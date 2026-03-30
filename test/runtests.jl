@@ -1,0 +1,167 @@
+using Test
+using JuMP
+using DynamicPolynomials
+using RationalSDP
+import MathOptInterface as MOI
+
+function rational_model(::Type{T}) where {T<:Real}
+    model = GenericModel{T}(() -> RationalSDP.Optimizer{T}())
+    set_silent(model)
+    return model
+end
+
+@testset "RationalSDP JuMP integration" begin
+    @testset "Exact feasibility with Rational{BigInt}" begin
+        model = rational_model(Rational{BigInt})
+        @variable(model, X[1:2, 1:2], PSD)
+        @constraint(model, X[1, 1] == 2//1)
+        @constraint(model, X[2, 2] == 2//1)
+        @constraint(model, X[1, 2] == 1//2)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        V = value.(X)
+        @test V[1, 1] == 2//1
+        @test V[2, 2] == 2//1
+        @test V[1, 2] == 1//2
+        @test V[2, 1] == 1//2
+    end
+
+    @testset "Mixed PSD and scalar inequalities" begin
+        model = rational_model(Rational{BigInt})
+        @variable(model, X[1:2, 1:2], PSD)
+        @variable(model, x)
+        @variable(model, y)
+        @constraint(model, X[1, 1] == 2//1)
+        @constraint(model, X[2, 2] == 2//1)
+        @constraint(model, X[1, 2] - x == 0//1)
+        @constraint(model, x >= 1//2)
+        @constraint(model, x <= 3//4)
+        @constraint(model, y >= -1//3)
+        @constraint(model, y <= 2//3)
+        @constraint(model, x + y >= 1//3)
+        @constraint(model, x - y <= 1//1)
+        @objective(model, Min, y)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        vx = value(x)
+        vy = value(y)
+        VX = value.(X)
+        @test VX[1, 2] == vx
+        @test VX[2, 1] == vx
+        @test vx >= 1//2
+        @test vx <= 3//4
+        @test vy >= -1//3
+        @test vy <= 2//3
+        @test vx + vy >= 1//3
+        @test vx - vy <= 1//1
+        @test BigFloat(vy) < big"-0.333"
+    end
+
+    @testset "LP scale with many interval constraints" begin
+        model = rational_model(Rational{BigInt})
+        n = 12
+        upper_bounds = vcat(fill(1//4, 4), fill(1//1, n - 4))
+        @variable(model, x[1:n])
+        for i in 1:n
+            @constraint(model, x[i] >= 0//1)
+            @constraint(model, x[i] <= upper_bounds[i])
+        end
+        @constraint(model, sum(x) == 1//1)
+        @objective(model, Min, sum((i // 1) * x[i] for i in 1:n))
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        values = value.(x)
+        @test sum(values) == 1//1
+        for i in 1:n
+            @test values[i] >= 0//1
+            @test values[i] <= upper_bounds[i]
+        end
+        @test BigFloat(objective_value(model)) < big"2.51"
+    end
+
+    @testset "Larger mixed cone instance" begin
+        model = rational_model(Rational{BigInt})
+        @variable(model, X[1:3, 1:3], PSD)
+        @variable(model, Y[1:2, 1:2], PSD)
+        @variable(model, u[1:16])
+        for i in eachindex(u)
+            @constraint(model, u[i] >= 0//1)
+            @constraint(model, u[i] <= 1//1)
+        end
+        @constraint(model, sum(u) == 5//1)
+        @constraint(model, X[1, 1] == 4//1)
+        @constraint(model, X[2, 2] == 3//1)
+        @constraint(model, X[3, 3] == 2//1)
+        @constraint(model, X[1, 2] == u[1])
+        @constraint(model, X[1, 3] == u[2] - 1//4)
+        @constraint(model, X[2, 3] == u[3] - 1//5)
+        @constraint(model, Y[1, 1] == 5//2)
+        @constraint(model, Y[2, 2] == 7//3)
+        @constraint(model, Y[1, 2] == u[4] - u[5])
+        @constraint(model, u[6] + u[7] >= 3//5)
+        @constraint(model, u[8] + u[9] <= 7//5)
+        @constraint(model, u[10] - u[11] >= -1//2)
+        @constraint(model, u[12] + u[13] + u[14] >= 1//1)
+        @constraint(model, u[15] + u[16] <= 3//2)
+        @objective(model, Min, sum((i // 1) * u[i] for i in eachindex(u)) - Y[1, 2])
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        UX = value.(u)
+        VX = value.(X)
+        VY = value.(Y)
+        @test sum(UX) == 5//1
+        @test VX[1, 2] == UX[1]
+        @test VX[1, 3] == UX[2] - 1//4
+        @test VX[2, 3] == UX[3] - 1//5
+        @test VY[1, 2] == UX[4] - UX[5]
+        @test VY[2, 1] == UX[4] - UX[5]
+        @test UX[6] + UX[7] >= 3//5
+        @test UX[8] + UX[9] <= 7//5
+        @test UX[10] - UX[11] >= -1//2
+        @test UX[12] + UX[13] + UX[14] >= 1//1
+        @test UX[15] + UX[16] <= 3//2
+    end
+
+    @testset "SOS-style polynomial lower bound via DynamicPolynomials" begin
+        model = rational_model(Rational{BigInt})
+        @polyvar z
+        basis = monomials([z], 0:2)
+        @variable(model, Q[1:3, 1:3], PSD)
+        @variable(model, t)
+
+        coeffs = Dict{Int,Any}(k => 0//1 for k in 0:4)
+        for i in eachindex(basis)
+            for j in i:length(basis)
+                degree_ij = degree(basis[i] * basis[j], z)
+                contribution = i == j ? Q[i, j] : 2//1 * Q[i, j]
+                coeffs[degree_ij] = coeffs[degree_ij] + contribution
+            end
+        end
+
+        @constraint(model, coeffs[0] == t)
+        @constraint(model, coeffs[1] == 0//1)
+        @constraint(model, coeffs[2] == -1//1)
+        @constraint(model, coeffs[3] == 0//1)
+        @constraint(model, coeffs[4] == 1//1)
+        @objective(model, Min, t)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test value(Q[3, 3]) == 1//1
+        @test value(Q[2, 3]) == 0//1
+        @test BigFloat(value(t)) < big"0.251"
+    end
+
+    @testset "Alternative rational output type" begin
+        model = rational_model(Rational{Int})
+        @variable(model, X[1:1, 1:1], PSD)
+        @variable(model, y)
+        @constraint(model, X[1, 1] == 3//1)
+        @constraint(model, y == 2//3)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test value(X[1, 1]) == 3//1
+        @test value(y) == 2//3
+    end
+end

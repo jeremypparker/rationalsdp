@@ -48,9 +48,10 @@ println(value(y))
 Set `verbose = false` to suppress iteration logs. In JuMP, `set_silent(model)`
 also suppresses the solver output.
 
-The verbose output is a stage-by-stage progress table in the style of a
-standard conic solver log. Set `verbose_newton = true` if you also want the
-inner Newton iterations.
+The verbose output is a stage-by-stage `PrettyTables` log in the style of a
+standard conic solver transcript. On a real terminal, the phase table updates
+live in place. Set `verbose_newton = true` if you also want the inner Newton
+iterations, or `live_progress = false` if you prefer one final table per phase.
 
 Threaded PSD barrier assembly is enabled with `threaded = true` and uses the
 Julia thread pool from `JULIA_NUM_THREADS`.

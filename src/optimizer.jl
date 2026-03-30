@@ -34,6 +34,7 @@ Base.@kwdef mutable struct Settings
     rational_tolerance::BigFloat = big"1e-40"
     verbose::Bool = true
     verbose_newton::Bool = false
+    live_progress::Bool = true
     inner_log_frequency::Int = 10
     threaded::Bool = true
     threading_min_block_size::Int = 48
@@ -146,60 +147,100 @@ function _log_newton(opt::Optimizer, message::AbstractString)
     return
 end
 
-_format_cell(value::AbstractString, width::Int) = rpad(value, width)
-_format_cell(value, width::Int) = _format_cell(string(value), width)
+_live_progress_enabled(opt::Optimizer) = opt.settings.live_progress && stdout isa Base.TTY
 
-function _table_border(widths::Vector{Int})
-    return "+" * join((repeat("-", width + 2) for width in widths), "+") * "+"
+const _PRETTY_TABLE_FORMAT = TextTableFormat(
+    borders = text_table_borders__unicode_rounded,
+)
+
+function _rows_to_matrix(rows::Vector{Vector{String}})
+    isempty(rows) && return zeros(String, 0, 0)
+    num_rows = length(rows)
+    num_cols = length(rows[1])
+    matrix = Matrix{String}(undef, num_rows, num_cols)
+    for row in 1:num_rows
+        for col in 1:num_cols
+            matrix[row, col] = rows[row][col]
+        end
+    end
+    return matrix
 end
 
-function _table_row(values::Vector{String}, widths::Vector{Int})
-    padded = [" " * _format_cell(values[index], widths[index]) * " " for index in eachindex(values)]
-    return "|" * join(padded, "|") * "|"
+function _phase_table_template(total_iterations::Int)
+    rows = [fill("", 5) for _ in 1:total_iterations]
+    for iteration in 1:total_iterations
+        rows[iteration][1] = "$(iteration)/$(total_iterations)"
+    end
+    return rows
 end
 
-function _log_table_header(
+function _render_table(
+    title::AbstractString,
+    columns::Vector{String},
+    rows::Vector{Vector{String}};
+    subtitle::AbstractString = "",
+)
+    table = _rows_to_matrix(rows)
+    return pretty_table(
+        String,
+        table;
+        column_labels = columns,
+        table_format = _PRETTY_TABLE_FORMAT,
+        title = title,
+        subtitle = subtitle,
+    )
+end
+
+function _log_pretty_table(
     opt::Optimizer,
     title::AbstractString,
     columns::Vector{String},
-    widths::Vector{Int},
+    rows::Vector{Vector{String}};
+    subtitle::AbstractString = "",
 )
-    border = _table_border(widths)
     _log_raw(opt)
-    _log_raw(opt, title)
-    _log_raw(opt, border)
-    _log_raw(opt, _table_row(columns, widths))
-    _log_raw(opt, border)
+    _log_raw(opt, chomp(_render_table(title, columns, rows; subtitle)))
     return
 end
 
-function _log_table_row!(
+function _print_live_table!(
     opt::Optimizer,
-    values::Vector{String},
-    widths::Vector{Int},
+    title::AbstractString,
+    columns::Vector{String},
+    rows::Vector{Vector{String}},
+    printed::Bool;
+    subtitle::AbstractString = "",
 )
-    _log_raw(opt, _table_row(values, widths))
-    return
-end
-
-function _log_table_footer(
-    opt::Optimizer,
-    widths::Vector{Int},
-)
-    _log_raw(opt, _table_border(widths))
-    return
+    if !opt.silent && opt.settings.verbose
+        pretty_table(
+            stdout,
+            _rows_to_matrix(rows);
+            column_labels = columns,
+            table_format = _PRETTY_TABLE_FORMAT,
+            title = title,
+            subtitle = subtitle,
+            overwrite_display = printed,
+        )
+    end
+    return true
 end
 
 function _log_banner(opt::Optimizer, problem::ProblemData)
-    width = 92
     thread_count = opt.settings.threaded ? nthreads() : 1
-    _log_raw(opt, repeat("=", width))
-    _log_raw(opt, "RationalSDP  |  primal-only interior-point method with exact rational recovery")
-    _log_raw(
+    _log_pretty_table(
         opt,
-        "variables=$(length(problem.original_variables))  psd_blocks=$(length(problem.blocks))  scalar_slacks=$(length(problem.positive_scalars))  equations=$(size(problem.A, 1))  threads=$(thread_count)",
+        "RationalSDP",
+        ["Item", "Value"],
+        [
+            ["Method", "Primal-only interior-point method with exact rational recovery"],
+            ["Variables", string(length(problem.original_variables))],
+            ["PSD blocks", string(length(problem.blocks))],
+            ["Scalar slacks", string(length(problem.positive_scalars))],
+            ["Affine equations", string(size(problem.A, 1))],
+            ["Threads", string(thread_count)],
+        ];
+        subtitle = "Solve summary",
     )
-    _log_raw(opt, repeat("=", width))
     return
 end
 
@@ -984,7 +1025,7 @@ function _barrier_value_grad_hess(
     hess = zeros(BigFloat, p, p)
 
     if settings.threaded && nthreads() > 1 && length(numeric_blocks) > 1
-        values = zeros(BigFloat, nthreads())
+        values = zeros(BigFloat, Base.Threads.maxthreadid())
         @threads for block_index in eachindex(numeric_blocks)
             tid = threadid()
             values[tid] += _block_barrier_value_grad_hess!(
@@ -1416,14 +1457,9 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         phase1_center = copy(x)
         penalty = opt.settings.initial_penalty
 
-        phase1_widths = [8, 12, 12, 12, 10]
+        phase1_rows = _phase_table_template(opt.settings.phase1_outer_iterations)
         phase1_start_time = time_ns()
-        _log_table_header(
-            opt,
-            "Phase I  |  feasibility search",
-            ["iter", "penalty", "residual", "barrier", "time (s)"],
-            phase1_widths,
-        )
+        phase1_live_printed = false
         for outer_iteration in 1:opt.settings.phase1_outer_iterations
             x = _newton_phase1!(
                 opt,
@@ -1442,21 +1478,30 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 problem.positive_scalars,
                 opt.settings,
             )
-            _log_table_row!(
-                opt,
-                [
-                    "$(outer_iteration)/$(opt.settings.phase1_outer_iterations)",
-                    _format_metric(penalty),
-                    _format_metric(residual),
-                    _format_metric(barrier_value),
-                    @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
-                ],
-                phase1_widths,
-            )
+            phase1_rows[outer_iteration][2] = _format_metric(penalty)
+            phase1_rows[outer_iteration][3] = _format_metric(residual)
+            phase1_rows[outer_iteration][4] = _format_metric(barrier_value)
+            phase1_rows[outer_iteration][5] = @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9)
+            if _live_progress_enabled(opt)
+                phase1_live_printed = _print_live_table!(
+                    opt,
+                    "Phase I",
+                    ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"],
+                    phase1_rows,
+                    phase1_live_printed;
+                    subtitle = "Feasibility search",
+                )
+            end
             residual <= opt.settings.feasibility_tolerance && break
             penalty *= opt.settings.penalty_growth
         end
-        _log_table_footer(opt, phase1_widths)
+        _live_progress_enabled(opt) || _log_pretty_table(
+            opt,
+            "Phase I",
+            ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"],
+            phase1_rows;
+            subtitle = "Feasibility search",
+        )
 
         anchor = _phase1_exact_feasible_point(x, problem, opt.settings)
         if anchor === nothing
@@ -1476,14 +1521,9 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             z = zeros(BigFloat, size(nullspace, 2))
             barrier_parameter = one(BigFloat)
 
-            phase2_widths = [8, 12, 12, 12, 10]
+            phase2_rows = _phase_table_template(opt.settings.phase2_outer_iterations)
             phase2_start_time = time_ns()
-            _log_table_header(
-                opt,
-                "Phase II |  objective path-following",
-                ["iter", "mu", "objective", "gap", "time (s)"],
-                phase2_widths,
-            )
+            phase2_live_printed = false
             for outer_iteration in 1:opt.settings.phase2_outer_iterations
                 z = _newton_phase2!(
                     opt,
@@ -1498,23 +1538,32 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 x_trial = x0 + N_big * z
                 approximate_objective = dot(c_big, x_trial) + BigFloat(problem.objective_constant_raw)
                 gap_bound = BigFloat(barrier_dim) / barrier_parameter
-                _log_table_row!(
-                    opt,
-                    [
-                        "$(outer_iteration)/$(opt.settings.phase2_outer_iterations)",
-                        _format_metric(barrier_parameter),
-                        _format_metric(approximate_objective),
-                        _format_metric(gap_bound),
-                        @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
-                    ],
-                    phase2_widths,
-                )
+                phase2_rows[outer_iteration][2] = _format_metric(barrier_parameter)
+                phase2_rows[outer_iteration][3] = _format_metric(approximate_objective)
+                phase2_rows[outer_iteration][4] = _format_metric(gap_bound)
+                phase2_rows[outer_iteration][5] = @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9)
+                if _live_progress_enabled(opt)
+                    phase2_live_printed = _print_live_table!(
+                        opt,
+                        "Phase II",
+                        ["Iter", "Mu", "Objective", "Gap", "Time (s)"],
+                        phase2_rows,
+                        phase2_live_printed;
+                        subtitle = "Objective path-following",
+                    )
+                end
                 if gap_bound <= opt.settings.optimality_gap_tolerance
                     break
                 end
                 barrier_parameter *= opt.settings.path_parameter_growth
             end
-            _log_table_footer(opt, phase2_widths)
+            _live_progress_enabled(opt) || _log_pretty_table(
+                opt,
+                "Phase II",
+                ["Iter", "Mu", "Objective", "Gap", "Time (s)"],
+                phase2_rows;
+                subtitle = "Objective path-following",
+            )
 
             x_candidate = _project_exact_solution(
                 x0 + N_big * z,

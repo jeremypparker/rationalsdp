@@ -1,15 +1,17 @@
 name = "RationalSDP"
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
-authors = ["OpenAI Codex"]
 version = "0.1.1"
+authors = ["OpenAI Codex"]
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
+PrettyTables = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
 [compat]
 MathOptInterface = "1"
+PrettyTables = "3"
 julia = "1.10"
 
 [extras]

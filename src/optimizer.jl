@@ -33,7 +33,10 @@ Base.@kwdef mutable struct Settings
     working_precision::Int = 448
     rational_tolerance::BigFloat = big"1e-40"
     verbose::Bool = true
+    verbose_newton::Bool = false
     inner_log_frequency::Int = 10
+    threaded::Bool = true
+    threading_min_block_size::Int = 48
 end
 
 struct BlockStructure
@@ -64,7 +67,6 @@ end
 
 struct NumericBlock
     structure::BlockStructure
-    bases::Vector{Matrix{BigFloat}}
 end
 
 mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
@@ -130,6 +132,77 @@ function _log(opt::Optimizer, message::AbstractString)
     return
 end
 
+function _log_raw(opt::Optimizer, message::AbstractString = "")
+    if !opt.silent && opt.settings.verbose
+        println(message)
+    end
+    return
+end
+
+function _log_newton(opt::Optimizer, message::AbstractString)
+    if !opt.silent && opt.settings.verbose && opt.settings.verbose_newton
+        println("[RationalSDP] ", message)
+    end
+    return
+end
+
+_format_cell(value::AbstractString, width::Int) = rpad(value, width)
+_format_cell(value, width::Int) = _format_cell(string(value), width)
+
+function _table_border(widths::Vector{Int})
+    return "+" * join((repeat("-", width + 2) for width in widths), "+") * "+"
+end
+
+function _table_row(values::Vector{String}, widths::Vector{Int})
+    padded = [" " * _format_cell(values[index], widths[index]) * " " for index in eachindex(values)]
+    return "|" * join(padded, "|") * "|"
+end
+
+function _log_table_header(
+    opt::Optimizer,
+    title::AbstractString,
+    columns::Vector{String},
+    widths::Vector{Int},
+)
+    border = _table_border(widths)
+    _log_raw(opt)
+    _log_raw(opt, title)
+    _log_raw(opt, border)
+    _log_raw(opt, _table_row(columns, widths))
+    _log_raw(opt, border)
+    return
+end
+
+function _log_table_row!(
+    opt::Optimizer,
+    values::Vector{String},
+    widths::Vector{Int},
+)
+    _log_raw(opt, _table_row(values, widths))
+    return
+end
+
+function _log_table_footer(
+    opt::Optimizer,
+    widths::Vector{Int},
+)
+    _log_raw(opt, _table_border(widths))
+    return
+end
+
+function _log_banner(opt::Optimizer, problem::ProblemData)
+    width = 92
+    thread_count = opt.settings.threaded ? nthreads() : 1
+    _log_raw(opt, repeat("=", width))
+    _log_raw(opt, "RationalSDP  |  primal-only interior-point method with exact rational recovery")
+    _log_raw(
+        opt,
+        "variables=$(length(problem.original_variables))  psd_blocks=$(length(problem.blocks))  scalar_slacks=$(length(problem.positive_scalars))  equations=$(size(problem.A, 1))  threads=$(thread_count)",
+    )
+    _log_raw(opt, repeat("=", width))
+    return
+end
+
 MOI.supports_incremental_interface(::Optimizer) = true
 MOI.copy_to(dest::Optimizer, src::MOI.ModelLike) = MOIU.default_copy_to(dest, src)
 MOI.is_empty(opt::Optimizer) = MOI.is_empty(opt.storage)
@@ -169,7 +242,7 @@ function MOI.supports(
     ::Optimizer,
     attr::MOI.AbstractOptimizerAttribute,
 )
-    return attr isa MOI.Silent
+    return attr isa MOI.Silent || attr isa MOI.SolverName
 end
 
 MOI.supports(opt::Optimizer, attr::MOI.AbstractModelAttribute) = MOI.supports(opt.storage, attr)
@@ -233,6 +306,7 @@ MOI.get(opt::Optimizer, ::MOI.PrimalStatus) = opt.primal_status
 MOI.get(opt::Optimizer, ::MOI.DualStatus) = opt.dual_status
 MOI.get(opt::Optimizer, ::MOI.RawStatusString) = opt.raw_status
 MOI.get(opt::Optimizer, ::MOI.SolveTimeSec) = opt.solve_time_sec
+MOI.get(::Optimizer, ::MOI.SolverName) = "RationalSDP"
 MOI.get(::Optimizer, ::MOI.ListOfOptimizerAttributesSet) = MOI.AbstractOptimizerAttribute[]
 
 function MOI.get(opt::Optimizer, attr::MOI.ObjectiveValue)
@@ -325,23 +399,6 @@ function _strictly_pd(matrix::Matrix{BigFloat})
     end
 end
 
-function _logdet_spd(matrix::Matrix{BigFloat})
-    factor = cholesky(Hermitian(matrix))
-    value = zero(BigFloat)
-    for d in diag(factor.L)
-        value += log(d)
-    end
-    return 2 * value
-end
-
-function _trace(matrix::AbstractMatrix)
-    value = zero(eltype(matrix))
-    for i in axes(matrix, 1)
-        value += matrix[i, i]
-    end
-    return value
-end
-
 function _rref(aug::Matrix{ExactRational})
     rows, cols = size(aug)
     pivot_columns = Int[]
@@ -403,6 +460,121 @@ function _solve_affine_system(
     return particular, nullspace
 end
 
+function _variable_fixed_zero(
+    particular::Vector{ExactRational},
+    nullspace::Matrix{ExactRational},
+    index::Int,
+)
+    iszero(particular[index]) || return false
+    for column in axes(nullspace, 2)
+        iszero(nullspace[index, column]) || return false
+    end
+    return true
+end
+
+function _block_direction_entry_indices(
+    block::BlockStructure,
+    local_direction::Int,
+)
+    indices = Int[]
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        if i == local_direction || j == local_direction
+            push!(indices, block.global_positions[local_index])
+        end
+    end
+    return indices
+end
+
+function _restrict_block(
+    block::BlockStructure,
+    keep_directions::Vector{Int},
+)
+    keep_lookup = Dict(direction => new_index for (new_index, direction) in enumerate(keep_directions))
+    variables = MOI.VariableIndex[]
+    global_positions = Int[]
+    local_positions = Tuple{Int,Int}[]
+    diagonal_positions = Int[]
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        haskey(keep_lookup, i) || continue
+        haskey(keep_lookup, j) || continue
+        new_position = (keep_lookup[i], keep_lookup[j])
+        push!(variables, block.variables[local_index])
+        push!(global_positions, block.global_positions[local_index])
+        push!(local_positions, new_position)
+        if new_position[1] == new_position[2]
+            push!(diagonal_positions, block.global_positions[local_index])
+        end
+    end
+    return BlockStructure(
+        length(keep_directions),
+        variables,
+        global_positions,
+        local_positions,
+        diagonal_positions,
+    )
+end
+
+function _append_zero_equalities(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+    indices::Vector{Int},
+)
+    isempty(indices) && return A, b
+    unique_indices = unique(sort(indices))
+    rows, cols = size(A)
+    A_augmented = zeros(ExactRational, rows + length(unique_indices), cols)
+    b_augmented = zeros(ExactRational, rows + length(unique_indices))
+    if rows > 0
+        A_augmented[1:rows, :] = A
+        b_augmented[1:rows] = b
+    end
+    for (offset, index) in enumerate(unique_indices)
+        row = rows + offset
+        A_augmented[row, index] = 1 // 1
+    end
+    return A_augmented, b_augmented
+end
+
+function _prune_psd_faces(
+    blocks::Vector{BlockStructure},
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+)
+    affine === nothing && return blocks, A, b, affine, 0
+    total_pruned = 0
+    while true
+        particular, nullspace = affine
+        zero_indices = Int[]
+        new_blocks = BlockStructure[]
+        changed = false
+        for block in blocks
+            remove_directions = Int[]
+            for local_direction in 1:block.size
+                if _variable_fixed_zero(particular, nullspace, block.diagonal_positions[local_direction])
+                    push!(remove_directions, local_direction)
+                end
+            end
+            if isempty(remove_directions)
+                push!(new_blocks, block)
+                continue
+            end
+            changed = true
+            total_pruned += length(remove_directions)
+            for local_direction in remove_directions
+                append!(zero_indices, _block_direction_entry_indices(block, local_direction))
+            end
+            keep_directions = setdiff(collect(1:block.size), remove_directions)
+            isempty(keep_directions) || push!(new_blocks, _restrict_block(block, keep_directions))
+        end
+        changed || return blocks, A, b, affine, total_pruned
+        A, b = _append_zero_equalities(A, b, zero_indices)
+        blocks = new_blocks
+        affine = _solve_affine_system(A, b)
+        affine === nothing && return blocks, A, b, affine, total_pruned
+    end
+end
+
 function _leading_principal_determinants_positive(matrix::Matrix{ExactRational})
     n = size(matrix, 1)
     for k in 1:n
@@ -437,21 +609,92 @@ function _strictly_interior_exact(
 end
 
 function _numeric_blocks(blocks::Vector{BlockStructure})
-    numeric_blocks = Vector{NumericBlock}(undef, length(blocks))
-    for (index, block) in enumerate(blocks)
-        bases = Vector{Matrix{BigFloat}}(undef, length(block.local_positions))
-        for (basis_index, (i, j)) in enumerate(block.local_positions)
-            basis = zeros(BigFloat, block.size, block.size)
-            basis[i, j] = 1
-            basis[j, i] = 1
-            if i == j
-                basis[i, j] = 1
-            end
-            bases[basis_index] = basis
-        end
-        numeric_blocks[index] = NumericBlock(block, bases)
+    return [NumericBlock(block) for block in blocks]
+end
+
+@inline function _barrier_gradient_entry(
+    inverse_matrix::Matrix{BigFloat},
+    i::Int,
+    j::Int,
+)
+    return i == j ? -inverse_matrix[i, i] : -2 * inverse_matrix[i, j]
+end
+
+@inline function _barrier_hessian_entry(
+    inverse_matrix::Matrix{BigFloat},
+    i::Int,
+    j::Int,
+    k::Int,
+    l::Int,
+)
+    if i == j
+        return k == l ? inverse_matrix[i, k]^2 : 2 * inverse_matrix[i, k] * inverse_matrix[i, l]
+    elseif k == l
+        return 2 * inverse_matrix[k, i] * inverse_matrix[k, j]
     end
-    return numeric_blocks
+    return 2 * (
+        inverse_matrix[i, k] * inverse_matrix[j, l] +
+        inverse_matrix[i, l] * inverse_matrix[j, k]
+    )
+end
+
+function _block_barrier_value_grad_hess!(
+    grad::Vector{BigFloat},
+    hess::Matrix{BigFloat},
+    x::Vector{BigFloat},
+    numeric_block::NumericBlock,
+    settings::Settings,
+    allow_threads::Bool,
+)
+    block = numeric_block.structure
+    X = _vector_to_matrix(x, block)
+    factor = cholesky(Hermitian(X))
+    inverse_matrix = Matrix{BigFloat}(I, block.size, block.size)
+    ldiv!(factor, inverse_matrix)
+
+    logdet = zero(BigFloat)
+    for diagonal_entry in diag(factor.L)
+        logdet += log(diagonal_entry)
+    end
+
+    local_positions = block.local_positions
+    global_positions = block.global_positions
+    local_dimension = length(local_positions)
+    use_threads = allow_threads && settings.threaded && nthreads() > 1 && local_dimension >= settings.threading_min_block_size
+
+    if use_threads
+        @threads for a in 1:local_dimension
+            i, j = local_positions[a]
+            ga = global_positions[a]
+            grad[ga] = _barrier_gradient_entry(inverse_matrix, i, j)
+            for b in a:local_dimension
+                k, l = local_positions[b]
+                gb = global_positions[b]
+                hess[ga, gb] = _barrier_hessian_entry(inverse_matrix, i, j, k, l)
+            end
+        end
+    else
+        for a in 1:local_dimension
+            i, j = local_positions[a]
+            ga = global_positions[a]
+            grad[ga] = _barrier_gradient_entry(inverse_matrix, i, j)
+            for b in a:local_dimension
+                k, l = local_positions[b]
+                gb = global_positions[b]
+                hess[ga, gb] = _barrier_hessian_entry(inverse_matrix, i, j, k, l)
+            end
+        end
+    end
+
+    for a in 1:local_dimension
+        ga = global_positions[a]
+        for b in (a + 1):local_dimension
+            gb = global_positions[b]
+            hess[gb, ga] = hess[ga, gb]
+        end
+    end
+
+    return -2 * logdet
 end
 
 function _extract_affine_row(
@@ -709,6 +952,13 @@ function _extract_problem(opt::Optimizer{T}) where {T}
     c_raw = vcat(c_original_raw, zeros(ExactRational, slack_count))
     c_min = vcat(c_original_min, zeros(ExactRational, slack_count))
     affine = _solve_affine_system(A, b)
+    blocks, A, b, affine, pruned_directions = _prune_psd_faces(blocks, A, b, affine)
+    if pruned_directions > 0
+        _log(
+            opt,
+            "pruned $(pruned_directions) PSD direction(s) fixed to the cone boundary before barrier solve",
+        )
+    end
 
     return ProblemData(
         original_variables,
@@ -726,30 +976,37 @@ function _barrier_value_grad_hess(
     x::Vector{BigFloat},
     numeric_blocks::Vector{NumericBlock},
     positive_scalars::Vector{Int},
+    settings::Settings,
 )
     p = length(x)
     value = zero(BigFloat)
     grad = zeros(BigFloat, p)
     hess = zeros(BigFloat, p, p)
 
-    for numeric_block in numeric_blocks
-        block = numeric_block.structure
-        X = _vector_to_matrix(x, block)
-        value -= _logdet_spd(X)
-        invX = inv(X)
-        transformed = [invX * basis for basis in numeric_block.bases]
-        global_positions = block.global_positions
-        for a in eachindex(transformed)
-            ga = global_positions[a]
-            grad[ga] -= _trace(transformed[a])
-            for b in a:length(transformed)
-                gb = global_positions[b]
-                contribution = _trace(transformed[a] * transformed[b])
-                hess[ga, gb] += contribution
-                if ga != gb
-                    hess[gb, ga] += contribution
-                end
-            end
+    if settings.threaded && nthreads() > 1 && length(numeric_blocks) > 1
+        values = zeros(BigFloat, nthreads())
+        @threads for block_index in eachindex(numeric_blocks)
+            tid = threadid()
+            values[tid] += _block_barrier_value_grad_hess!(
+                grad,
+                hess,
+                x,
+                numeric_blocks[block_index],
+                settings,
+                false,
+            )
+        end
+        value += sum(values)
+    else
+        for numeric_block in numeric_blocks
+            value += _block_barrier_value_grad_hess!(
+                grad,
+                hess,
+                x,
+                numeric_block,
+                settings,
+                true,
+            )
         end
     end
 
@@ -892,6 +1149,7 @@ function _newton_phase1!(
             x,
             numeric_blocks,
             problem.positive_scalars,
+            settings,
         )
         residual = A_big * x - b_big
         deviation = x - center
@@ -900,7 +1158,7 @@ function _newton_phase1!(
         grad = barrier_grad + penalty * (At * residual) + center_weight * deviation
         grad_norm = _max_abs(grad)
         if iteration == 1 || iteration % settings.inner_log_frequency == 0
-            _log(
+            _log_newton(
                 opt,
                 "phase I newton $(iteration): residual=$(_format_metric(residual_norm)), grad=$(_format_metric(grad_norm))",
             )
@@ -932,6 +1190,7 @@ function _newton_phase1!(
                     trial,
                     numeric_blocks,
                     problem.positive_scalars,
+                    settings,
                 )
                 trial_residual = A_big * trial - b_big
                 trial_deviation = trial - center
@@ -1025,13 +1284,14 @@ function _newton_phase2!(
             x,
             numeric_blocks,
             positive_scalars,
+            settings,
         )
         value = barrier_parameter * dot(c_big, x) + barrier_value
         grad_x = barrier_parameter * c_big + barrier_grad_x
         grad_z = Nt_big * grad_x
         grad_norm = _max_abs(grad_z)
         if iteration == 1 || iteration % settings.inner_log_frequency == 0
-            _log(
+            _log_newton(
                 opt,
                 "phase II newton $(iteration): grad=$(_format_metric(grad_norm))",
             )
@@ -1060,6 +1320,7 @@ function _newton_phase2!(
                     trial_x,
                     numeric_blocks,
                     positive_scalars,
+                    settings,
                 )
                 trial_value = barrier_parameter * dot(c_big, trial_x) + trial_barrier
                 if trial_value <= value + settings.armijo_fraction * step * directional_derivative
@@ -1098,10 +1359,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
     _reset_results!(opt)
     setprecision(opt.settings.working_precision) do
         problem = _extract_problem(opt)
-        _log(
-            opt,
-            "starting solve with $(length(problem.original_variables)) original vars, $(length(problem.blocks)) PSD blocks, $(length(problem.positive_scalars)) scalar slacks, and $(size(problem.A, 1)) affine equations",
-        )
+        _log_banner(opt, problem)
         if problem.affine === nothing
             opt.termination_status = MOI.INFEASIBLE
             opt.primal_status = MOI.NO_SOLUTION
@@ -1158,7 +1416,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         phase1_center = copy(x)
         penalty = opt.settings.initial_penalty
 
-        _log(opt, "phase I: searching for a strictly feasible interior point")
+        phase1_widths = [8, 12, 12, 12, 10]
+        phase1_start_time = time_ns()
+        _log_table_header(
+            opt,
+            "Phase I  |  feasibility search",
+            ["iter", "penalty", "residual", "barrier", "time (s)"],
+            phase1_widths,
+        )
         for outer_iteration in 1:opt.settings.phase1_outer_iterations
             x = _newton_phase1!(
                 opt,
@@ -1171,14 +1436,27 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 phase1_center,
             )
             residual = _max_abs(A_big * x - b_big)
-            barrier_value, _, _ = _barrier_value_grad_hess(x, numeric_blocks, problem.positive_scalars)
-            _log(
+            barrier_value, _, _ = _barrier_value_grad_hess(
+                x,
+                numeric_blocks,
+                problem.positive_scalars,
+                opt.settings,
+            )
+            _log_table_row!(
                 opt,
-                "phase I outer $(outer_iteration)/$(opt.settings.phase1_outer_iterations): penalty=$(_format_metric(penalty)), residual=$(_format_metric(residual)), barrier=$(_format_metric(barrier_value))",
+                [
+                    "$(outer_iteration)/$(opt.settings.phase1_outer_iterations)",
+                    _format_metric(penalty),
+                    _format_metric(residual),
+                    _format_metric(barrier_value),
+                    @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
+                ],
+                phase1_widths,
             )
             residual <= opt.settings.feasibility_tolerance && break
             penalty *= opt.settings.penalty_growth
         end
+        _log_table_footer(opt, phase1_widths)
 
         anchor = _phase1_exact_feasible_point(x, problem, opt.settings)
         if anchor === nothing
@@ -1198,7 +1476,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             z = zeros(BigFloat, size(nullspace, 2))
             barrier_parameter = one(BigFloat)
 
-            _log(opt, "phase II: following the barrier path toward the objective minimum")
+            phase2_widths = [8, 12, 12, 12, 10]
+            phase2_start_time = time_ns()
+            _log_table_header(
+                opt,
+                "Phase II |  objective path-following",
+                ["iter", "mu", "objective", "gap", "time (s)"],
+                phase2_widths,
+            )
             for outer_iteration in 1:opt.settings.phase2_outer_iterations
                 z = _newton_phase2!(
                     opt,
@@ -1213,15 +1498,23 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 x_trial = x0 + N_big * z
                 approximate_objective = dot(c_big, x_trial) + BigFloat(problem.objective_constant_raw)
                 gap_bound = BigFloat(barrier_dim) / barrier_parameter
-                _log(
+                _log_table_row!(
                     opt,
-                    "phase II outer $(outer_iteration)/$(opt.settings.phase2_outer_iterations): mu=$(_format_metric(barrier_parameter)), objective≈$(_format_metric(approximate_objective)), gap<=$(_format_metric(gap_bound))",
+                    [
+                        "$(outer_iteration)/$(opt.settings.phase2_outer_iterations)",
+                        _format_metric(barrier_parameter),
+                        _format_metric(approximate_objective),
+                        _format_metric(gap_bound),
+                        @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
+                    ],
+                    phase2_widths,
                 )
                 if gap_bound <= opt.settings.optimality_gap_tolerance
                     break
                 end
                 barrier_parameter *= opt.settings.path_parameter_growth
             end
+            _log_table_footer(opt, phase2_widths)
 
             x_candidate = _project_exact_solution(
                 x0 + N_big * z,
@@ -1240,9 +1533,10 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         opt.termination_status = MOI.OPTIMAL
         opt.primal_status = MOI.FEASIBLE_POINT
         opt.dual_status = MOI.NO_SOLUTION
-        opt.raw_status = "Solved with a mixed cone barrier method and exact rational recovery."
+        opt.raw_status = "Solved with a primal-only mixed cone barrier method and exact rational recovery."
         opt.result_count = 1
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+        _log_raw(opt)
         _log(opt, "finished in " * @sprintf("%.3f", opt.solve_time_sec) * "s with objective $(objective_value)")
     end
     return

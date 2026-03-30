@@ -2,6 +2,7 @@ using Test
 using JuMP
 using DynamicPolynomials
 using RationalSDP
+using LinearAlgebra
 import MathOptInterface as MOI
 
 function rational_model(::Type{T}) where {T<:Real}
@@ -11,6 +12,26 @@ function rational_model(::Type{T}) where {T<:Real}
 end
 
 @testset "RationalSDP JuMP integration" begin
+    @testset "Optimizer metadata" begin
+        model = rational_model(Rational{BigInt})
+        @test JuMP.solver_name(model) == "RationalSDP"
+    end
+
+    @testset "PSD face pruning from forced nullspace directions" begin
+        model = rational_model(Rational{BigInt})
+        @variable(model, X[1:2, 1:2], PSD)
+        @constraint(model, X[1, 1] == 0//1)
+        @constraint(model, X[2, 2] == 1//1)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        VX = value.(X)
+        @test VX[1, 1] == 0//1
+        @test VX[1, 2] == 0//1
+        @test VX[2, 1] == 0//1
+        @test VX[2, 2] == 1//1
+    end
+
     @testset "Exact feasibility with Rational{BigInt}" begin
         model = rational_model(Rational{BigInt})
         @variable(model, X[1:2, 1:2], PSD)
@@ -20,6 +41,7 @@ end
         @objective(model, Min, 0//1)
         optimize!(model)
         @test termination_status(model) == MOI.OPTIMAL
+        @test dual_status(model) == MOI.NO_SOLUTION
         V = value.(X)
         @test V[1, 1] == 2//1
         @test V[2, 2] == 2//1
@@ -150,6 +172,40 @@ end
         @test value(Q[3, 3]) == 1//1
         @test value(Q[2, 3]) == 0//1
         @test BigFloat(value(t)) < big"0.251"
+    end
+
+    @testset "SOS Lyapunov feasibility with face pruning" begin
+        model = rational_model(Rational{BigInt})
+        @polyvar x[1:1]
+        f = -x
+
+        basis_V = monomials(x, 0:2)
+        @variable(model, coeffs_V[1:length(basis_V)])
+        V = dot(coeffs_V, basis_V)
+        LV = dot(f, differentiate(V, x))
+
+        basis_b1 = monomials(x, 0:1)
+        basis_b2 = monomials(x, 0:1)
+
+        @variable(model, Q1[1:length(basis_b1), 1:length(basis_b1)], PSD)
+        p1 = -LV - basis_b1' * Q1 * basis_b1
+        @constraint(model, coefficients(p1) .== 0)
+
+        @variable(model, Q2[1:length(basis_b2), 1:length(basis_b2)], PSD)
+        @constraint(model, coefficients(V - dot(x, x) - basis_b2' * Q2 * basis_b2) .== 0)
+
+        @objective(model, Min, 0//1)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        VQ1 = value.(Q1)
+        VQ2 = value.(Q2)
+        @test VQ1[1, 1] == 0//1
+        @test VQ1[1, 2] == 0//1
+        @test VQ1[2, 1] == 0//1
+        @test VQ1[2, 2] > 0//1
+        @test VQ2[1, 1] > 0//1
+        @test VQ2[2, 2] > 0//1
     end
 
     @testset "Alternative rational output type" begin

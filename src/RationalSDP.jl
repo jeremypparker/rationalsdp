@@ -2,6 +2,7 @@ module RationalSDP
 
 using LinearAlgebra
 using Printf
+using Base.Threads
 import MathOptInterface as MOI
 
 include("optimizer.jl")

@@ -12,6 +12,7 @@ The solver now supports:
 - linear objectives
 - exact rational recovery for the returned primal point
 - user-selectable output types such as `Rational{BigInt}` or `Rational{Int}`
+- threaded PSD barrier assembly for larger cone blocks
 
 The default algorithm is a two-stage interior-point method:
 
@@ -47,6 +48,13 @@ println(value(y))
 Set `verbose = false` to suppress iteration logs. In JuMP, `set_silent(model)`
 also suppresses the solver output.
 
+The verbose output is a stage-by-stage progress table in the style of a
+standard conic solver log. Set `verbose_newton = true` if you also want the
+inner Newton iterations.
+
+Threaded PSD barrier assembly is enabled with `threaded = true` and uses the
+Julia thread pool from `JULIA_NUM_THREADS`.
+
 ## Output Types
 
 `Rational{BigInt}` is the safest choice if you want guaranteed exact output for
@@ -63,6 +71,10 @@ The implementation is still intentionally focused:
 - no dual certificates
 - the problem should admit a strictly feasible interior point
 
+`RationalSDP` does not currently run a primal-dual interior-point method. It
+tracks only primal iterates and returns `dual_status(model) == MOI.NO_SOLUTION`
+on success.
+
 ## Tests And Benchmarks
 
 The test suite includes:
@@ -72,6 +84,7 @@ The test suite includes:
 - larger mixed-cone and LP-style instances
 - a small SOS-style polynomial optimization example built with
   `DynamicPolynomials`
+- a Lyapunov-style SOS feasibility example that requires PSD face pruning
 
 Run the tests with:
 

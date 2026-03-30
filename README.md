@@ -1,35 +1,89 @@
 # RationalSDP
 
-`RationalSDP.jl` is a small MathOptInterface-compatible SDP solver for JuMP
-models where the coefficients are rational and you want an exactly
-affine-feasible rational primal solution back at the end.
+`RationalSDP.jl` is an experimental semidefinite programming solver for JuMP
+models with rational data. Its main goal is not raw speed or broad conic
+coverage; it is to take a rational SDP-like model, solve it with an interior
+point method, and return an exactly affine-feasible rational primal solution.
 
-The solver now supports:
+## Status
 
-- PSD matrix variables in `PositiveSemidefiniteConeTriangle`
-- unconstrained scalar variables alongside PSD blocks
+This project has absolutely been vibe-coded.
+
+That is meant literally: most of the implementation was built interactively with
+AI assistance rather than through a long, traditional solver-development cycle.
+So this is not a battle-hardened industrial optimizer, and you should treat it
+as experimental.
+
+That said, it has also been developed in a test-driven way. New features and bug
+fixes have generally come with JuMP-based regression tests, and the current test
+suite covers:
+
+- PSD-only and mixed PSD/scalar models
 - scalar equalities, inequalities, and interval constraints
+- exact rational output with multiple rational output types
+- SOS-style examples built directly with `DynamicPolynomials`
+- Lyapunov-style SOS models, including cases that need PSD face pruning
+- larger mixed-cone examples and benchmark-sized regression cases
+
+So the right mental model is: experimental, candidly AI-built, but not random.
+
+## What It Does
+
+`RationalSDP` currently supports:
+
+- PSD matrix variables in `MOI.PositiveSemidefiniteConeTriangle`
+- unconstrained scalar variables alongside PSD blocks
+- scalar `==`, `>=`, `<=`, and interval constraints
 - linear objectives
-- exact rational recovery for the returned primal point
-- user-selectable output types such as `Rational{BigInt}` or `Rational{Int}`
-- threaded PSD barrier assembly for larger cone blocks
+- exact rational primal recovery at the end of the solve
+- user-selectable output types such as `Rational{BigInt}` and `Rational{Int}`
+- solver settings exposed through JuMP / MOI optimizer attributes
+- threaded PSD barrier assembly for larger blocks
 
-The default algorithm is a two-stage interior-point method:
+The solver is a two-stage primal interior-point method:
 
-1. A penalty-barrier Phase I finds a strictly feasible interior point.
-2. A feasible barrier path-following Phase II improves the objective.
-3. The final point is projected back to an exact rational affine-feasible
-   solution.
+1. Phase I searches for a strictly feasible interior point.
+2. Phase II follows the barrier path to improve the objective.
+3. The final point is projected back to an exact rational primal solution.
 
-## Example
+## Current Limitations
+
+This is the important section to read before you depend on it.
+
+- It is a primal-only solver, not a primal-dual IPM.
+- It does not currently return dual certificates or dual variable values.
+- It is aimed at problems that admit a strictly feasible interior point.
+- It has some PSD face pruning, but not full general facial reduction.
+- It is focused on rational affine data and exact primal recovery, not on being
+  a broad high-performance conic solver.
+
+If you want a mature production SDP solver with stronger robustness, better dual
+information, and wider problem coverage, you should still look at established
+solver stacks.
+
+## Installation
+
+From a local clone of this repository:
+
+```julia
+julia --project=. -e "using Pkg; Pkg.instantiate()"
+```
+
+If you want to use the package from another Julia environment after cloning:
+
+```julia
+using Pkg
+Pkg.develop(path = "/path/to/RationalSDP")
+```
+
+## Quick Start
 
 ```julia
 using JuMP
 using RationalSDP
 
-model = GenericModel{Rational{BigInt}}(
-    () -> RationalSDP.Optimizer{Rational{BigInt}}(verbose = true),
-)
+model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
+set_optimizer_attribute(model, "verbose", true)
 
 @variable(model, X[1:2, 1:2], PSD)
 @variable(model, y)
@@ -43,60 +97,124 @@ optimize!(model)
 
 println(value.(X))
 println(value(y))
+println(termination_status(model))
+println(primal_status(model))
+println(dual_status(model))
 ```
 
-Set `verbose = false` to suppress iteration logs. In JuMP, `set_silent(model)`
-also suppresses the solver output.
+On success, `value.(...)` returns exact rational values of the model's numeric
+type.
 
-The verbose output is a stage-by-stage `PrettyTables` log in the style of a
-standard conic solver transcript. On a real terminal, the phase table updates
-live in place. Set `verbose_newton = true` if you also want the inner Newton
-iterations, or `live_progress = false` if you prefer one final table per phase.
+## Configuring The Solver
 
-Threaded PSD barrier assembly is enabled with `threaded = true` and uses the
-Julia thread pool from `JULIA_NUM_THREADS`.
+All fields of `RationalSDP.Settings` are exposed as optimizer attributes, so the
+preferred JuMP style is:
+
+```julia
+model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
+set_optimizer_attribute(model, "verbose", true)
+set_optimizer_attribute(model, "phase1_outer_iterations", 100)
+set_optimizer_attribute(model, "working_precision", 448)
+set_optimizer_attribute(model, "threaded", true)
+```
+
+You can also query them back:
+
+```julia
+get_optimizer_attribute(model, "phase1_outer_iterations")
+```
+
+Some particularly useful settings are:
+
+- `verbose`: print the phase logs
+- `verbose_newton`: also print inner Newton progress
+- `phase1_outer_iterations`: maximum number of outer Phase I penalty updates
+- `phase2_outer_iterations`: maximum number of outer Phase II barrier updates
+- `working_precision`: `BigFloat` precision used during the numerical solve
+- `rational_tolerance`: tolerance used during exact rational recovery
+- `threaded`: enable threaded PSD barrier assembly
+- `threading_min_block_size`: block-size threshold before threading is used
+
+## Logging
+
+With `verbose = true`, the solver prints:
+
+- a short solve summary
+- a live Phase I table, with one row printed after each outer iteration
+- a live Phase II table, with one row printed after each outer iteration
+- a final completion line with solve time and exact objective
+
+Use `set_silent(model)` to suppress solver output through JuMP.
 
 ## Output Types
 
-`Rational{BigInt}` is the safest choice if you want guaranteed exact output for
-general problems. Smaller rational types are supported, but they can only be
-used when the exact recovered numerator and denominator fit in the chosen
-integer type.
+`Rational{BigInt}` is the safest output type and the default recommendation.
+It can represent the recovered exact solution without overflow.
 
-## Current Scope
+Smaller types such as `Rational{Int}` also work, but only when the exact
+recovered numerators and denominators fit in the chosen integer type.
 
-The implementation is still intentionally focused:
+## Sum-Of-Squares / Polynomial Models
 
-- primal-only solver
-- linear objective only
-- no dual certificates
-- the problem should admit a strictly feasible interior point
-
-`RationalSDP` does not currently run a primal-dual interior-point method. It
-tracks only primal iterates and returns `dual_status(model) == MOI.NO_SOLUTION`
-on success.
-
-## Tests And Benchmarks
+The package is not a dedicated SOS layer, but it does work well with JuMP plus
+`DynamicPolynomials` if you build the Gram-matrix constraints yourself.
 
 The test suite includes:
 
-- mixed PSD and non-PSD models
-- scalar inequality and interval constraints
-- larger mixed-cone and LP-style instances
-- a small SOS-style polynomial optimization example built with
-  `DynamicPolynomials`
-- a Lyapunov-style SOS feasibility example that requires PSD face pruning
+- direct SOS lower-bound examples
+- Lyapunov-style SOS feasibility examples
+- Lorenz-style polynomial bounds
 
-Run the tests with:
+One practical caveat: if your SOS lift introduces obviously redundant Gram
+directions, the feasible set may lie on a face of the PSD cone. The solver has
+some automatic pruning for forced nullspace directions, but not full general
+facial reduction.
+
+## Testing
+
+Run the full test suite with:
 
 ```julia
 julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
+The tests are JuMP-level integration tests, not just unit tests for internal
+helpers, so they are a decent indicator that the public workflow still works.
+
+## Benchmarks
+
 Run the benchmark script with:
 
 ```julia
-julia benchmark/run_benchmarks.jl
+julia --project=. benchmark/runbenchmarks.jl
 ```
 
 Set `RATIONALSDP_BENCH_REPS` to control the number of timed repetitions.
+
+The benchmark suite includes:
+
+- a box-constrained LP-style model
+- a larger mixed PSD/scalar model
+- a small SOS quartic model
+- a quartic Lorenz-style polynomial SDP relaxation
+
+## When This Solver Is A Good Fit
+
+`RationalSDP` is a good fit when:
+
+- you care about exact rational primal output
+- your model is naturally written in JuMP / MOI
+- your problem is SDP-flavored but still within the current scope
+- you are comfortable using an experimental solver with a growing test suite
+
+It is probably not the right fit when:
+
+- you need dual solutions or certificates
+- you need the broadest possible conic support
+- you need industrial-scale robustness more than exact rational recovery
+
+## License / Maintenance
+
+This repository is currently best viewed as an experimental research / hobby
+solver project. Contributions, bug reports, and new regression tests are very
+welcome, especially for small failing examples.

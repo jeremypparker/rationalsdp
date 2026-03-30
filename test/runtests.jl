@@ -6,7 +6,7 @@ using LinearAlgebra
 import MathOptInterface as MOI
 
 function rational_model(::Type{T}) where {T<:Real}
-    model = GenericModel{T}(() -> RationalSDP.Optimizer{T}())
+    model = GenericModel{T}(RationalSDP.Optimizer{T})
     set_silent(model)
     return model
 end
@@ -15,6 +15,16 @@ end
     @testset "Optimizer metadata" begin
         model = rational_model(Rational{BigInt})
         @test JuMP.solver_name(model) == "RationalSDP"
+    end
+
+    @testset "Optimizer attributes" begin
+        model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
+        set_optimizer_attribute(model, "phase1_outer_iterations", 24)
+        set_optimizer_attribute(model, "verbose", false)
+        set_optimizer_attribute(model, "rational_tolerance", "1e-30")
+        @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
+        @test get_optimizer_attribute(model, "verbose") == false
+        @test get_optimizer_attribute(model, "rational_tolerance") == big"1e-30"
     end
 
     @testset "PSD face pruning from forced nullspace directions" begin
@@ -206,6 +216,60 @@ end
         @test VQ1[2, 2] > 0//1
         @test VQ2[1, 1] > 0//1
         @test VQ2[2, 2] > 0//1
+    end
+
+    @testset "Lorenz SOS mean upper bound" begin
+        model = rational_model(Rational{BigInt})
+        @polyvar x[1:3]
+
+        f = [
+            10 * (x[2] - x[1]);
+            28 * x[1] - x[1] * x[3] - x[2];
+            x[1] * x[2] - 8//3 * x[3];
+        ]
+
+        basis_V = monomials(x, 0:2)
+        @variable(model, coeffs_V[1:length(basis_V)])
+        V = dot(coeffs_V, basis_V)
+        LV = dot(f, differentiate(V, x))
+
+        basis_b = monomials(x, 0:1)
+        @variable(model, Q[1:length(basis_b), 1:length(basis_b)], PSD)
+        @variable(model, B)
+        @constraint(model, coefficients(B - x[3]^2 - LV - basis_b' * Q * basis_b) .== 0)
+        @objective(model, Min, B)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test BigFloat(value(B)) > big"729"
+        @test BigFloat(value(B)) < big"730"
+    end
+
+    @testset "Quartic Lorenz SOS mean upper bound" begin
+        model = rational_model(Rational{BigInt})
+        @polyvar x[1:3]
+
+        f = [
+            10 * (x[2] - x[1]);
+            28 * x[1] - x[1] * x[3] - x[2];
+            x[1] * x[2] - 8//3 * x[3];
+        ]
+
+        basis_V = monomials(x, 0:4)
+        @variable(model, coeffs_V[1:length(basis_V)])
+        V = dot(coeffs_V, basis_V)
+        LV = dot(f, differentiate(V, x))
+
+        basis_b = monomials(x, 0:2)
+        @variable(model, Q[1:length(basis_b), 1:length(basis_b)], PSD)
+        @variable(model, B)
+        @constraint(model, coefficients(B - x[3]^2 - LV - basis_b' * Q * basis_b) .== 0)
+        @objective(model, Min, B)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test BigFloat(value(B)) > big"728"
+        @test BigFloat(value(B)) < big"730"
     end
 
     @testset "Alternative rational output type" begin

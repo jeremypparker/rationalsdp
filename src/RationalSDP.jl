@@ -1,7 +1,6 @@
 module RationalSDP
 
 using LinearAlgebra
-using PrettyTables
 using Printf
 using Base.Threads
 import MathOptInterface as MOI

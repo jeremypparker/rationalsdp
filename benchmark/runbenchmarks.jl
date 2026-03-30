@@ -1,6 +1,7 @@
 import Pkg
 using Printf
 using Statistics
+using LinearAlgebra
 
 const REPO_ROOT = normpath(joinpath(@__DIR__, ".."))
 
@@ -17,7 +18,7 @@ function format_metric(x)
 end
 
 function rational_model(::Type{T}) where {T<:Real}
-    model = GenericModel{T}(() -> RationalSDP.Optimizer{T}(verbose = false))
+    model = GenericModel{T}(RationalSDP.Optimizer{T})
     set_silent(model)
     return model
 end
@@ -90,6 +91,29 @@ function build_sos_instance()
     return model
 end
 
+function build_lorenz_quartic_instance()
+    model = rational_model(Rational{BigInt})
+    @polyvar x[1:3]
+
+    f = [
+        10 * (x[2] - x[1]);
+        28 * x[1] - x[1] * x[3] - x[2];
+        x[1] * x[2] - 8 // 3 * x[3];
+    ]
+
+    basis_V = monomials(x, 0:4)
+    @variable(model, coeffs_V[1:length(basis_V)])
+    V = dot(coeffs_V, basis_V)
+    LV = dot(f, differentiate(V, x))
+
+    basis_b = monomials(x, 0:2)
+    @variable(model, Q[1:length(basis_b), 1:length(basis_b)], PSD)
+    @variable(model, B)
+    @constraint(model, coefficients(B - x[3]^2 - LV - basis_b' * Q * basis_b) .== 0)
+    @objective(model, Min, B)
+    return model
+end
+
 function benchmark_case(name::AbstractString, builder::Function; repetitions::Int)
     warmup = builder()
     optimize!(warmup)
@@ -137,6 +161,7 @@ function main()
     benchmark_case("lp_box_24", () -> build_lp_box_instance(24); repetitions = repetitions)
     benchmark_case("mixed_cone_20", build_large_mixed_instance; repetitions = repetitions)
     benchmark_case("sos_quartic", build_sos_instance; repetitions = repetitions)
+    benchmark_case("lorenz_quartic", build_lorenz_quartic_instance; repetitions = repetitions)
 end
 
 main()

@@ -16,7 +16,7 @@ MOIU.@model(
 
 Base.@kwdef mutable struct Settings
     max_iterations::Int = 80
-    phase1_outer_iterations::Int = 14
+    phase1_outer_iterations::Int = 100
     phase2_outer_iterations::Int = 12
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
@@ -68,6 +68,12 @@ end
 
 struct NumericBlock
     structure::BlockStructure
+end
+
+struct NumericAffineData{F}
+    particular_big::Vector{BigFloat}
+    nullspace_big::Matrix{BigFloat}
+    nullspace_factor::F
 end
 
 mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
@@ -147,87 +153,105 @@ function _log_newton(opt::Optimizer, message::AbstractString)
     return
 end
 
-_live_progress_enabled(opt::Optimizer) = opt.settings.live_progress && stdout isa Base.TTY
+function _completed_rows(rows::Vector{Vector{String}})
+    return [row for row in rows if any(!isempty, row[2:end])]
+end
 
-const _PRETTY_TABLE_FORMAT = TextTableFormat(
-    borders = text_table_borders__unicode_rounded,
-)
-
-function _rows_to_matrix(rows::Vector{Vector{String}})
-    isempty(rows) && return zeros(String, 0, 0)
-    num_rows = length(rows)
-    num_cols = length(rows[1])
-    matrix = Matrix{String}(undef, num_rows, num_cols)
-    for row in 1:num_rows
-        for col in 1:num_cols
-            matrix[row, col] = rows[row][col]
+function _column_widths(columns::Vector{String}, rows::Vector{Vector{String}})
+    widths = [textwidth(column) for column in columns]
+    for row in rows
+        for index in eachindex(columns)
+            widths[index] = max(widths[index], textwidth(row[index]))
         end
     end
-    return matrix
+    return widths
 end
 
-function _phase_table_template(total_iterations::Int)
-    rows = [fill("", 5) for _ in 1:total_iterations]
-    for iteration in 1:total_iterations
-        rows[iteration][1] = "$(iteration)/$(total_iterations)"
-    end
-    return rows
-end
-
-function _render_table(
-    title::AbstractString,
-    columns::Vector{String},
-    rows::Vector{Vector{String}};
-    subtitle::AbstractString = "",
+function _format_table_row(
+    row::Vector{String},
+    widths::Vector{Int},
+    alignments::Vector{Symbol},
 )
-    table = _rows_to_matrix(rows)
-    return pretty_table(
-        String,
-        table;
-        column_labels = columns,
-        table_format = _PRETTY_TABLE_FORMAT,
-        title = title,
-        subtitle = subtitle,
-    )
+    cells = String[]
+    for index in eachindex(row)
+        padding = max(0, widths[index] - textwidth(row[index]))
+        if alignments[index] == :right
+            push!(cells, repeat(" ", padding) * row[index])
+        else
+            push!(cells, row[index] * repeat(" ", padding))
+        end
+    end
+    return "  " * join(cells, "  ")
 end
 
-function _log_pretty_table(
+function _table_separator(widths::Vector{Int})
+    return "  " * join((repeat("-", width) for width in widths), "  ")
+end
+
+function _log_table(
     opt::Optimizer,
     title::AbstractString,
     columns::Vector{String},
     rows::Vector{Vector{String}};
     subtitle::AbstractString = "",
+    alignments::Vector{Symbol} = vcat([:left], fill(:right, length(columns) - 1)),
 )
+    visible_rows = isempty(rows) ? rows : _completed_rows(rows)
+    widths = _column_widths(columns, visible_rows)
     _log_raw(opt)
-    _log_raw(opt, chomp(_render_table(title, columns, rows; subtitle)))
+    _log_raw(opt, title)
+    if !isempty(subtitle)
+        _log_raw(opt, subtitle)
+    end
+    _log_raw(opt, _format_table_row(columns, widths, fill(:left, length(columns))))
+    _log_raw(opt, _table_separator(widths))
+    for row in visible_rows
+        _log_raw(opt, _format_table_row(row, widths, alignments))
+    end
     return
 end
 
-function _print_live_table!(
+function _phase_table_widths(columns::Vector{String}, total_iterations::Int)
+    sample_rows = [[
+        string(total_iterations),
+        "1.000e+00",
+        "1.000e+00",
+        "-1.000e+00",
+        "9999.99",
+    ]]
+    return _column_widths(columns, sample_rows)
+end
+
+function _log_table_header(
     opt::Optimizer,
     title::AbstractString,
     columns::Vector{String},
-    rows::Vector{Vector{String}},
-    printed::Bool;
+    widths::Vector{Int};
     subtitle::AbstractString = "",
 )
-    if !opt.silent && opt.settings.verbose
-        pretty_table(
-            stdout,
-            _rows_to_matrix(rows);
-            column_labels = columns,
-            table_format = _PRETTY_TABLE_FORMAT,
-            title = title,
-            subtitle = subtitle,
-            overwrite_display = printed,
-        )
+    _log_raw(opt)
+    _log_raw(opt, title)
+    if !isempty(subtitle)
+        _log_raw(opt, subtitle)
     end
-    return true
+    _log_raw(opt, _format_table_row(columns, widths, fill(:left, length(columns))))
+    _log_raw(opt, _table_separator(widths))
+    return
+end
+
+function _log_table_row(
+    opt::Optimizer,
+    row::Vector{String},
+    widths::Vector{Int},
+    alignments::Vector{Symbol},
+)
+    _log_raw(opt, _format_table_row(row, widths, alignments))
+    return
 end
 
 function _log_banner(opt::Optimizer, problem::ProblemData)
     thread_count = opt.settings.threaded ? nthreads() : 1
-    _log_pretty_table(
+    _log_table(
         opt,
         "RationalSDP",
         ["Item", "Value"],
@@ -240,9 +264,45 @@ function _log_banner(opt::Optimizer, problem::ProblemData)
             ["Threads", string(thread_count)],
         ];
         subtitle = "Solve summary",
+        alignments = [:left, :left],
     )
     return
 end
+
+const _SETTINGS_DEFAULTS = Settings()
+const _SETTING_FIELDNAMES = fieldnames(Settings)
+const _SETTING_NAME_SET = Set(String(name) for name in _SETTING_FIELDNAMES)
+
+function _setting_symbol(name::AbstractString)
+    symbol = Symbol(name)
+    symbol in _SETTING_FIELDNAMES || throw(MOI.UnsupportedAttribute(MOI.RawOptimizerAttribute(name)))
+    return symbol
+end
+
+function _convert_setting_value(::Type{BigFloat}, value)
+    if value isa AbstractString
+        return parse(BigFloat, value)
+    end
+    return BigFloat(value)
+end
+
+function _convert_setting_value(::Type{Bool}, value)
+    if value isa AbstractString
+        lowercase_value = lowercase(value)
+        lowercase_value == "true" && return true
+        lowercase_value == "false" && return false
+    end
+    return convert(Bool, value)
+end
+
+function _convert_setting_value(::Type{Int}, value)
+    if value isa AbstractString
+        return parse(Int, value)
+    end
+    return convert(Int, value)
+end
+
+_convert_setting_value(::Type{T}, value) where {T} = convert(T, value)
 
 MOI.supports_incremental_interface(::Optimizer) = true
 MOI.copy_to(dest::Optimizer, src::MOI.ModelLike) = MOIU.default_copy_to(dest, src)
@@ -283,7 +343,11 @@ function MOI.supports(
     ::Optimizer,
     attr::MOI.AbstractOptimizerAttribute,
 )
-    return attr isa MOI.Silent || attr isa MOI.SolverName
+    return (
+        attr isa MOI.Silent ||
+        attr isa MOI.SolverName ||
+        (attr isa MOI.RawOptimizerAttribute && attr.name in _SETTING_NAME_SET)
+    )
 end
 
 MOI.supports(opt::Optimizer, attr::MOI.AbstractModelAttribute) = MOI.supports(opt.storage, attr)
@@ -314,6 +378,17 @@ function MOI.set(
 end
 
 MOI.get(opt::Optimizer, ::MOI.Silent) = opt.silent
+
+function MOI.set(
+    opt::Optimizer,
+    attr::MOI.RawOptimizerAttribute,
+    value,
+)
+    symbol = _setting_symbol(attr.name)
+    field_type = fieldtype(Settings, symbol)
+    setfield!(opt.settings, symbol, _convert_setting_value(field_type, value))
+    return
+end
 
 function MOI.set(
     opt::Optimizer,
@@ -348,7 +423,25 @@ MOI.get(opt::Optimizer, ::MOI.DualStatus) = opt.dual_status
 MOI.get(opt::Optimizer, ::MOI.RawStatusString) = opt.raw_status
 MOI.get(opt::Optimizer, ::MOI.SolveTimeSec) = opt.solve_time_sec
 MOI.get(::Optimizer, ::MOI.SolverName) = "RationalSDP"
-MOI.get(::Optimizer, ::MOI.ListOfOptimizerAttributesSet) = MOI.AbstractOptimizerAttribute[]
+
+function MOI.get(opt::Optimizer, ::MOI.ListOfOptimizerAttributesSet)
+    attrs = MOI.AbstractOptimizerAttribute[]
+    opt.silent && push!(attrs, MOI.Silent())
+    for name in _SETTING_FIELDNAMES
+        current = getfield(opt.settings, name)
+        default = getfield(_SETTINGS_DEFAULTS, name)
+        current == default || push!(attrs, MOI.RawOptimizerAttribute(String(name)))
+    end
+    return attrs
+end
+
+function MOI.get(
+    opt::Optimizer,
+    attr::MOI.RawOptimizerAttribute,
+)
+    symbol = _setting_symbol(attr.name)
+    return getfield(opt.settings, symbol)
+end
 
 function MOI.get(opt::Optimizer, attr::MOI.ObjectiveValue)
     MOI.check_result_index_bounds(opt, attr)
@@ -651,6 +744,15 @@ end
 
 function _numeric_blocks(blocks::Vector{BlockStructure})
     return [NumericBlock(block) for block in blocks]
+end
+
+function _numeric_affine_data(problem::ProblemData)
+    problem.affine === nothing && return nothing
+    particular, nullspace = problem.affine
+    particular_big = BigFloat.(particular)
+    nullspace_big = BigFloat.(nullspace)
+    nullspace_factor = size(nullspace, 2) == 0 ? nothing : qr(nullspace_big)
+    return NumericAffineData(particular_big, nullspace_big, nullspace_factor)
 end
 
 @inline function _barrier_gradient_entry(
@@ -1084,12 +1186,13 @@ function _build_phase1_initial_point(
     problem::ProblemData,
     settings::Settings,
     numeric_blocks::Vector{NumericBlock},
+    numeric_affine::Union{Nothing,NumericAffineData},
 )
     total_dimension = length(problem.objective_vector_raw)
-    x = if problem.affine === nothing
+    x = if numeric_affine === nothing
         zeros(BigFloat, total_dimension)
     else
-        BigFloat.(problem.affine[1])
+        copy(numeric_affine.particular_big)
     end
 
     scale = settings.initial_scale
@@ -1249,21 +1352,28 @@ function _newton_phase1!(
     return x
 end
 function _project_exact_solution(
-    x_approx::Vector{BigFloat},
+    coefficients::Vector{BigFloat},
     particular::Vector{ExactRational},
     nullspace::Matrix{ExactRational};
     tolerance::BigFloat,
 )
-    if size(nullspace, 2) == 0
+    if isempty(coefficients)
         return particular
     end
-    delta = x_approx .- BigFloat.(particular)
-    N_big = BigFloat.(nullspace)
-    coefficients = N_big \ delta
     rational_coefficients = [
         rationalize(BigInt, value; tol = tolerance) for value in coefficients
     ]
     return particular + nullspace * rational_coefficients
+end
+
+function _affine_coordinates(
+    x_approx::Vector{BigFloat},
+    numeric_affine::NumericAffineData,
+)
+    if size(numeric_affine.nullspace_big, 2) == 0
+        return BigFloat[]
+    end
+    return numeric_affine.nullspace_factor \ (x_approx .- numeric_affine.particular_big)
 end
 
 function _blend_to_interior(
@@ -1290,12 +1400,14 @@ function _phase1_exact_feasible_point(
     x_phase1::Vector{BigFloat},
     problem::ProblemData,
     settings::Settings,
+    numeric_affine::NumericAffineData,
 )
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
+    coefficients = _affine_coordinates(x_phase1, numeric_affine)
     for tolerance in _recovery_tolerances(settings)
         candidate = _project_exact_solution(
-            x_phase1,
+            coefficients,
             particular,
             nullspace;
             tolerance = tolerance,
@@ -1305,6 +1417,19 @@ function _phase1_exact_feasible_point(
         end
     end
     return nothing
+end
+
+function _should_attempt_phase1_recovery(
+    residual::BigFloat,
+    iteration::Int,
+    last_probe_residual::Union{Nothing,BigFloat},
+    settings::Settings,
+)
+    iteration == 1 && return true
+    residual <= settings.feasibility_tolerance && return true
+    residual <= big"1e-6" && return true
+    last_probe_residual === nothing && return true
+    return residual * 64 <= last_probe_residual
 end
 
 function _newton_phase2!(
@@ -1451,15 +1576,26 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         end
 
         numeric_blocks = _numeric_blocks(problem.blocks)
+        numeric_affine = _numeric_affine_data(problem)
         A_big = BigFloat.(problem.A)
         b_big = BigFloat.(problem.b)
-        x = _build_phase1_initial_point(problem, opt.settings, numeric_blocks)
+        x = _build_phase1_initial_point(problem, opt.settings, numeric_blocks, numeric_affine)
         phase1_center = copy(x)
         penalty = opt.settings.initial_penalty
 
-        phase1_rows = _phase_table_template(opt.settings.phase1_outer_iterations)
+        phase1_columns = ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"]
+        phase1_alignments = vcat([:left], fill(:right, length(phase1_columns) - 1))
+        phase1_widths = _phase_table_widths(phase1_columns, opt.settings.phase1_outer_iterations)
+        _log_table_header(
+            opt,
+            "Phase I",
+            phase1_columns,
+            phase1_widths;
+            subtitle = "Feasibility search",
+        )
         phase1_start_time = time_ns()
-        phase1_live_printed = false
+        anchor = nothing
+        last_phase1_recovery_probe = nothing
         for outer_iteration in 1:opt.settings.phase1_outer_iterations
             x = _newton_phase1!(
                 opt,
@@ -1478,32 +1614,32 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 problem.positive_scalars,
                 opt.settings,
             )
-            phase1_rows[outer_iteration][2] = _format_metric(penalty)
-            phase1_rows[outer_iteration][3] = _format_metric(residual)
-            phase1_rows[outer_iteration][4] = _format_metric(barrier_value)
-            phase1_rows[outer_iteration][5] = @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9)
-            if _live_progress_enabled(opt)
-                phase1_live_printed = _print_live_table!(
-                    opt,
-                    "Phase I",
-                    ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"],
-                    phase1_rows,
-                    phase1_live_printed;
-                    subtitle = "Feasibility search",
-                )
+            phase1_row = [
+                string(outer_iteration),
+                _format_metric(penalty),
+                _format_metric(residual),
+                _format_metric(barrier_value),
+                @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
+            ]
+            _log_table_row(opt, phase1_row, phase1_widths, phase1_alignments)
+            if _should_attempt_phase1_recovery(
+                residual,
+                outer_iteration,
+                last_phase1_recovery_probe,
+                opt.settings,
+            )
+                anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+                last_phase1_recovery_probe = residual
             end
-            residual <= opt.settings.feasibility_tolerance && break
+            if residual <= opt.settings.feasibility_tolerance || anchor !== nothing
+                break
+            end
             penalty *= opt.settings.penalty_growth
         end
-        _live_progress_enabled(opt) || _log_pretty_table(
-            opt,
-            "Phase I",
-            ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"],
-            phase1_rows;
-            subtitle = "Feasibility search",
-        )
 
-        anchor = _phase1_exact_feasible_point(x, problem, opt.settings)
+        if anchor === nothing
+            anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+        end
         if anchor === nothing
             opt.termination_status = MOI.NUMERICAL_ERROR
             opt.primal_status = MOI.NO_SOLUTION
@@ -1516,14 +1652,22 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         x_exact = anchor
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
             x0 = BigFloat.(x_exact)
-            N_big = BigFloat.(nullspace)
+            N_big = numeric_affine.nullspace_big
             c_big = BigFloat.(problem.objective_vector_min)
             z = zeros(BigFloat, size(nullspace, 2))
             barrier_parameter = one(BigFloat)
 
-            phase2_rows = _phase_table_template(opt.settings.phase2_outer_iterations)
+            phase2_columns = ["Iter", "Mu", "Objective", "Gap", "Time (s)"]
+            phase2_alignments = vcat([:left], fill(:right, length(phase2_columns) - 1))
+            phase2_widths = _phase_table_widths(phase2_columns, opt.settings.phase2_outer_iterations)
+            _log_table_header(
+                opt,
+                "Phase II",
+                phase2_columns,
+                phase2_widths;
+                subtitle = "Objective path-following",
+            )
             phase2_start_time = time_ns()
-            phase2_live_printed = false
             for outer_iteration in 1:opt.settings.phase2_outer_iterations
                 z = _newton_phase2!(
                     opt,
@@ -1538,35 +1682,22 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 x_trial = x0 + N_big * z
                 approximate_objective = dot(c_big, x_trial) + BigFloat(problem.objective_constant_raw)
                 gap_bound = BigFloat(barrier_dim) / barrier_parameter
-                phase2_rows[outer_iteration][2] = _format_metric(barrier_parameter)
-                phase2_rows[outer_iteration][3] = _format_metric(approximate_objective)
-                phase2_rows[outer_iteration][4] = _format_metric(gap_bound)
-                phase2_rows[outer_iteration][5] = @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9)
-                if _live_progress_enabled(opt)
-                    phase2_live_printed = _print_live_table!(
-                        opt,
-                        "Phase II",
-                        ["Iter", "Mu", "Objective", "Gap", "Time (s)"],
-                        phase2_rows,
-                        phase2_live_printed;
-                        subtitle = "Objective path-following",
-                    )
-                end
+                phase2_row = [
+                    string(outer_iteration),
+                    _format_metric(barrier_parameter),
+                    _format_metric(approximate_objective),
+                    _format_metric(gap_bound),
+                    @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
+                ]
+                _log_table_row(opt, phase2_row, phase2_widths, phase2_alignments)
                 if gap_bound <= opt.settings.optimality_gap_tolerance
                     break
                 end
                 barrier_parameter *= opt.settings.path_parameter_growth
             end
-            _live_progress_enabled(opt) || _log_pretty_table(
-                opt,
-                "Phase II",
-                ["Iter", "Mu", "Objective", "Gap", "Time (s)"],
-                phase2_rows;
-                subtitle = "Objective path-following",
-            )
 
             x_candidate = _project_exact_solution(
-                x0 + N_big * z,
+                _affine_coordinates(x0 + N_big * z, numeric_affine),
                 particular,
                 nullspace;
                 tolerance = opt.settings.rational_tolerance,

@@ -1,5 +1,6 @@
 module RationalSDP
 
+using DoubleFloats: Double64
 using LinearAlgebra
 using Printf
 using Base.Threads

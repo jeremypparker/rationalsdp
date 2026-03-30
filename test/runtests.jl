@@ -22,9 +22,23 @@ end
         set_optimizer_attribute(model, "phase1_outer_iterations", 24)
         set_optimizer_attribute(model, "verbose", false)
         set_optimizer_attribute(model, "rational_tolerance", "1e-30")
+        set_optimizer_attribute(model, "working_float_type", "BigFloat")
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "verbose") == false
         @test get_optimizer_attribute(model, "rational_tolerance") == big"1e-30"
+        @test get_optimizer_attribute(model, "working_float_type") == BigFloat
+    end
+
+    @testset "Working float type selection" begin
+        model = rational_model(Rational{BigInt})
+        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
+        set_optimizer_attribute(model, "working_float_type", BigFloat)
+        @variable(model, X[1:1, 1:1], PSD)
+        @constraint(model, X[1, 1] == 1//1)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test value(X[1, 1]) == 1//1
     end
 
     @testset "PSD face pruning from forced nullspace directions" begin
@@ -87,7 +101,7 @@ end
         @test vy <= 2//3
         @test vx + vy >= 1//3
         @test vx - vy <= 1//1
-        @test BigFloat(vy) < big"-0.333"
+        @test vy < -(333//1000)
     end
 
     @testset "LP scale with many interval constraints" begin
@@ -109,7 +123,7 @@ end
             @test values[i] >= 0//1
             @test values[i] <= upper_bounds[i]
         end
-        @test BigFloat(objective_value(model)) < big"2.51"
+        @test objective_value(model) < 251//100
     end
 
     @testset "Larger mixed cone instance" begin
@@ -181,7 +195,7 @@ end
         @test termination_status(model) == MOI.OPTIMAL
         @test value(Q[3, 3]) == 1//1
         @test value(Q[2, 3]) == 0//1
-        @test BigFloat(value(t)) < big"0.251"
+        @test value(t) < 251//1000
     end
 
     @testset "SOS Lyapunov feasibility with face pruning" begin
@@ -241,8 +255,8 @@ end
         optimize!(model)
 
         @test termination_status(model) == MOI.OPTIMAL
-        @test BigFloat(value(B)) > big"729"
-        @test BigFloat(value(B)) < big"730"
+        @test value(B) > 729//1
+        @test value(B) < 730//1
     end
 
     @testset "Quartic Lorenz SOS mean upper bound" begin
@@ -268,8 +282,8 @@ end
         optimize!(model)
 
         @test termination_status(model) == MOI.OPTIMAL
-        @test BigFloat(value(B)) > big"728"
-        @test BigFloat(value(B)) < big"730"
+        @test value(B) > 728//1
+        @test value(B) < 730//1
     end
 
     @testset "Alternative rational output type" begin

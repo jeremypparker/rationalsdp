@@ -18,6 +18,7 @@ Base.@kwdef mutable struct Settings
     max_iterations::Int = 80
     phase1_outer_iterations::Int = 100
     phase2_outer_iterations::Int = 12
+    working_float_type::DataType = Double64
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
     gradient_tolerance::BigFloat = big"1e-24"
@@ -70,10 +71,10 @@ struct NumericBlock
     structure::BlockStructure
 end
 
-struct NumericAffineData{F}
-    particular_big::Vector{BigFloat}
-    nullspace_big::Matrix{BigFloat}
-    nullspace_factor::F
+struct NumericAffineData{F,S}
+    particular::Vector{F}
+    nullspace::Matrix{F}
+    nullspace_factor::S
 end
 
 mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
@@ -286,6 +287,24 @@ function _convert_setting_value(::Type{BigFloat}, value)
     return BigFloat(value)
 end
 
+function _convert_setting_value(::Type{DataType}, value)
+    parsed = if value isa AbstractString
+        symbol = Symbol(value)
+        if isdefined(@__MODULE__, symbol)
+            getfield(@__MODULE__, symbol)
+        elseif isdefined(Base, symbol)
+            getfield(Base, symbol)
+        else
+            error("Unknown working float type: $(value)")
+        end
+    else
+        value
+    end
+    parsed isa Type || error("working_float_type must be a floating-point type.")
+    parsed <: AbstractFloat || error("working_float_type must be a subtype of AbstractFloat.")
+    return parsed
+end
+
 function _convert_setting_value(::Type{Bool}, value)
     if value isa AbstractString
         lowercase_value = lowercase(value)
@@ -303,6 +322,72 @@ function _convert_setting_value(::Type{Int}, value)
 end
 
 _convert_setting_value(::Type{T}, value) where {T} = convert(T, value)
+
+function _working_float_type(settings::Settings)
+    F = settings.working_float_type
+    F <: AbstractFloat || error("working_float_type must be a subtype of AbstractFloat.")
+    return F
+end
+
+_to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
+_to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
+_to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
+_to_working_float(::Type{F}, x::AbstractFloat) where {F<:AbstractFloat} = F(x)
+
+function _to_working_array(::Type{F}, values::AbstractVector) where {F<:AbstractFloat}
+    converted = Vector{F}(undef, length(values))
+    for index in eachindex(values)
+        converted[index] = _to_working_float(F, values[index])
+    end
+    return converted
+end
+
+function _to_working_array(::Type{F}, values::AbstractMatrix) where {F<:AbstractFloat}
+    converted = Matrix{F}(undef, size(values)...)
+    for index in eachindex(values)
+        converted[index] = _to_working_float(F, values[index])
+    end
+    return converted
+end
+
+function _with_working_precision(settings::Settings, f::Function)
+    F = _working_float_type(settings)
+    if F === BigFloat
+        return setprecision(BigFloat, settings.working_precision) do
+            f(F)
+        end
+    end
+    return f(F)
+end
+
+function _numeric_settings(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
+    return (
+        max_iterations = settings.max_iterations,
+        phase1_outer_iterations = settings.phase1_outer_iterations,
+        phase2_outer_iterations = settings.phase2_outer_iterations,
+        working_float_type = F,
+        feasibility_tolerance = _to_working_float(F, settings.feasibility_tolerance),
+        optimality_gap_tolerance = _to_working_float(F, settings.optimality_gap_tolerance),
+        gradient_tolerance = _to_working_float(F, settings.gradient_tolerance),
+        line_search_shrink = _to_working_float(F, settings.line_search_shrink),
+        armijo_fraction = _to_working_float(F, settings.armijo_fraction),
+        min_step = _to_working_float(F, settings.min_step),
+        initial_scale = _to_working_float(F, settings.initial_scale),
+        initial_penalty = _to_working_float(F, settings.initial_penalty),
+        penalty_growth = _to_working_float(F, settings.penalty_growth),
+        path_parameter_growth = _to_working_float(F, settings.path_parameter_growth),
+        phase1_center_weight = _to_working_float(F, settings.phase1_center_weight),
+        boundary_fraction = _to_working_float(F, settings.boundary_fraction),
+        working_precision = settings.working_precision,
+        rational_tolerance = _to_working_float(F, settings.rational_tolerance),
+        verbose = settings.verbose,
+        verbose_newton = settings.verbose_newton,
+        live_progress = settings.live_progress,
+        inner_log_frequency = settings.inner_log_frequency,
+        threaded = settings.threaded,
+        threading_min_block_size = settings.threading_min_block_size,
+    )
+end
 
 MOI.supports_incremental_interface(::Optimizer) = true
 MOI.copy_to(dest::Optimizer, src::MOI.ModelLike) = MOIU.default_copy_to(dest, src)
@@ -524,7 +609,7 @@ function _vector_to_matrix(
     return X
 end
 
-function _strictly_pd(matrix::Matrix{BigFloat})
+function _strictly_pd(matrix::AbstractMatrix{F}) where {F<:AbstractFloat}
     try
         cholesky(Hermitian(matrix))
         return true
@@ -746,30 +831,30 @@ function _numeric_blocks(blocks::Vector{BlockStructure})
     return [NumericBlock(block) for block in blocks]
 end
 
-function _numeric_affine_data(problem::ProblemData)
+function _numeric_affine_data(problem::ProblemData, ::Type{F}) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
-    particular_big = BigFloat.(particular)
-    nullspace_big = BigFloat.(nullspace)
-    nullspace_factor = size(nullspace, 2) == 0 ? nothing : qr(nullspace_big)
-    return NumericAffineData(particular_big, nullspace_big, nullspace_factor)
+    particular_numeric = _to_working_array(F, particular)
+    nullspace_numeric = _to_working_array(F, nullspace)
+    nullspace_factor = size(nullspace, 2) == 0 ? nothing : qr(nullspace_numeric)
+    return NumericAffineData(particular_numeric, nullspace_numeric, nullspace_factor)
 end
 
 @inline function _barrier_gradient_entry(
-    inverse_matrix::Matrix{BigFloat},
+    inverse_matrix::AbstractMatrix{F},
     i::Int,
     j::Int,
-)
+) where {F<:AbstractFloat}
     return i == j ? -inverse_matrix[i, i] : -2 * inverse_matrix[i, j]
 end
 
 @inline function _barrier_hessian_entry(
-    inverse_matrix::Matrix{BigFloat},
+    inverse_matrix::AbstractMatrix{F},
     i::Int,
     j::Int,
     k::Int,
     l::Int,
-)
+) where {F<:AbstractFloat}
     if i == j
         return k == l ? inverse_matrix[i, k]^2 : 2 * inverse_matrix[i, k] * inverse_matrix[i, l]
     elseif k == l
@@ -782,20 +867,20 @@ end
 end
 
 function _block_barrier_value_grad_hess!(
-    grad::Vector{BigFloat},
-    hess::Matrix{BigFloat},
-    x::Vector{BigFloat},
+    grad::Vector{F},
+    hess::Matrix{F},
+    x::Vector{F},
     numeric_block::NumericBlock,
-    settings::Settings,
+    settings,
     allow_threads::Bool,
-)
+) where {F<:AbstractFloat}
     block = numeric_block.structure
     X = _vector_to_matrix(x, block)
     factor = cholesky(Hermitian(X))
-    inverse_matrix = Matrix{BigFloat}(I, block.size, block.size)
+    inverse_matrix = Matrix{F}(I, block.size, block.size)
     ldiv!(factor, inverse_matrix)
 
-    logdet = zero(BigFloat)
+    logdet = zero(F)
     for diagonal_entry in diag(factor.L)
         logdet += log(diagonal_entry)
     end
@@ -1116,18 +1201,18 @@ function _extract_problem(opt::Optimizer{T}) where {T}
     )
 end
 function _barrier_value_grad_hess(
-    x::Vector{BigFloat},
+    x::Vector{F},
     numeric_blocks::Vector{NumericBlock},
     positive_scalars::Vector{Int},
-    settings::Settings,
-)
+    settings,
+) where {F<:AbstractFloat}
     p = length(x)
-    value = zero(BigFloat)
-    grad = zeros(BigFloat, p)
-    hess = zeros(BigFloat, p, p)
+    value = zero(F)
+    grad = zeros(F, p)
+    hess = zeros(F, p, p)
 
     if settings.threaded && nthreads() > 1 && length(numeric_blocks) > 1
-        values = zeros(BigFloat, Base.Threads.maxthreadid())
+        values = zeros(F, Base.Threads.maxthreadid())
         @threads for block_index in eachindex(numeric_blocks)
             tid = threadid()
             values[tid] += _block_barrier_value_grad_hess!(
@@ -1165,10 +1250,10 @@ function _barrier_value_grad_hess(
 end
 
 function _strictly_interior_numeric(
-    x::Vector{BigFloat},
+    x::Vector{F},
     numeric_blocks::Vector{NumericBlock},
     positive_scalars::Vector{Int},
-)
+) where {F<:AbstractFloat}
     for index in positive_scalars
         if !(x[index] > 0)
             return false
@@ -1184,15 +1269,16 @@ end
 
 function _build_phase1_initial_point(
     problem::ProblemData,
-    settings::Settings,
+    settings,
     numeric_blocks::Vector{NumericBlock},
     numeric_affine::Union{Nothing,NumericAffineData},
 )
+    F = settings.working_float_type
     total_dimension = length(problem.objective_vector_raw)
     x = if numeric_affine === nothing
-        zeros(BigFloat, total_dimension)
+        zeros(F, total_dimension)
     else
-        copy(numeric_affine.particular_big)
+        copy(numeric_affine.particular)
     end
 
     scale = settings.initial_scale
@@ -1214,8 +1300,8 @@ function _build_phase1_initial_point(
 end
 
 function _max_abs(vector::AbstractVector)
-    isempty(vector) && return zero(BigFloat)
-    result = zero(BigFloat)
+    isempty(vector) && return zero(eltype(vector))
+    result = zero(eltype(vector))
     for value in vector
         result = max(result, abs(value))
     end
@@ -1223,24 +1309,26 @@ function _max_abs(vector::AbstractVector)
 end
 
 function _recovery_tolerances(settings::Settings)
-    tolerances = BigFloat[]
-    tolerance = max(big"1e-8", sqrt(settings.rational_tolerance))
-    while tolerance > settings.rational_tolerance
+    F = _working_float_type(settings)
+    tolerances = F[]
+    tolerance = max(F(1.0e-8), sqrt(_to_working_float(F, settings.rational_tolerance)))
+    final_tolerance = _to_working_float(F, settings.rational_tolerance)
+    while tolerance > final_tolerance
         push!(tolerances, tolerance)
-        tolerance /= big"1e4"
+        tolerance /= F(1.0e4)
     end
-    push!(tolerances, settings.rational_tolerance)
+    push!(tolerances, final_tolerance)
     return tolerances
 end
 
 function _max_step_to_boundary(
-    x::Vector{BigFloat},
-    direction::Vector{BigFloat},
+    x::Vector{F},
+    direction::Vector{F},
     numeric_blocks::Vector{NumericBlock},
     positive_scalars::Vector{Int},
-    fraction::BigFloat,
-)
-    max_step = one(BigFloat)
+    fraction::F,
+) where {F<:AbstractFloat}
+    max_step = one(F)
     for index in positive_scalars
         if direction[index] < 0
             max_step = min(max_step, fraction * x[index] / (-direction[index]))
@@ -1256,19 +1344,20 @@ function _max_step_to_boundary(
             max_step = min(max_step, fraction / frobenius_bound)
         end
     end
-    return max(zero(BigFloat), max_step)
+    return max(zero(F), max_step)
 end
 
-function _solve_spd_system(matrix::Matrix{BigFloat}, rhs::Vector{BigFloat})
-    regularization = big"0"
-    identity_matrix = Matrix{BigFloat}(I, size(matrix, 1), size(matrix, 2))
+function _solve_spd_system(matrix::Matrix{F}, rhs::Vector{F}) where {F<:AbstractFloat}
+    regularization = zero(F)
+    identity_matrix = Matrix{F}(I, size(matrix, 1), size(matrix, 2))
+    seed = _to_working_float(F, big"1e-30")
     for _ in 1:10
         trial = matrix + regularization * identity_matrix
         try
             factor = cholesky(Hermitian(trial))
             return factor \ rhs
         catch
-            regularization = iszero(regularization) ? big"1e-30" : 10 * regularization
+            regularization = iszero(regularization) ? seed : F(10) * regularization
         end
     end
     error("Failed to factor Newton system.")
@@ -1276,15 +1365,16 @@ end
 
 function _newton_phase1!(
     opt::Optimizer,
-    x::Vector{BigFloat},
+    x::Vector{F},
     problem::ProblemData,
     numeric_blocks::Vector{NumericBlock},
-    A_big::Matrix{BigFloat},
-    b_big::Vector{BigFloat},
-    penalty::BigFloat,
-    center::Vector{BigFloat},
-)
-    settings = opt.settings
+    A_big::Matrix{F},
+    b_big::Vector{F},
+    penalty::F,
+    center::Vector{F},
+    numeric_settings,
+) where {F<:AbstractFloat}
+    settings = numeric_settings
     At = transpose(A_big)
     AtA = At * A_big
     center_weight = settings.phase1_center_weight
@@ -1317,7 +1407,7 @@ function _newton_phase1!(
         direction = -_solve_spd_system(hess, grad)
         directional_derivative = dot(grad, direction)
         step = min(
-            one(BigFloat),
+            one(F),
             _max_step_to_boundary(
                 x,
                 direction,
@@ -1352,11 +1442,11 @@ function _newton_phase1!(
     return x
 end
 function _project_exact_solution(
-    coefficients::Vector{BigFloat},
+    coefficients::Vector{F},
     particular::Vector{ExactRational},
     nullspace::Matrix{ExactRational};
-    tolerance::BigFloat,
-)
+    tolerance::F,
+) where {F<:AbstractFloat}
     if isempty(coefficients)
         return particular
     end
@@ -1367,13 +1457,13 @@ function _project_exact_solution(
 end
 
 function _affine_coordinates(
-    x_approx::Vector{BigFloat},
-    numeric_affine::NumericAffineData,
-)
-    if size(numeric_affine.nullspace_big, 2) == 0
-        return BigFloat[]
+    x_approx::Vector{F},
+    numeric_affine::NumericAffineData{F},
+) where {F<:AbstractFloat}
+    if size(numeric_affine.nullspace, 2) == 0
+        return F[]
     end
-    return numeric_affine.nullspace_factor \ (x_approx .- numeric_affine.particular_big)
+    return numeric_affine.nullspace_factor \ (x_approx .- numeric_affine.particular)
 end
 
 function _blend_to_interior(
@@ -1397,11 +1487,11 @@ function _blend_to_interior(
 end
 
 function _phase1_exact_feasible_point(
-    x_phase1::Vector{BigFloat},
+    x_phase1::Vector{F},
     problem::ProblemData,
     settings::Settings,
-    numeric_affine::NumericAffineData,
-)
+    numeric_affine::NumericAffineData{F},
+) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
     coefficients = _affine_coordinates(x_phase1, numeric_affine)
@@ -1420,29 +1510,30 @@ function _phase1_exact_feasible_point(
 end
 
 function _should_attempt_phase1_recovery(
-    residual::BigFloat,
+    residual::F,
     iteration::Int,
-    last_probe_residual::Union{Nothing,BigFloat},
-    settings::Settings,
-)
+    last_probe_residual::Union{Nothing,F},
+    settings,
+) where {F<:AbstractFloat}
     iteration == 1 && return true
     residual <= settings.feasibility_tolerance && return true
-    residual <= big"1e-6" && return true
+    residual <= F(1.0e-6) && return true
     last_probe_residual === nothing && return true
     return residual * 64 <= last_probe_residual
 end
 
 function _newton_phase2!(
     opt::Optimizer,
-    z::Vector{BigFloat},
-    x0::Vector{BigFloat},
-    N_big::Matrix{BigFloat},
-    c_big::Vector{BigFloat},
+    z::Vector{F},
+    x0::Vector{F},
+    N_big::Matrix{F},
+    c_big::Vector{F},
     numeric_blocks::Vector{NumericBlock},
     positive_scalars::Vector{Int},
-    barrier_parameter::BigFloat,
-)
-    settings = opt.settings
+    barrier_parameter::F,
+    numeric_settings,
+) where {F<:AbstractFloat}
+    settings = numeric_settings
     Nt_big = transpose(N_big)
     for iteration in 1:settings.max_iterations
         x = x0 + N_big * z
@@ -1468,7 +1559,7 @@ function _newton_phase2!(
         direction_x = N_big * direction
         directional_derivative = dot(grad_z, direction)
         step = min(
-            one(BigFloat),
+            one(F),
             _max_step_to_boundary(
                 x,
                 direction_x,
@@ -1523,7 +1614,8 @@ end
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
-    setprecision(opt.settings.working_precision) do
+    _with_working_precision(opt.settings, function (F)
+        numeric_settings = _numeric_settings(opt.settings, F)
         problem = _extract_problem(opt)
         _log_banner(opt, problem)
         if problem.affine === nothing
@@ -1576,12 +1668,12 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         end
 
         numeric_blocks = _numeric_blocks(problem.blocks)
-        numeric_affine = _numeric_affine_data(problem)
-        A_big = BigFloat.(problem.A)
-        b_big = BigFloat.(problem.b)
-        x = _build_phase1_initial_point(problem, opt.settings, numeric_blocks, numeric_affine)
+        numeric_affine = _numeric_affine_data(problem, F)
+        A_big = _to_working_array(F, problem.A)
+        b_big = _to_working_array(F, problem.b)
+        x = _build_phase1_initial_point(problem, numeric_settings, numeric_blocks, numeric_affine)
         phase1_center = copy(x)
-        penalty = opt.settings.initial_penalty
+        penalty = numeric_settings.initial_penalty
 
         phase1_columns = ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"]
         phase1_alignments = vcat([:left], fill(:right, length(phase1_columns) - 1))
@@ -1606,13 +1698,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 b_big,
                 penalty,
                 phase1_center,
+                numeric_settings,
             )
             residual = _max_abs(A_big * x - b_big)
             barrier_value, _, _ = _barrier_value_grad_hess(
                 x,
                 numeric_blocks,
                 problem.positive_scalars,
-                opt.settings,
+                numeric_settings,
             )
             phase1_row = [
                 string(outer_iteration),
@@ -1626,15 +1719,15 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 residual,
                 outer_iteration,
                 last_phase1_recovery_probe,
-                opt.settings,
+                numeric_settings,
             )
                 anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
                 last_phase1_recovery_probe = residual
             end
-            if residual <= opt.settings.feasibility_tolerance || anchor !== nothing
+            if residual <= numeric_settings.feasibility_tolerance || anchor !== nothing
                 break
             end
-            penalty *= opt.settings.penalty_growth
+            penalty *= numeric_settings.penalty_growth
         end
 
         if anchor === nothing
@@ -1651,11 +1744,11 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
 
         x_exact = anchor
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
-            x0 = BigFloat.(x_exact)
-            N_big = numeric_affine.nullspace_big
-            c_big = BigFloat.(problem.objective_vector_min)
-            z = zeros(BigFloat, size(nullspace, 2))
-            barrier_parameter = one(BigFloat)
+            x0 = _to_working_array(F, x_exact)
+            N_big = numeric_affine.nullspace
+            c_big = _to_working_array(F, problem.objective_vector_min)
+            z = zeros(F, size(nullspace, 2))
+            barrier_parameter = one(F)
 
             phase2_columns = ["Iter", "Mu", "Objective", "Gap", "Time (s)"]
             phase2_alignments = vcat([:left], fill(:right, length(phase2_columns) - 1))
@@ -1678,10 +1771,11 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                     numeric_blocks,
                     problem.positive_scalars,
                     barrier_parameter,
+                    numeric_settings,
                 )
                 x_trial = x0 + N_big * z
-                approximate_objective = dot(c_big, x_trial) + BigFloat(problem.objective_constant_raw)
-                gap_bound = BigFloat(barrier_dim) / barrier_parameter
+                approximate_objective = dot(c_big, x_trial) + _to_working_float(F, problem.objective_constant_raw)
+                gap_bound = _to_working_float(F, barrier_dim) / barrier_parameter
                 phase2_row = [
                     string(outer_iteration),
                     _format_metric(barrier_parameter),
@@ -1690,17 +1784,17 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                     @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
                 ]
                 _log_table_row(opt, phase2_row, phase2_widths, phase2_alignments)
-                if gap_bound <= opt.settings.optimality_gap_tolerance
+                if gap_bound <= numeric_settings.optimality_gap_tolerance
                     break
                 end
-                barrier_parameter *= opt.settings.path_parameter_growth
+                barrier_parameter *= numeric_settings.path_parameter_growth
             end
 
             x_candidate = _project_exact_solution(
                 _affine_coordinates(x0 + N_big * z, numeric_affine),
                 particular,
                 nullspace;
-                tolerance = opt.settings.rational_tolerance,
+                tolerance = numeric_settings.rational_tolerance,
             )
             x_exact = _blend_to_interior(anchor, x_candidate, problem)
         end
@@ -1718,6 +1812,6 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
         _log_raw(opt)
         _log(opt, "finished in " * @sprintf("%.3f", opt.solve_time_sec) * "s with objective $(objective_value)")
-    end
+    end)
     return
 end

@@ -37,6 +37,7 @@ So the right mental model is: experimental, candidly AI-built, but not random.
 - linear objectives
 - exact rational primal recovery at the end of the solve
 - user-selectable output types such as `Rational{BigInt}` and `Rational{Int}`
+- user-selectable internal working float types, with `Double64` as the default
 - solver settings exposed through JuMP / MOI optimizer attributes
 - threaded PSD barrier assembly for larger blocks
 
@@ -114,7 +115,7 @@ preferred JuMP style is:
 model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
 set_optimizer_attribute(model, "verbose", true)
 set_optimizer_attribute(model, "phase1_outer_iterations", 100)
-set_optimizer_attribute(model, "working_precision", 448)
+set_optimizer_attribute(model, "working_float_type", RationalSDP.Double64)
 set_optimizer_attribute(model, "threaded", true)
 ```
 
@@ -130,10 +131,22 @@ Some particularly useful settings are:
 - `verbose_newton`: also print inner Newton progress
 - `phase1_outer_iterations`: maximum number of outer Phase I penalty updates
 - `phase2_outer_iterations`: maximum number of outer Phase II barrier updates
-- `working_precision`: `BigFloat` precision used during the numerical solve
+- `working_float_type`: internal floating-point type used during the numerical solve
+- `working_precision`: `BigFloat` precision, used only when `working_float_type == BigFloat`
 - `rational_tolerance`: tolerance used during exact rational recovery
 - `threaded`: enable threaded PSD barrier assembly
 - `threading_min_block_size`: block-size threshold before threading is used
+
+By default, the numerical solve uses `Double64` from `DoubleFloats`, which is a
+reasonable middle ground between `Float64` and `BigFloat`. Performance depends
+on the problem and on the linear algebra path taken by the chosen type, so it
+is worth benchmarking `Float64`, `Double64`, and `BigFloat` on your own models.
+If you want a different internal type, for example:
+
+```julia
+set_optimizer_attribute(model, "working_float_type", Float64)
+set_optimizer_attribute(model, "working_float_type", BigFloat)
+```
 
 ## Logging
 

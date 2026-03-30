@@ -20,10 +20,14 @@ end
     @testset "Optimizer attributes" begin
         model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
         set_optimizer_attribute(model, "phase1_outer_iterations", 24)
+        set_optimizer_attribute(model, "phase1_backend", "native")
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         set_optimizer_attribute(model, "verbose", false)
         set_optimizer_attribute(model, "rational_tolerance", "1e-30")
         set_optimizer_attribute(model, "working_float_type", "BigFloat")
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
+        @test get_optimizer_attribute(model, "phase1_backend") == :native
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         @test get_optimizer_attribute(model, "verbose") == false
         @test get_optimizer_attribute(model, "rational_tolerance") == big"1e-30"
         @test get_optimizer_attribute(model, "working_float_type") == BigFloat
@@ -32,6 +36,8 @@ end
     @testset "Working float type selection" begin
         model = rational_model(Rational{BigInt})
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         set_optimizer_attribute(model, "working_float_type", BigFloat)
         @variable(model, X[1:1, 1:1], PSD)
         @constraint(model, X[1, 1] == 1//1)
@@ -39,6 +45,43 @@ end
         optimize!(model)
         @test termination_status(model) == MOI.OPTIMAL
         @test value(X[1, 1]) == 1//1
+    end
+
+    @testset "Native Phase I backend override" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "phase1_backend", :native)
+        @variable(model, X[1:1, 1:1], PSD)
+        @constraint(model, X[1, 1] == 1//1)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test value(X[1, 1]) == 1//1
+    end
+
+    @testset "Exact phase II segment refinement" begin
+        problem = RationalSDP.ProblemData(
+            [MOI.VariableIndex(1)],
+            RationalSDP.BlockStructure[],
+            [1],
+            Rational{BigInt}[1//1],
+            0//1,
+            Rational{BigInt}[1//1],
+            zeros(Rational{BigInt}, 0, 1),
+            Rational{BigInt}[],
+            nothing,
+        )
+        anchor = Rational{BigInt}[2//1]
+        candidate = Rational{BigInt}[0//1]
+        refined = RationalSDP._best_exact_interior_on_segment(
+            anchor,
+            candidate,
+            problem;
+            max_bisections = 8,
+        )
+        @test refined[1] > 0//1
+        @test refined[1] < anchor[1]
+        @test RationalSDP._exact_objective_value(problem, refined) <
+              RationalSDP._exact_objective_value(problem, anchor)
     end
 
     @testset "PSD face pruning from forced nullspace directions" begin

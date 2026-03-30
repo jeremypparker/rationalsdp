@@ -18,6 +18,10 @@ Base.@kwdef mutable struct Settings
     max_iterations::Int = 80
     phase1_outer_iterations::Int = 100
     phase2_outer_iterations::Int = 12
+    phase1_backend::Symbol = :hypatia
+    phase1_hypatia_float_type::DataType = Float64
+    phase1_hypatia_iter_limit::Int = 400
+    phase1_hypatia_margin_upper::BigFloat = big"1.0"
     working_float_type::DataType = Double64
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
@@ -33,12 +37,15 @@ Base.@kwdef mutable struct Settings
     boundary_fraction::BigFloat = big"0.99"
     working_precision::Int = 448
     rational_tolerance::BigFloat = big"1e-40"
+    exact_refinement_bisections::Int = 48
     verbose::Bool = true
     verbose_newton::Bool = false
     live_progress::Bool = true
     inner_log_frequency::Int = 10
     threaded::Bool = true
     threading_min_block_size::Int = 48
+    iterative_linear_solver::Bool = true
+    iterative_solver_min_dimension::Int = 384
 end
 
 struct BlockStructure
@@ -71,10 +78,19 @@ struct NumericBlock
     structure::BlockStructure
 end
 
-struct NumericAffineData{F,S}
+struct PSDBarrierCache{F}
+    numeric_block::NumericBlock
+    primal_matrix::Matrix{F}
+    inverse_matrix::Matrix{F}
+    eigenvectors::Matrix{F}
+    eigenvalues::Vector{F}
+end
+
+mutable struct NumericAffineData{F}
     particular::Vector{F}
-    nullspace::Matrix{F}
-    nullspace_factor::S
+    exact_nullspace::Matrix{ExactRational}
+    numeric_nullspace::Union{Nothing,Matrix{F}}
+    nullspace_factor::Any
 end
 
 mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
@@ -257,7 +273,7 @@ function _log_banner(opt::Optimizer, problem::ProblemData)
         "RationalSDP",
         ["Item", "Value"],
         [
-            ["Method", "Primal-only interior-point method with exact rational recovery"],
+            ["Method", "Primal barrier + exact recovery"],
             ["Variables", string(length(problem.original_variables))],
             ["PSD blocks", string(length(problem.blocks))],
             ["Scalar slacks", string(length(problem.positive_scalars))],
@@ -300,9 +316,13 @@ function _convert_setting_value(::Type{DataType}, value)
     else
         value
     end
-    parsed isa Type || error("working_float_type must be a floating-point type.")
-    parsed <: AbstractFloat || error("working_float_type must be a subtype of AbstractFloat.")
+    parsed isa Type || error("Float-type settings must be assigned a floating-point type.")
+    parsed <: AbstractFloat || error("Float-type settings must be subtypes of AbstractFloat.")
     return parsed
+end
+
+function _convert_setting_value(::Type{Symbol}, value)
+    return value isa AbstractString ? Symbol(value) : convert(Symbol, value)
 end
 
 function _convert_setting_value(::Type{Bool}, value)
@@ -329,6 +349,18 @@ function _working_float_type(settings::Settings)
     return F
 end
 
+function _phase1_backend(settings::Settings)
+    backend = settings.phase1_backend
+    backend in (:hypatia, :native) || error("phase1_backend must be :hypatia or :native.")
+    return backend
+end
+
+function _phase1_hypatia_float_type(settings::Settings)
+    F = settings.phase1_hypatia_float_type
+    F <: AbstractFloat || error("phase1_hypatia_float_type must be a subtype of AbstractFloat.")
+    return F
+end
+
 _to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
@@ -350,6 +382,23 @@ function _to_working_array(::Type{F}, values::AbstractMatrix) where {F<:Abstract
     return converted
 end
 
+function _to_working_sparse_matrix(::Type{F}, values::AbstractMatrix) where {F<:AbstractFloat}
+    row_indices = Int[]
+    column_indices = Int[]
+    entries = F[]
+    for column in 1:size(values, 2)
+        for row in 1:size(values, 1)
+            value = values[row, column]
+            if !iszero(value)
+                push!(row_indices, row)
+                push!(column_indices, column)
+                push!(entries, _to_working_float(F, value))
+            end
+        end
+    end
+    return sparse(row_indices, column_indices, entries, size(values)...)
+end
+
 function _with_working_precision(settings::Settings, f::Function)
     F = _working_float_type(settings)
     if F === BigFloat
@@ -361,6 +410,10 @@ function _with_working_precision(settings::Settings, f::Function)
 end
 
 function _numeric_settings(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
+    effective_gradient_tolerance = max(
+        _to_working_float(F, settings.gradient_tolerance),
+        sqrt(eps(F)),
+    )
     return (
         max_iterations = settings.max_iterations,
         phase1_outer_iterations = settings.phase1_outer_iterations,
@@ -368,7 +421,7 @@ function _numeric_settings(settings::Settings, ::Type{F}) where {F<:AbstractFloa
         working_float_type = F,
         feasibility_tolerance = _to_working_float(F, settings.feasibility_tolerance),
         optimality_gap_tolerance = _to_working_float(F, settings.optimality_gap_tolerance),
-        gradient_tolerance = _to_working_float(F, settings.gradient_tolerance),
+        gradient_tolerance = effective_gradient_tolerance,
         line_search_shrink = _to_working_float(F, settings.line_search_shrink),
         armijo_fraction = _to_working_float(F, settings.armijo_fraction),
         min_step = _to_working_float(F, settings.min_step),
@@ -386,6 +439,8 @@ function _numeric_settings(settings::Settings, ::Type{F}) where {F<:AbstractFloa
         inner_log_frequency = settings.inner_log_frequency,
         threaded = settings.threaded,
         threading_min_block_size = settings.threading_min_block_size,
+        iterative_linear_solver = settings.iterative_linear_solver,
+        iterative_solver_min_dimension = settings.iterative_solver_min_dimension,
     )
 end
 
@@ -609,6 +664,33 @@ function _vector_to_matrix(
     return X
 end
 
+function _dual_vector_to_matrix(
+    x::AbstractVector{S},
+    block::BlockStructure,
+) where {S}
+    X = zeros(S, block.size, block.size)
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        value = x[block.global_positions[local_index]]
+        if i != j
+            value /= 2
+        end
+        X[i, j] = value
+        X[j, i] = value
+    end
+    return X
+end
+
+function _matrix_to_vector!(
+    destination::AbstractVector{S},
+    X::AbstractMatrix{S},
+    block::BlockStructure,
+) where {S}
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        destination[block.global_positions[local_index]] = X[i, j]
+    end
+    return destination
+end
+
 function _strictly_pd(matrix::AbstractMatrix{F}) where {F<:AbstractFloat}
     try
         cholesky(Hermitian(matrix))
@@ -677,6 +759,30 @@ function _solve_affine_system(
         end
     end
     return particular, nullspace
+end
+
+function _phase1_active_positions(problem::ProblemData)
+    positions = Int[]
+    append!(positions, problem.positive_scalars)
+    for block in problem.blocks
+        append!(positions, block.global_positions)
+    end
+    return unique(sort(positions))
+end
+
+function _phase1_nullspace(problem::ProblemData)
+    problem.affine === nothing && error("Phase I nullspace requested without affine data.")
+    _, nullspace = problem.affine
+    size(nullspace, 2) == 0 && return nullspace
+
+    active_positions = _phase1_active_positions(problem)
+    isempty(active_positions) && return zeros(ExactRational, size(nullspace, 1), 0)
+
+    reduced = nullspace[active_positions, :]
+    reduced_augmented = hcat(copy(reduced), zeros(ExactRational, size(reduced, 1)))
+    _, pivots = _rref(reduced_augmented)
+    isempty(pivots) && return zeros(ExactRational, size(nullspace, 1), 0)
+    return nullspace[:, pivots]
 end
 
 function _variable_fixed_zero(
@@ -835,9 +941,28 @@ function _numeric_affine_data(problem::ProblemData, ::Type{F}) where {F<:Abstrac
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
     particular_numeric = _to_working_array(F, particular)
-    nullspace_numeric = _to_working_array(F, nullspace)
-    nullspace_factor = size(nullspace, 2) == 0 ? nothing : qr(nullspace_numeric)
-    return NumericAffineData(particular_numeric, nullspace_numeric, nullspace_factor)
+    return NumericAffineData{F}(particular_numeric, nullspace, nothing, nothing)
+end
+
+function _numeric_nullspace!(numeric_affine::NumericAffineData{F}) where {F<:AbstractFloat}
+    if size(numeric_affine.exact_nullspace, 2) == 0
+        if numeric_affine.numeric_nullspace === nothing
+            numeric_affine.numeric_nullspace = Matrix{F}(undef, size(numeric_affine.exact_nullspace)...)
+        end
+        return numeric_affine.numeric_nullspace
+    end
+    if numeric_affine.numeric_nullspace === nothing
+        numeric_affine.numeric_nullspace = _to_working_array(F, numeric_affine.exact_nullspace)
+    end
+    return numeric_affine.numeric_nullspace
+end
+
+function _nullspace_factor!(numeric_affine::NumericAffineData{F}) where {F<:AbstractFloat}
+    size(numeric_affine.exact_nullspace, 2) == 0 && return nothing
+    if numeric_affine.nullspace_factor === nothing
+        numeric_affine.nullspace_factor = qr(_numeric_nullspace!(numeric_affine))
+    end
+    return numeric_affine.nullspace_factor
 end
 
 @inline function _barrier_gradient_entry(
@@ -923,6 +1048,209 @@ function _block_barrier_value_grad_hess!(
     end
 
     return -2 * logdet
+end
+
+function _block_barrier_value_grad_diag!(
+    grad::Vector{F},
+    diag_hess::Vector{F},
+    x::Vector{F},
+    numeric_block::NumericBlock,
+) where {F<:AbstractFloat}
+    block = numeric_block.structure
+    X = _vector_to_matrix(x, block)
+    factor = cholesky(Hermitian(X))
+    inverse_matrix = Matrix{F}(I, block.size, block.size)
+    ldiv!(factor, inverse_matrix)
+
+    logdet = zero(F)
+    for diagonal_entry in diag(factor.L)
+        logdet += log(diagonal_entry)
+    end
+
+    local_positions = block.local_positions
+    global_positions = block.global_positions
+    for a in eachindex(local_positions)
+        i, j = local_positions[a]
+        ga = global_positions[a]
+        grad[ga] = _barrier_gradient_entry(inverse_matrix, i, j)
+        diag_hess[ga] = _barrier_hessian_entry(inverse_matrix, i, j, i, j)
+    end
+
+    spectral = eigen(Hermitian(X))
+    return -2 * logdet, PSDBarrierCache(
+        numeric_block,
+        X,
+        inverse_matrix,
+        spectral.vectors,
+        spectral.values,
+    )
+end
+
+function _barrier_value_only(
+    x::Vector{F},
+    numeric_blocks::Vector{NumericBlock},
+    positive_scalars::Vector{Int},
+) where {F<:AbstractFloat}
+    value = zero(F)
+    for numeric_block in numeric_blocks
+        block = numeric_block.structure
+        X = _vector_to_matrix(x, block)
+        factor = cholesky(Hermitian(X))
+        logdet = zero(F)
+        for diagonal_entry in diag(factor.L)
+            logdet += log(diagonal_entry)
+        end
+        value -= 2 * logdet
+    end
+    for index in positive_scalars
+        value -= log(x[index])
+    end
+    return value
+end
+
+function _barrier_value_grad_diag(
+    x::Vector{F},
+    numeric_blocks::Vector{NumericBlock},
+    positive_scalars::Vector{Int},
+) where {F<:AbstractFloat}
+    value = zero(F)
+    grad = zeros(F, length(x))
+    diag_hess = zeros(F, length(x))
+    caches = Vector{PSDBarrierCache{F}}(undef, length(numeric_blocks))
+
+    for block_index in eachindex(numeric_blocks)
+        block_value, cache = _block_barrier_value_grad_diag!(
+            grad,
+            diag_hess,
+            x,
+            numeric_blocks[block_index],
+        )
+        value += block_value
+        caches[block_index] = cache
+    end
+
+    for index in positive_scalars
+        inverse_slack = inv(x[index])
+        value -= log(x[index])
+        grad[index] -= inverse_slack
+        diag_hess[index] += inverse_slack^2
+    end
+
+    return value, grad, diag_hess, caches
+end
+
+function _barrier_hessian_mul!(
+    destination::Vector{F},
+    direction::Vector{F},
+    caches::Vector{PSDBarrierCache{F}},
+    positive_scalars::Vector{Int},
+    x::Vector{F},
+) where {F<:AbstractFloat}
+    fill!(destination, zero(F))
+    for cache in caches
+        block = cache.numeric_block.structure
+        D = _vector_to_matrix(direction, block)
+        M = cache.inverse_matrix * D * cache.inverse_matrix
+        for local_index in eachindex(block.local_positions)
+            i, j = block.local_positions[local_index]
+            global_index = block.global_positions[local_index]
+            destination[global_index] += i == j ? M[i, i] : 2 * M[i, j]
+        end
+    end
+    for index in positive_scalars
+        destination[index] += direction[index] / (x[index]^2)
+    end
+    return destination
+end
+
+function _apply_block_regularized_inverse!(
+    destination::AbstractVector{F},
+    rhs::AbstractVector{F},
+    cache::PSDBarrierCache{F},
+    center_weight::F,
+) where {F<:AbstractFloat}
+    block = cache.numeric_block.structure
+    rhs_matrix = _dual_vector_to_matrix(rhs, block)
+    Q = cache.eigenvectors
+    λ = cache.eigenvalues
+    transformed_rhs = transpose(Q) * rhs_matrix * Q
+    transformed_solution = similar(transformed_rhs)
+    @inbounds for j in axes(transformed_rhs, 2)
+        for i in axes(transformed_rhs, 1)
+            transformed_solution[i, j] =
+                transformed_rhs[i, j] / (inv(λ[i] * λ[j]) + center_weight)
+        end
+    end
+    solution_matrix = Q * transformed_solution * transpose(Q)
+    _matrix_to_vector!(destination, solution_matrix, block)
+    return destination
+end
+
+function _apply_regularized_barrier_inverse!(
+    destination::Vector{F},
+    rhs::AbstractVector{F},
+    caches::Vector{PSDBarrierCache{F}},
+    positive_scalars::Vector{Int},
+    x::Vector{F},
+    center_weight::F,
+) where {F<:AbstractFloat}
+    destination .= rhs ./ center_weight
+    for cache in caches
+        _apply_block_regularized_inverse!(destination, rhs, cache, center_weight)
+    end
+    for index in positive_scalars
+        destination[index] = rhs[index] / (inv(x[index]^2) + center_weight)
+    end
+    return destination
+end
+
+function _schur_phase1_direction(
+    opt::Optimizer,
+    grad::Vector{F},
+    A_big::AbstractMatrix{F},
+    At_big::AbstractMatrix{F},
+    penalty::F,
+    caches::Vector{PSDBarrierCache{F}},
+    positive_scalars::Vector{Int},
+    x::Vector{F},
+    center_weight::F,
+) where {F<:AbstractFloat}
+    inverse_grad = similar(grad)
+    _apply_regularized_barrier_inverse!(
+        inverse_grad,
+        grad,
+        caches,
+        positive_scalars,
+        x,
+        center_weight,
+    )
+
+    m = size(A_big, 1)
+    n = size(A_big, 2)
+    inverse_At = Matrix{F}(undef, n, m)
+    rhs_column = Vector{F}(undef, n)
+    solution_column = Vector{F}(undef, n)
+    for row_index in 1:m
+        rhs_column .= @view At_big[:, row_index]
+        _apply_regularized_barrier_inverse!(
+            solution_column,
+            rhs_column,
+            caches,
+            positive_scalars,
+            x,
+            center_weight,
+        )
+        @views inverse_At[:, row_index] .= solution_column
+    end
+
+    schur = A_big * inverse_At
+    diagonal_shift = inv(penalty)
+    for row_index in 1:m
+        schur[row_index, row_index] += diagonal_shift
+    end
+    rhs = A_big * inverse_grad
+    y = _solve_spd_system(schur, rhs)
+    return -inverse_grad + inverse_At * y
 end
 
 function _extract_affine_row(
@@ -1308,8 +1636,7 @@ function _max_abs(vector::AbstractVector)
     return result
 end
 
-function _recovery_tolerances(settings::Settings)
-    F = _working_float_type(settings)
+function _recovery_tolerances(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
     tolerances = F[]
     tolerance = max(F(1.0e-8), sqrt(_to_working_float(F, settings.rational_tolerance)))
     final_tolerance = _to_working_float(F, settings.rational_tolerance)
@@ -1319,6 +1646,10 @@ function _recovery_tolerances(settings::Settings)
     end
     push!(tolerances, final_tolerance)
     return tolerances
+end
+
+function _recovery_tolerances(settings::Settings)
+    return _recovery_tolerances(settings, _working_float_type(settings))
 end
 
 function _max_step_to_boundary(
@@ -1363,33 +1694,52 @@ function _solve_spd_system(matrix::Matrix{F}, rhs::Vector{F}) where {F<:Abstract
     error("Failed to factor Newton system.")
 end
 
+function _l2_norm(vector::AbstractVector{F}) where {F<:AbstractFloat}
+    isempty(vector) && return zero(F)
+    return sqrt(sum(abs2, vector))
+end
+
 function _newton_phase1!(
     opt::Optimizer,
     x::Vector{F},
     problem::ProblemData,
     numeric_blocks::Vector{NumericBlock},
-    A_big::Matrix{F},
+    A_big::AbstractMatrix{F},
+    At_big::AbstractMatrix{F},
+    AtA::Union{Nothing,Matrix{F}},
     b_big::Vector{F},
     penalty::F,
     center::Vector{F},
     numeric_settings,
 ) where {F<:AbstractFloat}
     settings = numeric_settings
-    At = transpose(A_big)
-    AtA = At * A_big
     center_weight = settings.phase1_center_weight
+    use_iterative_linear_solver =
+        settings.iterative_linear_solver && length(x) >= settings.iterative_solver_min_dimension
     for iteration in 1:settings.max_iterations
-        barrier_value, barrier_grad, barrier_hess = _barrier_value_grad_hess(
-            x,
-            numeric_blocks,
-            problem.positive_scalars,
-            settings,
-        )
+        barrier_value = zero(F)
+        barrier_grad = zeros(F, length(x))
+        barrier_hess = nothing
+        barrier_caches = PSDBarrierCache{F}[]
+        if use_iterative_linear_solver
+            barrier_value, barrier_grad, _, barrier_caches = _barrier_value_grad_diag(
+                x,
+                numeric_blocks,
+                problem.positive_scalars,
+            )
+        else
+            barrier_value, barrier_grad, barrier_hess = _barrier_value_grad_hess(
+                x,
+                numeric_blocks,
+                problem.positive_scalars,
+                settings,
+            )
+        end
         residual = A_big * x - b_big
         deviation = x - center
         residual_norm = _max_abs(residual)
         value = barrier_value + penalty * dot(residual, residual) / 2 + center_weight * dot(deviation, deviation) / 2
-        grad = barrier_grad + penalty * (At * residual) + center_weight * deviation
+        grad = barrier_grad + penalty * (At_big * residual) + center_weight * deviation
         grad_norm = _max_abs(grad)
         if iteration == 1 || iteration % settings.inner_log_frequency == 0
             _log_newton(
@@ -1400,11 +1750,25 @@ function _newton_phase1!(
         if grad_norm <= settings.gradient_tolerance
             return x
         end
-        hess = barrier_hess + penalty * AtA
-        for diagonal in 1:length(x)
-            hess[diagonal, diagonal] += center_weight
+        if use_iterative_linear_solver
+            direction = _schur_phase1_direction(
+                opt,
+                grad,
+                A_big,
+                At_big,
+                penalty,
+                barrier_caches,
+                problem.positive_scalars,
+                x,
+                center_weight,
+            )
+        else
+            hess = barrier_hess + something(AtA, At_big * A_big) * penalty
+            for diagonal in 1:length(x)
+                hess[diagonal, diagonal] += center_weight
+            end
+            direction = -_solve_spd_system(hess, grad)
         end
-        direction = -_solve_spd_system(hess, grad)
         directional_derivative = dot(grad, direction)
         step = min(
             one(F),
@@ -1420,11 +1784,10 @@ function _newton_phase1!(
         while step >= settings.min_step
             trial = x + step * direction
             if _strictly_interior_numeric(trial, numeric_blocks, problem.positive_scalars)
-                trial_barrier, _, _ = _barrier_value_grad_hess(
+                trial_barrier = _barrier_value_only(
                     trial,
                     numeric_blocks,
                     problem.positive_scalars,
-                    settings,
                 )
                 trial_residual = A_big * trial - b_big
                 trial_deviation = trial - center
@@ -1460,30 +1823,77 @@ function _affine_coordinates(
     x_approx::Vector{F},
     numeric_affine::NumericAffineData{F},
 ) where {F<:AbstractFloat}
-    if size(numeric_affine.nullspace, 2) == 0
+    if size(numeric_affine.exact_nullspace, 2) == 0
         return F[]
     end
-    return numeric_affine.nullspace_factor \ (x_approx .- numeric_affine.particular)
+    return _nullspace_factor!(numeric_affine) \ (x_approx .- numeric_affine.particular)
 end
 
-function _blend_to_interior(
+function _best_exact_interior_on_segment(
     anchor::Vector{ExactRational},
     candidate::Vector{ExactRational},
-    problem::ProblemData,
+    problem::ProblemData;
+    max_bisections::Int,
 )
+    candidate_objective = _exact_objective_value(problem, candidate)
+    anchor_objective = _exact_objective_value(problem, anchor)
+    candidate_objective < anchor_objective || return anchor
+
     if _strictly_interior_exact(candidate, problem.blocks, problem.positive_scalars)
         return candidate
     end
+
     delta = candidate - anchor
-    weight = 1 // 1
-    for _ in 1:128
+    any(!iszero, delta) || return anchor
+
+    lower = 0 // 1
+    upper = 1 // 1
+    best = anchor
+    for _ in 1:max_bisections
+        weight = (lower + upper) / 2
         trial = anchor + weight * delta
         if _strictly_interior_exact(trial, problem.blocks, problem.positive_scalars)
-            return trial
+            lower = weight
+            best = trial
+        else
+            upper = weight
         end
-        weight //= 2
     end
-    return anchor
+
+    return best
+end
+
+function _phase2_exact_refinement(
+    x_approx::Vector{F},
+    anchor::Vector{ExactRational},
+    problem::ProblemData,
+    settings::Settings,
+    numeric_affine::NumericAffineData{F},
+) where {F<:AbstractFloat}
+    problem.affine === nothing && return anchor
+    particular, nullspace = problem.affine
+    coefficients = _affine_coordinates(x_approx, numeric_affine)
+    best = anchor
+
+    for tolerance in _recovery_tolerances(settings, F)
+        candidate = _project_exact_solution(
+            coefficients,
+            particular,
+            nullspace;
+            tolerance = tolerance,
+        )
+        refined = _best_exact_interior_on_segment(
+            anchor,
+            candidate,
+            problem;
+            max_bisections = settings.exact_refinement_bisections,
+        )
+        if _exact_objective_value(problem, refined) < _exact_objective_value(problem, best)
+            best = refined
+        end
+    end
+
+    return best
 end
 
 function _phase1_exact_feasible_point(
@@ -1495,7 +1905,7 @@ function _phase1_exact_feasible_point(
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
     coefficients = _affine_coordinates(x_phase1, numeric_affine)
-    for tolerance in _recovery_tolerances(settings)
+    for tolerance in _recovery_tolerances(settings, F)
         candidate = _project_exact_solution(
             coefficients,
             particular,
@@ -1515,11 +1925,177 @@ function _should_attempt_phase1_recovery(
     last_probe_residual::Union{Nothing,F},
     settings,
 ) where {F<:AbstractFloat}
-    iteration == 1 && return true
     residual <= settings.feasibility_tolerance && return true
-    residual <= F(1.0e-6) && return true
-    last_probe_residual === nothing && return true
-    return residual * 64 <= last_probe_residual
+    residual <= F(1.0e-6) || return false
+    last_probe_residual === nothing && return iteration >= 2
+    return residual * 32 <= last_probe_residual
+end
+
+function _hypatia_phase1_syssolver(::Type{F}) where {F<:AbstractFloat}
+    if F == Float64
+        return Hypatia.Solvers.SymIndefSparseSystemSolver{F}(), false
+    end
+    return Hypatia.Solvers.SymIndefDenseSystemSolver{F}(), true
+end
+
+function _build_hypatia_phase1_model(
+    problem::ProblemData,
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    problem.affine === nothing && error("Hypatia Phase I requires a consistent affine reduction.")
+    particular, _ = problem.affine
+    nullspace = _phase1_nullspace(problem)
+    reduced_dimension = size(nullspace, 2)
+    total_dimension = reduced_dimension + 1
+    margin_index = total_dimension
+    scalar_margin_rows = length(problem.positive_scalars) + 2
+    psd_rows = sum((length(block.local_positions) for block in problem.blocks); init = 0)
+    total_cone_dimension = scalar_margin_rows + psd_rows
+
+    c = zeros(F, total_dimension)
+    c[margin_index] = -one(F)
+
+    A_reduced = spzeros(F, 0, total_dimension)
+    b_reduced = F[]
+    particular_numeric = _to_working_array(F, particular)
+    nullspace_numeric = _to_working_array(F, nullspace)
+
+    row_indices = Int[]
+    column_indices = Int[]
+    values = F[]
+    h = zeros(F, total_cone_dimension)
+    cones = Hypatia.Cones.Cone{F}[]
+
+    margin_upper = _to_working_float(F, settings.phase1_hypatia_margin_upper)
+    margin_upper > zero(F) || error("phase1_hypatia_margin_upper must be positive.")
+
+    row = 1
+    for index in problem.positive_scalars
+        h[row] = particular_numeric[index]
+        for column in 1:reduced_dimension
+            coefficient = nullspace_numeric[index, column]
+            iszero(coefficient) && continue
+            push!(row_indices, row)
+            push!(column_indices, column)
+            push!(values, -coefficient)
+        end
+        push!(row_indices, row)
+        push!(column_indices, margin_index)
+        push!(values, one(F))
+        row += 1
+    end
+
+    push!(row_indices, row)
+    push!(column_indices, margin_index)
+    push!(values, -one(F))
+    row += 1
+
+    h[row] = margin_upper
+    push!(row_indices, row)
+    push!(column_indices, margin_index)
+    push!(values, one(F))
+    row += 1
+
+    push!(cones, Hypatia.Cones.Nonnegative{F}(scalar_margin_rows))
+
+    rt2 = sqrt(F(2))
+    for block in problem.blocks
+        block_dimension = length(block.local_positions)
+        push!(cones, Hypatia.Cones.PosSemidefTri{F,F}(block_dimension))
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            row_index = row + local_index - 1
+            global_index = block.global_positions[local_index]
+            scale = i == j ? one(F) : rt2
+            h[row_index] = scale * particular_numeric[global_index]
+            for column in 1:reduced_dimension
+                coefficient = scale * nullspace_numeric[global_index, column]
+                iszero(coefficient) && continue
+                push!(row_indices, row_index)
+                push!(column_indices, column)
+                push!(values, -coefficient)
+            end
+            if i == j
+                push!(row_indices, row_index)
+                push!(column_indices, margin_index)
+                push!(values, one(F))
+            end
+        end
+        row += block_dimension
+    end
+
+    @assert row == total_cone_dimension + 1
+    G = sparse(row_indices, column_indices, values, total_cone_dimension, total_dimension)
+    return Hypatia.Models.Model{F}(c, A_reduced, b_reduced, G, h, cones)
+end
+
+function _hypatia_phase1_point(
+    problem::ProblemData,
+    coordinates::AbstractVector{F},
+) where {F<:AbstractFloat}
+    problem.affine === nothing && error("Hypatia Phase I requires a consistent affine reduction.")
+    particular, _ = problem.affine
+    nullspace = _phase1_nullspace(problem)
+    point = _to_working_array(F, particular)
+    if !isempty(coordinates)
+        point .+= _to_working_array(F, nullspace) * coordinates
+    end
+    return point
+end
+
+function _phase1_hypatia_anchor(
+    opt::Optimizer,
+    problem::ProblemData,
+)
+    HF = _phase1_hypatia_float_type(opt.settings)
+    model = _build_hypatia_phase1_model(problem, opt.settings, HF)
+    syssolver, use_dense_model = _hypatia_phase1_syssolver(HF)
+    solver = Hypatia.Solvers.Solver{HF}(
+        verbose = !opt.silent && opt.settings.verbose,
+        iter_limit = opt.settings.phase1_hypatia_iter_limit,
+        preprocess = false,
+        reduce = false,
+        syssolver = syssolver,
+        use_dense_model = use_dense_model,
+    )
+    start_time = time_ns()
+    Hypatia.Solvers.load(solver, model)
+    Hypatia.Solvers.solve(solver)
+
+    status = Hypatia.Solvers.get_status(solver)
+    iterations = Hypatia.Solvers.get_num_iters(solver)
+    total_time_sec = (time_ns() - start_time) / 1.0e9
+    raw_solution = try
+        Hypatia.Solvers.get_x(solver)
+    catch
+        nothing
+    end
+
+    if raw_solution === nothing || length(raw_solution) != size(model.G, 2)
+        _log(
+            opt,
+            "Hypatia Phase I: no usable point (status=$(status), iter=$(iterations), time=$(@sprintf("%.2f", total_time_sec))s)",
+        )
+        return nothing
+    end
+
+    candidate = _hypatia_phase1_point(problem, raw_solution[1:(end - 1)])
+    margin = raw_solution[end]
+    A_numeric = _to_working_sparse_matrix(HF, problem.A)
+    b_numeric = _to_working_array(HF, problem.b)
+    residual = size(A_numeric, 1) == 0 ? zero(HF) : _max_abs(A_numeric * candidate - b_numeric)
+
+    _log(
+        opt,
+        "Hypatia Phase I: status=$(status), iter=$(iterations), margin=$(_format_metric(margin)), residual=$(_format_metric(residual)), time=$(@sprintf("%.2f", total_time_sec))s",
+    )
+
+    all(isfinite, raw_solution) || return nothing
+    recovery_threshold = max(HF(1.0e-6), sqrt(eps(HF)))
+    residual <= recovery_threshold || return nothing
+
+    numeric_affine = _numeric_affine_data(problem, HF)
+    return _phase1_exact_feasible_point(candidate, problem, opt.settings, numeric_affine)
 end
 
 function _newton_phase2!(
@@ -1621,7 +2197,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         if problem.affine === nothing
             opt.termination_status = MOI.INFEASIBLE
             opt.primal_status = MOI.NO_SOLUTION
-            opt.raw_status = "Affine equalities are inconsistent."
+            opt.raw_status = "Inconsistent affine system"
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
             return
         end
@@ -1637,19 +2213,19 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             opt.termination_status = MOI.OPTIMAL
             opt.primal_status = MOI.FEASIBLE_POINT
             opt.dual_status = MOI.NO_SOLUTION
-            opt.raw_status = "Solved by exact affine elimination."
+            opt.raw_status = "Solved by affine elimination"
             opt.result_count = 1
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
-            _log(opt, "finished by exact elimination without barrier work")
+            _log(opt, "done by affine elimination")
             return
         elseif barrier_dim == 0
             objective_direction = _objective_nullspace_direction(problem.objective_vector_min, nullspace)
             if any(!iszero, objective_direction)
                 opt.termination_status = MOI.DUAL_INFEASIBLE
                 opt.primal_status = MOI.NO_SOLUTION
-                opt.raw_status = "Objective is unbounded along the affine nullspace."
+                opt.raw_status = "Unbounded on affine nullspace"
                 opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
-                _log(opt, "detected unbounded affine objective")
+                _log(opt, "unbounded on affine nullspace")
                 return
             end
             objective_value = _exact_objective_value(problem, particular)
@@ -1660,92 +2236,117 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             opt.termination_status = MOI.OPTIMAL
             opt.primal_status = MOI.FEASIBLE_POINT
             opt.dual_status = MOI.NO_SOLUTION
-            opt.raw_status = "Objective is constant over the affine feasible region."
+            opt.raw_status = "Constant on affine feasible set"
             opt.result_count = 1
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
-            _log(opt, "finished on a barrier-free affine problem")
+            _log(opt, "done on affine feasible set")
             return
         end
 
         numeric_blocks = _numeric_blocks(problem.blocks)
         numeric_affine = _numeric_affine_data(problem, F)
-        A_big = _to_working_array(F, problem.A)
-        b_big = _to_working_array(F, problem.b)
-        x = _build_phase1_initial_point(problem, numeric_settings, numeric_blocks, numeric_affine)
-        phase1_center = copy(x)
-        penalty = numeric_settings.initial_penalty
-
-        phase1_columns = ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"]
-        phase1_alignments = vcat([:left], fill(:right, length(phase1_columns) - 1))
-        phase1_widths = _phase_table_widths(phase1_columns, opt.settings.phase1_outer_iterations)
-        _log_table_header(
-            opt,
-            "Phase I",
-            phase1_columns,
-            phase1_widths;
-            subtitle = "Feasibility search",
-        )
-        phase1_start_time = time_ns()
         anchor = nothing
-        last_phase1_recovery_probe = nothing
-        for outer_iteration in 1:opt.settings.phase1_outer_iterations
-            x = _newton_phase1!(
-                opt,
-                x,
-                problem,
-                numeric_blocks,
-                A_big,
-                b_big,
-                penalty,
-                phase1_center,
-                numeric_settings,
-            )
-            residual = _max_abs(A_big * x - b_big)
-            barrier_value, _, _ = _barrier_value_grad_hess(
-                x,
-                numeric_blocks,
-                problem.positive_scalars,
-                numeric_settings,
-            )
-            phase1_row = [
-                string(outer_iteration),
-                _format_metric(penalty),
-                _format_metric(residual),
-                _format_metric(barrier_value),
-                @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
-            ]
-            _log_table_row(opt, phase1_row, phase1_widths, phase1_alignments)
-            if _should_attempt_phase1_recovery(
-                residual,
-                outer_iteration,
-                last_phase1_recovery_probe,
-                numeric_settings,
-            )
-                anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
-                last_phase1_recovery_probe = residual
+        if _phase1_backend(opt.settings) == :hypatia
+            _log(opt, "Phase I via Hypatia")
+            anchor = try
+                _phase1_hypatia_anchor(opt, problem)
+            catch err
+                _log(opt, "Hypatia Phase I failed ($(typeof(err))); using native Phase I")
+                nothing
             end
-            if residual <= numeric_settings.feasibility_tolerance || anchor !== nothing
-                break
-            end
-            penalty *= numeric_settings.penalty_growth
         end
 
         if anchor === nothing
-            anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+            _phase1_backend(opt.settings) == :hypatia &&
+                _log(opt, "using native Phase I")
+            use_iterative_phase1 =
+                numeric_settings.iterative_linear_solver &&
+                length(problem.objective_vector_raw) >= numeric_settings.iterative_solver_min_dimension
+            A_big = use_iterative_phase1 ?
+                _to_working_sparse_matrix(F, problem.A) :
+                _to_working_array(F, problem.A)
+            At_big = transpose(A_big)
+            b_big = _to_working_array(F, problem.b)
+            AtA_big = use_iterative_phase1 ? nothing : At_big * A_big
+            x = _build_phase1_initial_point(problem, numeric_settings, numeric_blocks, numeric_affine)
+            phase1_center = copy(x)
+            penalty = numeric_settings.initial_penalty
+
+            phase1_columns = ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"]
+            phase1_alignments = vcat([:left], fill(:right, length(phase1_columns) - 1))
+            phase1_widths = _phase_table_widths(phase1_columns, opt.settings.phase1_outer_iterations)
+            _log_table_header(
+                opt,
+                "Phase I",
+                phase1_columns,
+                phase1_widths;
+                subtitle = "Feasibility search",
+            )
+            phase1_start_time = time_ns()
+            last_phase1_recovery_probe = nothing
+            last_phase1_residual = typemax(F)
+            for outer_iteration in 1:opt.settings.phase1_outer_iterations
+                x = _newton_phase1!(
+                    opt,
+                    x,
+                    problem,
+                    numeric_blocks,
+                    A_big,
+                    At_big,
+                    AtA_big,
+                    b_big,
+                    penalty,
+                    phase1_center,
+                    numeric_settings,
+                )
+                residual = _max_abs(A_big * x - b_big)
+                last_phase1_residual = residual
+                barrier_value, _, _ = _barrier_value_grad_hess(
+                    x,
+                    numeric_blocks,
+                    problem.positive_scalars,
+                    numeric_settings,
+                )
+                phase1_row = [
+                    string(outer_iteration),
+                    _format_metric(penalty),
+                    _format_metric(residual),
+                    _format_metric(barrier_value),
+                    @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
+                ]
+                _log_table_row(opt, phase1_row, phase1_widths, phase1_alignments)
+                if _should_attempt_phase1_recovery(
+                    residual,
+                    outer_iteration,
+                    last_phase1_recovery_probe,
+                    numeric_settings,
+                )
+                    anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+                    last_phase1_recovery_probe = residual
+                end
+                if residual <= numeric_settings.feasibility_tolerance || anchor !== nothing
+                    break
+                end
+                penalty *= numeric_settings.penalty_growth
+            end
+
+            if anchor === nothing && last_phase1_residual <= F(1.0e-6)
+                anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+            end
         end
         if anchor === nothing
             opt.termination_status = MOI.NUMERICAL_ERROR
             opt.primal_status = MOI.NO_SOLUTION
-            opt.raw_status = "Failed to recover an exact strictly feasible rational point."
+            opt.raw_status = "Exact interior recovery failed"
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
-            _log(opt, "exact rational interior recovery failed after phase I")
+            _log(opt, "Phase I exact recovery failed")
             return
         end
 
         x_exact = anchor
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
             x0 = _to_working_array(F, x_exact)
-            N_big = numeric_affine.nullspace
+            N_big = _numeric_nullspace!(numeric_affine)
             c_big = _to_working_array(F, problem.objective_vector_min)
             z = zeros(F, size(nullspace, 2))
             barrier_parameter = one(F)
@@ -1790,13 +2391,13 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 barrier_parameter *= numeric_settings.path_parameter_growth
             end
 
-            x_candidate = _project_exact_solution(
-                _affine_coordinates(x0 + N_big * z, numeric_affine),
-                particular,
-                nullspace;
-                tolerance = numeric_settings.rational_tolerance,
+            x_exact = _phase2_exact_refinement(
+                x0 + N_big * z,
+                anchor,
+                problem,
+                opt.settings,
+                numeric_affine,
             )
-            x_exact = _blend_to_interior(anchor, x_candidate, problem)
         end
 
         objective_value = _exact_objective_value(problem, x_exact)
@@ -1807,11 +2408,11 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         opt.termination_status = MOI.OPTIMAL
         opt.primal_status = MOI.FEASIBLE_POINT
         opt.dual_status = MOI.NO_SOLUTION
-        opt.raw_status = "Solved with a primal-only mixed cone barrier method and exact rational recovery."
+        opt.raw_status = "Solved"
         opt.result_count = 1
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
         _log_raw(opt)
-        _log(opt, "finished in " * @sprintf("%.3f", opt.solve_time_sec) * "s with objective $(objective_value)")
+        _log(opt, "done in " * @sprintf("%.3f", opt.solve_time_sec) * "s, objective=$(objective_value)")
     end)
     return
 end

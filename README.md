@@ -38,12 +38,14 @@ So the right mental model is: experimental, candidly AI-built, but not random.
 - exact rational primal recovery at the end of the solve
 - user-selectable output types such as `Rational{BigInt}` and `Rational{Int}`
 - user-selectable internal working float types, with `Double64` as the default
+- a Hypatia-backed centered Phase I solve on the cleaned extracted conic problem
 - solver settings exposed through JuMP / MOI optimizer attributes
 - threaded PSD barrier assembly for larger blocks
 
 The solver is a two-stage primal interior-point method:
 
-1. Phase I searches for a strictly feasible interior point.
+1. Phase I, by default, solves a centered conic feasibility model with Hypatia
+   to get a numerically central interior candidate.
 2. Phase II follows the barrier path to improve the objective.
 3. The final point is projected back to an exact rational primal solution.
 
@@ -104,7 +106,10 @@ println(dual_status(model))
 ```
 
 On success, `value.(...)` returns exact rational values of the model's numeric
-type.
+type. When Phase II optimization is used, the solver now performs an exact
+rational refinement from the strictly interior anchor before returning the final
+point, which makes near-boundary optima more robust than a single final
+rationalization pass.
 
 ## Configuring The Solver
 
@@ -129,11 +134,16 @@ Some particularly useful settings are:
 
 - `verbose`: print the phase logs
 - `verbose_newton`: also print inner Newton progress
+- `phase1_backend`: choose `:hypatia` or `:native` for the Phase I feasibility search
+- `phase1_hypatia_float_type`: floating-point type used by the Hypatia Phase I backend
+- `phase1_hypatia_iter_limit`: iteration cap for the Hypatia Phase I backend
+- `phase1_hypatia_margin_upper`: upper bound on the centered Phase I margin variable
 - `phase1_outer_iterations`: maximum number of outer Phase I penalty updates
 - `phase2_outer_iterations`: maximum number of outer Phase II barrier updates
 - `working_float_type`: internal floating-point type used during the numerical solve
 - `working_precision`: `BigFloat` precision, used only when `working_float_type == BigFloat`
 - `rational_tolerance`: tolerance used during exact rational recovery
+- `exact_refinement_bisections`: dyadic refinement budget for exact rational Phase II improvement
 - `threaded`: enable threaded PSD barrier assembly
 - `threading_min_block_size`: block-size threshold before threading is used
 
@@ -148,14 +158,29 @@ set_optimizer_attribute(model, "working_float_type", Float64)
 set_optimizer_attribute(model, "working_float_type", BigFloat)
 ```
 
+By default, Phase I uses `Hypatia` with `Float64` on the cleaned conic problem,
+even if Phase II uses a different internal type. That split is deliberate:
+Phase I only needs to deliver a good numerical interior candidate, and
+Hypatia's strongest sparse linear algebra path is currently most attractive in
+`Float64`. If you want to force the old in-package Phase I instead:
+
+```julia
+set_optimizer_attribute(model, "phase1_backend", :native)
+```
+
 ## Logging
 
 With `verbose = true`, the solver prints:
 
 - a short solve summary
-- a live Phase I table, with one row printed after each outer iteration
+- a live Phase I log
 - a live Phase II table, with one row printed after each outer iteration
 - a final completion line with solve time and exact objective
+
+When `phase1_backend == :hypatia`, the Phase I output comes from Hypatia's own
+iteration log plus a short RationalSDP summary line with the centered margin
+and affine residual. When `phase1_backend == :native`, RationalSDP prints its
+own Phase I table.
 
 Use `set_silent(model)` to suppress solver output through JuMP.
 

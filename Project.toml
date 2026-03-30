@@ -1,7 +1,7 @@
 name = "RationalSDP"
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 authors = ["OpenAI Codex"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"

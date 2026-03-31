@@ -3,5 +3,4 @@ using Pkg
 Pkg.activate(@__DIR__; io = devnull)
 Pkg.instantiate(; io = devnull)
 
-include("testutils.jl")
-include("slowtests.jl")
+include("runtests.jl")

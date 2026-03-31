@@ -1,15 +1,4 @@
-using Test
-using JuMP
-using DynamicPolynomials
-using RationalSDP
-using LinearAlgebra
-import MathOptInterface as MOI
-
-function rational_model(::Type{T}) where {T<:Real}
-    model = GenericModel{T}(RationalSDP.Optimizer{T})
-    set_silent(model)
-    return model
-end
+include("testutils.jl")
 
 @testset "RationalSDP JuMP integration" begin
     @testset "Optimizer metadata" begin
@@ -22,12 +11,20 @@ end
         set_optimizer_attribute(model, "phase1_outer_iterations", 24)
         set_optimizer_attribute(model, "phase1_backend", "native")
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
+        set_optimizer_attribute(model, "phase1_hypatia_margin_upper", "1e-4")
+        set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
+        set_optimizer_attribute(model, "phase1_hypatia_margin_shrink", "0.2")
+        set_optimizer_attribute(model, "phase1_hypatia_objective_bias", "1e-12")
         set_optimizer_attribute(model, "verbose", false)
         set_optimizer_attribute(model, "rational_tolerance", "1e-30")
         set_optimizer_attribute(model, "working_float_type", "BigFloat")
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
+        @test get_optimizer_attribute(model, "phase1_hypatia_margin_upper") == big"1e-4"
+        @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
+        @test get_optimizer_attribute(model, "phase1_hypatia_margin_shrink") == big"0.2"
+        @test get_optimizer_attribute(model, "phase1_hypatia_objective_bias") == big"1e-12"
         @test get_optimizer_attribute(model, "verbose") == false
         @test get_optimizer_attribute(model, "rational_tolerance") == big"1e-30"
         @test get_optimizer_attribute(model, "working_float_type") == BigFloat
@@ -37,8 +34,13 @@ end
         model = rational_model(Rational{BigInt})
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
-        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
         set_optimizer_attribute(model, "working_float_type", BigFloat)
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", "auto")
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
         @variable(model, X[1:1, 1:1], PSD)
         @constraint(model, X[1, 1] == 1//1)
         @objective(model, Min, 0//1)

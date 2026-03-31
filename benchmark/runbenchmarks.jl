@@ -3,11 +3,10 @@ using Printf
 using Statistics
 using LinearAlgebra
 
-const REPO_ROOT = normpath(joinpath(@__DIR__, ".."))
+Pkg.activate(@__DIR__; io = devnull)
+Pkg.instantiate(; io = devnull)
 
-Pkg.activate(mktempdir(); io = devnull)
-Pkg.add(["JuMP", "DynamicPolynomials"]; io = devnull)
-Pkg.develop(path = REPO_ROOT; io = devnull)
+const REPO_ROOT = normpath(joinpath(@__DIR__, ".."))
 
 using JuMP
 using DynamicPolynomials

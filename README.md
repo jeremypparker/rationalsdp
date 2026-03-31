@@ -135,9 +135,12 @@ Some particularly useful settings are:
 - `verbose`: print the phase logs
 - `verbose_newton`: also print inner Newton progress
 - `phase1_backend`: choose `:hypatia` or `:native` for the Phase I feasibility search
-- `phase1_hypatia_float_type`: floating-point type used by the Hypatia Phase I backend
+- `phase1_hypatia_float_type`: floating-point type used by the Hypatia Phase I backend, defaulting to `working_float_type`; set it explicitly or use `"auto"`
 - `phase1_hypatia_iter_limit`: iteration cap for the Hypatia Phase I backend
-- `phase1_hypatia_margin_upper`: upper bound on the centered Phase I margin variable
+- `phase1_hypatia_margin_upper`: largest centered-margin cap Hypatia Phase I is allowed to use
+- `phase1_hypatia_min_margin_upper`: smallest centered-margin cap Hypatia Phase I tries before relaxing
+- `phase1_hypatia_margin_shrink`: geometric factor used when relaxing the Hypatia Phase I margin cap
+- `phase1_hypatia_objective_bias`: tiny objective tie-break used inside Hypatia Phase I when the model has a nonzero objective
 - `phase1_outer_iterations`: maximum number of outer Phase I penalty updates
 - `phase2_outer_iterations`: maximum number of outer Phase II barrier updates
 - `working_float_type`: internal floating-point type used during the numerical solve
@@ -158,11 +161,11 @@ set_optimizer_attribute(model, "working_float_type", Float64)
 set_optimizer_attribute(model, "working_float_type", BigFloat)
 ```
 
-By default, Phase I uses `Hypatia` with `Float64` on the cleaned conic problem,
-even if Phase II uses a different internal type. That split is deliberate:
-Phase I only needs to deliver a good numerical interior candidate, and
-Hypatia's strongest sparse linear algebra path is currently most attractive in
-`Float64`. If you want to force the old in-package Phase I instead:
+By default, Phase I uses Hypatia with the same floating-point type as
+`working_float_type`. On optimization problems, it now tries a small
+centered-margin cap first and only relaxes that cap if exact recovery fails,
+which gives the native Phase II solver a much better interior anchor on harder
+SOS-style models. If you want to force the old in-package Phase I instead:
 
 ```julia
 set_optimizer_attribute(model, "phase1_backend", :native)
@@ -210,21 +213,39 @@ facial reduction.
 
 ## Testing
 
-Run the full test suite with:
+For normal development, use the stable test environment instead of `Pkg.test`.
+That avoids the temporary test environment setup and keeps precompiled caches
+warm between runs.
+
+Run the fast test suite with:
+
+```julia
+julia test/runfasttests.jl
+```
+
+Run the full package test harness with:
 
 ```julia
 julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
-The tests are JuMP-level integration tests, not just unit tests for internal
-helpers, so they are a decent indicator that the public workflow still works.
+The direct test scripts are JuMP-level integration tests, not just unit tests
+for internal helpers, so they are a decent indicator that the public workflow
+still works.
+
+There is also a separate slow-only regression script for heavier cases such as
+the degree-6 Lorenz SOS bound:
+
+```julia
+julia test/runslowtests.jl
+```
 
 ## Benchmarks
 
 Run the benchmark script with:
 
 ```julia
-julia --project=. benchmark/runbenchmarks.jl
+julia benchmark/runbenchmarks.jl
 ```
 
 Set `RATIONALSDP_BENCH_REPS` to control the number of timed repetitions.

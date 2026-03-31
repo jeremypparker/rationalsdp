@@ -342,3 +342,7 @@ end
         @test value(y) == 2//3
     end
 end
+
+if "slow" in ARGS
+    include("slowtests.jl")
+end

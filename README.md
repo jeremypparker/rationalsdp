@@ -111,6 +111,27 @@ rational refinement from the strictly interior anchor before returning the final
 point, which makes near-boundary optima more robust than a single final
 rationalization pass.
 
+## Exact Input Data
+
+For proof-oriented workflows, write model data using exact integers and
+rationals such as `2` and `1//10`, not `2.0` or `0.1`.
+
+The optimizer itself is now intentionally rational-typed. In other words, use
+constructors like `RationalSDP.Optimizer{Rational{BigInt}}`, not
+`RationalSDP.Optimizer{Float64}`.
+
+If a floating-point or irrational coefficient reaches `RationalSDP`, the solver
+now throws an error instead of silently rationalizing it. That is deliberate:
+silently turning approximate data into exact rationals can hide bugs in
+computer-assisted proofs.
+
+One JuMP caveat is worth knowing: if you build a
+`GenericModel{Rational{BigInt}}`, JuMP may convert a float literal like `0.1`
+into an exact binary rational before the solver sees it. At that point the
+solver cannot distinguish it from an explicitly supplied rational with the same
+value. So if exactness matters, the safe rule is still simple: avoid float
+literals entirely and write exact rationals yourself.
+
 ## Configuring The Solver
 
 All fields of `RationalSDP.Settings` are exposed as optimizer attributes, so the

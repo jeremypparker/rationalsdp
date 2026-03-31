@@ -49,6 +49,12 @@ include("testutils.jl")
         @test value(X[1, 1]) == 1//1
     end
 
+    @testset "Reject approximate model coefficients" begin
+        @test_throws ArgumentError RationalSDP.Optimizer{Float64}()
+        @test_throws ArgumentError RationalSDP._exact_rational(0.1)
+        @test_throws ArgumentError RationalSDP._exact_rational(pi)
+    end
+
     @testset "Native Phase I backend override" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "phase1_backend", :native)

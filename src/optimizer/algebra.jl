@@ -8,8 +8,31 @@ end
 
 _exact_rational(x::Integer) = ExactRational(BigInt(x), BigInt(1))
 
+function _unsupported_exact_input_error(x, kind::AbstractString)
+    throw(
+        ArgumentError(
+            "RationalSDP requires exact integer/rational model coefficients. " *
+            "Received $(kind) value $(repr(x))::$(typeof(x)). " *
+            "Rewrite it using explicit rationals such as `1//10`.",
+        ),
+    )
+end
+
 function _exact_rational(x::AbstractFloat)
-    return rationalize(BigInt, BigFloat(x))
+    _unsupported_exact_input_error(x, "floating-point")
+end
+
+function _exact_rational(x::AbstractIrrational)
+    _unsupported_exact_input_error(x, "irrational")
+end
+
+function _exact_rational(x::Real)
+    throw(
+        ArgumentError(
+            "RationalSDP only accepts integer and rational model coefficients; " *
+            "received $(repr(x))::$(typeof(x)).",
+        ),
+    )
 end
 
 function _to_output_type(::Type{T}, x::ExactRational) where {T<:Real}

@@ -133,7 +133,7 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     objective_value::Union{Nothing,T}
 end
 
-function Optimizer{T}(; kwargs...) where {T<:Real}
+function Optimizer{T}(; kwargs...) where {T<:Rational}
     return Optimizer{T}(
         Settings(; kwargs...),
         StorageModel{T}(),
@@ -149,7 +149,16 @@ function Optimizer{T}(; kwargs...) where {T<:Real}
     )
 end
 
-Optimizer(; kwargs...) = Optimizer{Float64}(; kwargs...)
+function Optimizer{T}(; kwargs...) where {T<:Real}
+    throw(
+        ArgumentError(
+            "RationalSDP.Optimizer must be parameterized by a rational type, " *
+            "for example `RationalSDP.Optimizer{Rational{BigInt}}`.",
+        ),
+    )
+end
+
+Optimizer(; kwargs...) = Optimizer{Rational{BigInt}}(; kwargs...)
 
 function _reset_results!(opt::Optimizer)
     opt.termination_status = MOI.OPTIMIZE_NOT_CALLED

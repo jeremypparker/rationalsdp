@@ -44,6 +44,495 @@ function _solve_dual_rows_least_squares(
     return solution
 end
 
+function _convert_moi_function(
+    ::Type{F},
+    func::MOI.VariableIndex,
+    variable_map::Dict{MOI.VariableIndex,MOI.VariableIndex},
+) where {F<:AbstractFloat}
+    return variable_map[func]
+end
+
+function _convert_moi_function(
+    ::Type{F},
+    func::MOI.VectorOfVariables,
+    variable_map::Dict{MOI.VariableIndex,MOI.VariableIndex},
+) where {F<:AbstractFloat}
+    return MOI.VectorOfVariables([variable_map[vi] for vi in func.variables])
+end
+
+function _convert_moi_function(
+    ::Type{F},
+    func::MOI.ScalarAffineFunction{T},
+    variable_map::Dict{MOI.VariableIndex,MOI.VariableIndex},
+) where {F<:AbstractFloat,T}
+    terms = MOI.ScalarAffineTerm{F}[
+        MOI.ScalarAffineTerm(
+            _to_working_float(F, term.coefficient),
+            variable_map[term.variable],
+        ) for term in func.terms
+    ]
+    return MOI.ScalarAffineFunction(terms, _to_working_float(F, func.constant))
+end
+
+function _convert_moi_function(
+    ::Type{F},
+    func::MOI.VectorAffineFunction{T},
+    variable_map::Dict{MOI.VariableIndex,MOI.VariableIndex},
+) where {F<:AbstractFloat,T}
+    terms = MOI.VectorAffineTerm{F}[
+        MOI.VectorAffineTerm(
+            term.output_index,
+            MOI.ScalarAffineTerm(
+                _to_working_float(F, term.scalar_term.coefficient),
+                variable_map[term.scalar_term.variable],
+            ),
+        ) for term in func.terms
+    ]
+    constants = _to_working_array(F, func.constants)
+    return MOI.VectorAffineFunction(terms, constants)
+end
+
+_convert_moi_set(::Type{F}, set::MOI.EqualTo{T}) where {F<:AbstractFloat,T} =
+    MOI.EqualTo(_to_working_float(F, set.value))
+_convert_moi_set(::Type{F}, set::MOI.GreaterThan{T}) where {F<:AbstractFloat,T} =
+    MOI.GreaterThan(_to_working_float(F, set.lower))
+_convert_moi_set(::Type{F}, set::MOI.LessThan{T}) where {F<:AbstractFloat,T} =
+    MOI.LessThan(_to_working_float(F, set.upper))
+_convert_moi_set(::Type{F}, set::MOI.Interval{T}) where {F<:AbstractFloat,T} =
+    MOI.Interval(_to_working_float(F, set.lower), _to_working_float(F, set.upper))
+_convert_moi_set(::Type{F}, set::MOI.PositiveSemidefiniteConeTriangle) where {F<:AbstractFloat} = set
+
+function _copy_storage_to_hypatia_optimizer(
+    storage,
+    target,
+    ::Type{T},
+    ::Type{F},
+) where {T<:Real,F<:AbstractFloat}
+    variables = MOI.get(storage, MOI.ListOfVariableIndices())
+    mapped_variables = MOI.add_variables(target, length(variables))
+    variable_map = Dict{MOI.VariableIndex,MOI.VariableIndex}(
+        variable => mapped_variables[index] for (index, variable) in enumerate(variables)
+    )
+    constraint_map = Dict{Any,Any}()
+
+    sense = MOI.get(storage, MOI.ObjectiveSense())
+    MOI.set(target, MOI.ObjectiveSense(), sense)
+    if sense != MOI.FEASIBILITY_SENSE
+        objective_type = MOI.get(storage, MOI.ObjectiveFunctionType())
+        if objective_type == MOI.VariableIndex
+            func = MOI.get(storage, MOI.ObjectiveFunction{MOI.VariableIndex}())
+            MOI.set(
+                target,
+                MOI.ObjectiveFunction{MOI.VariableIndex}(),
+                _convert_moi_function(F, func, variable_map),
+            )
+        elseif objective_type <: MOI.ScalarAffineFunction
+            func = MOI.get(storage, MOI.ObjectiveFunction{objective_type}())
+            MOI.set(
+                target,
+                MOI.ObjectiveFunction{MOI.ScalarAffineFunction{F}}(),
+                _convert_moi_function(F, func, variable_map),
+            )
+        else
+            error("Unsupported objective function type for Hypatia dual postsolve: $objective_type")
+        end
+    end
+
+    scalar_constraint_types = (
+        (MOI.ScalarAffineFunction{T}, MOI.EqualTo{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.GreaterThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.LessThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.Interval{T}),
+        (MOI.VariableIndex, MOI.EqualTo{T}),
+        (MOI.VariableIndex, MOI.GreaterThan{T}),
+        (MOI.VariableIndex, MOI.LessThan{T}),
+        (MOI.VariableIndex, MOI.Interval{T}),
+    )
+
+    for (FuncType, SetType) in scalar_constraint_types
+        for ci in MOI.get(storage, MOI.ListOfConstraintIndices{FuncType,SetType}())
+            func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+            set = MOI.get(storage, MOI.ConstraintSet(), ci)
+            constraint_map[ci] = MOI.add_constraint(
+                target,
+                _convert_moi_function(F, func, variable_map),
+                _convert_moi_set(F, set),
+            )
+        end
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorOfVariables,
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        constraint_map[ci] = MOI.add_constraint(
+            target,
+            _convert_moi_function(F, func, variable_map),
+            _convert_moi_set(F, set),
+        )
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorAffineFunction{T},
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        constraint_map[ci] = MOI.add_constraint(
+            target,
+            _convert_moi_function(F, func, variable_map),
+            _convert_moi_set(F, set),
+        )
+    end
+
+    return constraint_map
+end
+
+function _cone_positions(problem::ProblemData)
+    positions = Int[]
+    append!(positions, problem.positive_scalars)
+    for block in problem.blocks
+        append!(positions, block.global_positions)
+    end
+    return unique(sort(positions))
+end
+
+function _dual_free_positions(problem::ProblemData)
+    return setdiff(collect(eachindex(problem.objective_vector_min)), _cone_positions(problem))
+end
+
+function _inverse_psd_affine_dual_vector(
+    raw::AbstractVector{F},
+    block::BlockStructure,
+) where {F<:AbstractFloat}
+    dual_vector = similar(raw)
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        value = raw[local_index]
+        if i != j
+            value *= 2
+        end
+        dual_vector[local_index] = value
+    end
+    return dual_vector
+end
+
+function _hypatia_dual_targets(
+    target,
+    constraint_map::Dict{Any,Any},
+    storage,
+    problem::ProblemData,
+    ::Type{T},
+    ::Type{F},
+) where {T<:Real,F<:AbstractFloat}
+    row_count = size(problem.A, 1)
+    y_target = zeros(F, row_count)
+
+    scalar_constraint_types = (
+        (MOI.ScalarAffineFunction{T}, MOI.EqualTo{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.GreaterThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.LessThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.Interval{T}),
+        (MOI.VariableIndex, MOI.EqualTo{T}),
+        (MOI.VariableIndex, MOI.GreaterThan{T}),
+        (MOI.VariableIndex, MOI.LessThan{T}),
+        (MOI.VariableIndex, MOI.Interval{T}),
+    )
+
+    for (FuncType, SetType) in scalar_constraint_types
+        for ci in MOI.get(storage, MOI.ListOfConstraintIndices{FuncType,SetType}())
+            rows = get(problem.scalar_constraint_rows, ci, Int[])
+            length(rows) == 1 || continue
+            mapped_ci = get(constraint_map, ci, nothing)
+            mapped_ci === nothing && continue
+            y_target[only(rows)] = MOI.get(target, MOI.ConstraintDual(), mapped_ci)
+        end
+    end
+
+    A_numeric = _to_working_array(F, problem.A)
+    s_target = _to_working_array(F, problem.objective_vector_min) - transpose(A_numeric) * y_target
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorOfVariables,
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        mapped_ci = get(constraint_map, ci, nothing)
+        mapped_ci === nothing && continue
+        block = problem.blocks[problem.psd_constraint_blocks[ci]]
+        s_target[block.global_positions] .= MOI.get(target, MOI.ConstraintDual(), mapped_ci)
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorAffineFunction{T},
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        mapped_ci = get(constraint_map, ci, nothing)
+        mapped_ci === nothing && continue
+        block = problem.blocks[problem.psd_constraint_blocks[ci]]
+        raw_dual = MOI.get(target, MOI.ConstraintDual(), mapped_ci)
+        s_target[block.global_positions] .= _inverse_psd_affine_dual_vector(raw_dual, block)
+    end
+
+    return y_target, s_target
+end
+
+function _dual_affine_exact_data(problem::ProblemData)
+    row_count = size(problem.A, 1)
+    free_positions = _dual_free_positions(problem)
+    if isempty(free_positions)
+        return (
+            zeros(ExactRational, row_count),
+            Matrix{ExactRational}(I, row_count, row_count),
+            _cone_positions(problem),
+        )
+    end
+
+    affine = _solve_affine_system(
+        Matrix(transpose(problem.A[:, free_positions])),
+        problem.objective_vector_min[free_positions],
+    )
+    affine === nothing && return nothing
+    y_particular, y_nullspace = affine
+    return y_particular, y_nullspace, _cone_positions(problem)
+end
+
+function _dual_candidate_margins(
+    problem::ProblemData,
+    s_exact::Vector{ExactRational},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    min_scalar = typemax(F)
+    if !isempty(problem.positive_scalars)
+        scalar_values = try
+            [_to_working_float(F, s_exact[index]) for index in problem.positive_scalars]
+        catch
+            return -typemax(F), -typemax(F)
+        end
+        all(isfinite, scalar_values) || return -typemax(F), -typemax(F)
+        min_scalar = minimum(scalar_values)
+    end
+    min_psd = typemax(F)
+    for block in problem.blocks
+        dual_matrix = try
+            _to_working_array(F, _dual_vector_to_matrix(s_exact, block))
+        catch
+            return -typemax(F), -typemax(F)
+        end
+        all(isfinite, dual_matrix) || return -typemax(F), -typemax(F)
+        eigen_min = try
+            minimum(eigvals(Symmetric(dual_matrix)))
+        catch
+            return -typemax(F), -typemax(F)
+        end
+        isfinite(eigen_min) || return -typemax(F), -typemax(F)
+        min_psd = min(min_psd, eigen_min)
+    end
+    return min_scalar, min_psd
+end
+
+function _select_exact_dual_candidate(
+    opt::Optimizer,
+    problem::ProblemData,
+    y_target::Vector{F},
+    s_target::Vector{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    exact_affine = _dual_affine_exact_data(problem)
+    exact_affine === nothing && return nothing
+    y_particular, y_nullspace, cone_positions = exact_affine
+
+    Y_numeric = _to_working_array(F, y_nullspace)
+    y_rhs = y_target - _to_working_array(F, y_particular)
+
+    cone_matrix = problem.A[:, cone_positions]
+    s_particular =
+        problem.objective_vector_min[cone_positions] - transpose(cone_matrix) * y_particular
+    S_numeric = -(_to_working_array(F, transpose(cone_matrix)) * Y_numeric)
+    s_rhs = s_target[cone_positions] - _to_working_array(F, s_particular)
+
+    weights = (F(1), F(10), F(100))
+    best = nothing
+    best_margin = -typemax(F)
+    best_violation = typemax(F)
+
+    for weight in weights
+        coordinates = if size(Y_numeric, 2) == 0
+            F[]
+        else
+            fitting_matrix =
+                isempty(cone_positions) ?
+                Y_numeric :
+                [Y_numeric; sqrt(weight) * S_numeric]
+            fitting_rhs =
+                isempty(cone_positions) ?
+                y_rhs :
+                [y_rhs; sqrt(weight) * s_rhs]
+            solved = try
+                fitting_matrix \ fitting_rhs
+            catch
+                nothing
+            end
+            solved === nothing && continue
+            all(isfinite, solved) || continue
+            solved
+        end
+
+        for tolerance in _recovery_tolerances(opt.settings, F)
+            y_exact = _project_exact_solution(
+                coordinates,
+                y_particular,
+                y_nullspace;
+                tolerance = tolerance,
+            )
+            s_exact = problem.objective_vector_min - transpose(problem.A) * y_exact
+            min_scalar, min_psd = _dual_candidate_margins(problem, s_exact, F)
+            margin = min(min_scalar, min_psd)
+            violation = max(zero(F), -min_scalar) + max(zero(F), -min_psd)
+            if margin > best_margin + sqrt(eps(F)) ||
+               (abs(margin - best_margin) <= sqrt(eps(F)) && violation < best_violation)
+                best = (y_exact = y_exact, s_exact = s_exact, min_scalar = min_scalar, min_psd = min_psd)
+                best_margin = margin
+                best_violation = violation
+            end
+        end
+    end
+
+    return best
+end
+
+function _set_exact_constraint_duals!(
+    opt::Optimizer{T},
+    problem::ProblemData,
+    y_exact::Vector{ExactRational},
+    s_exact::Vector{ExactRational},
+) where {T<:Real}
+    scalar_constraint_types = (
+        (MOI.ScalarAffineFunction{T}, MOI.EqualTo{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.GreaterThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.LessThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.Interval{T}),
+        (MOI.VariableIndex, MOI.EqualTo{T}),
+        (MOI.VariableIndex, MOI.GreaterThan{T}),
+        (MOI.VariableIndex, MOI.LessThan{T}),
+        (MOI.VariableIndex, MOI.Interval{T}),
+    )
+
+    for (FuncType, SetType) in scalar_constraint_types
+        for ci in MOI.get(opt.storage, MOI.ListOfConstraintIndices{FuncType,SetType}())
+            rows = get(problem.scalar_constraint_rows, ci, Int[])
+            length(rows) == 1 || continue
+            opt.constraint_dual[ci] = _to_output_type(T, y_exact[only(rows)])
+        end
+    end
+
+    for ci in MOI.get(
+        opt.storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorOfVariables,
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        block = problem.blocks[problem.psd_constraint_blocks[ci]]
+        opt.constraint_dual[ci] = _to_output_type.(T, s_exact[block.global_positions])
+    end
+
+    for ci in MOI.get(
+        opt.storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorAffineFunction{T},
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        block = problem.blocks[problem.psd_constraint_blocks[ci]]
+        dual_vector = _psd_affine_dual_vector(s_exact[block.global_positions], block)
+        opt.constraint_dual[ci] = _to_output_type.(T, dual_vector)
+    end
+    return
+end
+
+function _hypatia_storage_dual_postsolve!(
+    opt::Optimizer{T},
+    problem::ProblemData,
+) where {T<:Real}
+    HF = _dual_postsolve_float_type(opt.settings)
+    return _with_float_precision(HF, opt.settings.working_precision, function (::Type{F}) where {F<:AbstractFloat}
+        tolerance = _dual_output_tolerance(opt.settings)
+        target = MOI.instantiate(
+            () -> Hypatia.Optimizer{F}(verbose = false);
+            with_bridge_type = F,
+        )
+        MOI.set(target, MOI.Silent(), opt.silent || !opt.settings.verbose)
+        MOI.set(target, MOI.RawOptimizerAttribute("iter_limit"), opt.settings.phase1_hypatia_iter_limit)
+        constraint_map = _copy_storage_to_hypatia_optimizer(opt.storage, target, T, F)
+        MOI.optimize!(target)
+
+        termination = MOI.get(target, MOI.TerminationStatus())
+        dual_status = MOI.get(target, MOI.DualStatus())
+        if termination != MOI.OPTIMAL && termination != MOI.ALMOST_OPTIMAL
+            _log(
+                opt,
+                "Hypatia dual postsolve unavailable: term=$(termination), dual=$(dual_status)",
+            )
+            return false
+        end
+        if dual_status != MOI.FEASIBLE_POINT && dual_status != MOI.NEARLY_FEASIBLE_POINT
+            _log(
+                opt,
+                "Hypatia dual postsolve unavailable: term=$(termination), dual=$(dual_status)",
+            )
+            return false
+        end
+
+        y_target = nothing
+        s_target = nothing
+        try
+            y_target, s_target = _hypatia_dual_targets(target, constraint_map, opt.storage, problem, T, F)
+        catch err
+            _log(opt, "Hypatia dual postsolve fit unavailable: $(typeof(err))")
+        end
+        exact_dual =
+            y_target === nothing || s_target === nothing ?
+            nothing :
+            _select_exact_dual_candidate(opt, problem, y_target, s_target, F)
+        if exact_dual !== nothing
+            _set_exact_constraint_duals!(
+                opt,
+                problem,
+                exact_dual.y_exact,
+                exact_dual.s_exact,
+            )
+            _log(
+                opt,
+                "Hypatia dual postsolve: exact fit with scalar=$(_format_metric(exact_dual.min_scalar)), psd=$(_format_metric(exact_dual.min_psd))",
+            )
+            return true
+        end
+
+        for (original_ci, mapped_ci) in constraint_map
+            dual_value = try
+                MOI.get(target, MOI.ConstraintDual(), mapped_ci)
+            catch
+                continue
+            end
+            opt.constraint_dual[original_ci] = _convert_dual_output(T, dual_value, tolerance)
+        end
+        return true
+    end)
+end
+
 function _recover_dual_kkt(
     problem::ProblemData,
     x_numeric::Vector{F},
@@ -395,6 +884,11 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             dual_rows = dual_rows,
             dual_slack = dual_slack,
         )
+        if _dual_postsolve_backend(opt.settings) == :hypatia
+            if _hypatia_storage_dual_postsolve!(opt, problem)
+                dual_rows = zeros(F, 0)
+            end
+        end
         opt.objective_value = _to_output_type(T, objective_value)
         opt.termination_status = MOI.OPTIMAL
         opt.primal_status = MOI.FEASIBLE_POINT

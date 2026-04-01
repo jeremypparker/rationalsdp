@@ -253,6 +253,7 @@ function build_dualized_kse_timeaverage_model(; phase2_outer_iterations::Int = 4
     set_silent(ws.model)
     set_optimizer_attribute(ws.model, "working_float_type", Float64)
     set_optimizer_attribute(ws.model, "phase2_outer_iterations", phase2_outer_iterations)
+    set_optimizer_attribute(ws.model, "dual_postsolve_backend", :hypatia)
 
     gauge_basis = _kse_makebasis(ws, ws.v[1:4], 4, 4; odd = true)
     f1, _ = _kse_makepoly_from_basis(ws.model, gauge_basis)

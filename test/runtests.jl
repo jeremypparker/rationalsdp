@@ -35,12 +35,18 @@ include("testutils.jl")
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == RationalSDP.Double64
         set_optimizer_attribute(model, "working_float_type", BigFloat)
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
+        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == BigFloat
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "auto")
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
+        set_optimizer_attribute(model, "dual_postsolve_float_type", "Float64")
+        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == Float64
+        set_optimizer_attribute(model, "dual_postsolve_float_type", "auto")
+        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == BigFloat
         @variable(model, X[1:1, 1:1], PSD)
         @constraint(model, X[1, 1] == 1//1)
         @objective(model, Min, 0//1)
@@ -146,6 +152,27 @@ include("testutils.jl")
         @test dual_status(model) == MOI.FEASIBLE_POINT
         @test value(B) == 729//1
         @test all(iszero(value(coeff)) for coeff in coefficients(expression))
+    end
+
+    @testset "Hypatia dual postsolve exact equality recovery" begin
+        model = dual_model(Rational{BigInt})
+        set_silent(model)
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        set_optimizer_attribute(model, "dual_postsolve_backend", :hypatia)
+        @variable(model, Q[1:2, 1:2], PSD)
+        @variable(model, t)
+        @constraint(model, Q[1, 1] == t)
+        @constraint(model, 2//1 * Q[2, 1] == -1//1)
+        @constraint(model, Q[2, 2] == 1//1)
+        @objective(model, Min, t)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test dual_status(model) == MOI.FEASIBLE_POINT
+        @test value(Q[1, 1]) == value(t)
+        @test 2//1 * value(Q[2, 1]) == -1//1
+        @test value(Q[2, 2]) == 1//1
     end
 
     @testset "Exact phase II segment refinement" begin

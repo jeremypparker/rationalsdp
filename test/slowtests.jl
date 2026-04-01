@@ -33,9 +33,9 @@ include("kse_timeaverage_helpers.jl")
 
         @test result.termination_status == MOI.OPTIMAL
         @test result.primal_status == MOI.FEASIBLE_POINT
-        @test result.B_value > 20//1
-        @test result.B_value < 21//1
-        @test_broken all(
+        @test result.B_value > 11//4
+        @test result.B_value < 14//5
+        @test all(
             iszero(value(coeff)) for
             expression in result.certificate.expressions for
             coeff in coefficients(expression)

@@ -27,6 +27,8 @@ Base.@kwdef mutable struct Settings
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
     phase1_hypatia_margin_shrink::BigFloat = big"0.1"
     phase1_hypatia_objective_bias::BigFloat = big"1e-12"
+    dual_postsolve_backend::Symbol = :kkt
+    dual_postsolve_float_type::DataType = AbstractFloat
     working_float_type::DataType = Double64
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
@@ -413,6 +415,23 @@ function _phase1_hypatia_float_type(settings::Settings)
     return F
 end
 
+function _dual_postsolve_backend(settings::Settings)
+    backend = settings.dual_postsolve_backend
+    backend in (:kkt, :hypatia) ||
+        error("dual_postsolve_backend must be :kkt or :hypatia.")
+    return backend
+end
+
+function _dual_postsolve_float_type(settings::Settings)
+    F = settings.dual_postsolve_float_type
+    if F === AbstractFloat
+        return _working_float_type(settings)
+    end
+    F <: AbstractFloat ||
+        error("dual_postsolve_float_type must be a subtype of AbstractFloat or `auto`.")
+    return F
+end
+
 _to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
@@ -642,6 +661,7 @@ function MOI.get(
 )
     symbol = _setting_symbol(attr.name)
     symbol === :phase1_hypatia_float_type && return _phase1_hypatia_float_type(opt.settings)
+    symbol === :dual_postsolve_float_type && return _dual_postsolve_float_type(opt.settings)
     return getfield(opt.settings, symbol)
 end
 

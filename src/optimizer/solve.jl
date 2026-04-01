@@ -1,5 +1,187 @@
 # Top-level solve orchestration and result reporting.
 
+function _dual_output_tolerance(settings::Settings)
+    return max(big"1e-6", sqrt(settings.rational_tolerance))
+end
+
+function _convert_dual_output(::Type{T}, value, tolerance::BigFloat) where {T<:Real}
+    if value isa AbstractVector
+        return [_convert_dual_output(T, entry, tolerance) for entry in value]
+    elseif value isa Integer
+        return _to_output_type(T, _exact_rational(value))
+    end
+    return _to_output_type(T, rationalize(BigInt, BigFloat(value); tol = tolerance))
+end
+
+function _solve_dual_rows_least_squares(
+    M::AbstractMatrix{F},
+    rhs::AbstractVector{F},
+) where {F<:AbstractFloat}
+    solution = try
+        M \ rhs
+    catch
+        nothing
+    end
+    if solution !== nothing && all(isfinite, solution)
+        return solution
+    end
+
+    # Dualized models can make `A'` rank-deficient even when the KKT system is
+    # numerically well behaved. Use a pseudoinverse solve in that case so we can
+    # still recover consistent approximate duals for MOI / Dualization output.
+    svd_factor = svd(Matrix(M))
+    isempty(svd_factor.S) && return nothing
+    tolerance =
+        max(size(M)...) * eps(F) * maximum(svd_factor.S)
+    inverted_singular_values = [
+        sigma > tolerance ? inv(sigma) : zero(F) for sigma in svd_factor.S
+    ]
+    solution =
+        svd_factor.V *
+        Diagonal(inverted_singular_values) *
+        transpose(svd_factor.U) * rhs
+    all(isfinite, solution) || return nothing
+    return solution
+end
+
+function _recover_dual_kkt(
+    problem::ProblemData,
+    x_numeric::Vector{F},
+    barrier_parameter::F,
+    numeric_blocks::Vector{NumericBlock},
+    numeric_settings,
+) where {F<:AbstractFloat}
+    barrier_parameter > zero(F) || return nothing
+    _, barrier_grad, _ = _barrier_value_grad_hess(
+        x_numeric,
+        numeric_blocks,
+        problem.positive_scalars,
+        numeric_settings,
+    )
+    dual_slack = -barrier_grad / barrier_parameter
+
+    if size(problem.A, 1) == 0
+        return zeros(F, 0), dual_slack
+    end
+
+    A_big = _to_working_array(F, problem.A)
+    rhs = _to_working_array(F, problem.objective_vector_min) - dual_slack
+    dual_rows = _solve_dual_rows_least_squares(transpose(A_big), rhs)
+    dual_rows === nothing && return nothing
+    all(isfinite, dual_rows) || return nothing
+    return dual_rows, dual_slack
+end
+
+function _constraint_primal_value(
+    func::MOI.ScalarAffineFunction{T},
+    variable_primal::Dict{MOI.VariableIndex,T},
+) where {T}
+    value = func.constant
+    for term in func.terms
+        value += term.coefficient * variable_primal[term.variable]
+    end
+    return value
+end
+
+function _constraint_primal_value(
+    func::MOI.VectorAffineFunction{T},
+    variable_primal::Dict{MOI.VariableIndex,T},
+) where {T}
+    values = copy(func.constants)
+    for term in func.terms
+        values[term.output_index] +=
+            term.scalar_term.coefficient * variable_primal[term.scalar_term.variable]
+    end
+    return values
+end
+
+function _psd_affine_dual_vector(
+    dual_entries::AbstractVector,
+    block::BlockStructure,
+)
+    matrix = zeros(eltype(dual_entries), block.size, block.size)
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        value = dual_entries[local_index]
+        if i != j
+            value /= 2
+        end
+        matrix[i, j] = value
+        matrix[j, i] = value
+    end
+    vector = similar(dual_entries)
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        vector[local_index] = matrix[i, j]
+    end
+    return vector
+end
+
+function _populate_constraint_results!(
+    opt::Optimizer{T},
+    problem::ProblemData,
+    x_exact::Vector{ExactRational};
+    dual_rows = nothing,
+    dual_slack = nothing,
+) where {T<:Real}
+    tolerance = _dual_output_tolerance(opt.settings)
+    scalar_constraint_types = (
+        (MOI.ScalarAffineFunction{T}, MOI.EqualTo{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.GreaterThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.LessThan{T}),
+        (MOI.ScalarAffineFunction{T}, MOI.Interval{T}),
+        (MOI.VariableIndex, MOI.EqualTo{T}),
+        (MOI.VariableIndex, MOI.GreaterThan{T}),
+        (MOI.VariableIndex, MOI.LessThan{T}),
+        (MOI.VariableIndex, MOI.Interval{T}),
+    )
+
+    for (F, S) in scalar_constraint_types
+        for ci in MOI.get(opt.storage, MOI.ListOfConstraintIndices{F,S}())
+            func = MOI.get(opt.storage, MOI.ConstraintFunction(), ci)
+            primal_value = func isa MOI.VariableIndex ? opt.variable_primal[func] : _constraint_primal_value(func, opt.variable_primal)
+            opt.constraint_primal[ci] = primal_value
+            if dual_rows !== nothing && haskey(problem.scalar_constraint_rows, ci)
+                rows = problem.scalar_constraint_rows[ci]
+                length(rows) == 1 || continue
+                opt.constraint_dual[ci] = _convert_dual_output(T, dual_rows[only(rows)], tolerance)
+            end
+        end
+    end
+
+    for ci in MOI.get(
+        opt.storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorOfVariables,
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        func = MOI.get(opt.storage, MOI.ConstraintFunction(), ci)
+        opt.constraint_primal[ci] = [opt.variable_primal[variable] for variable in func.variables]
+        if dual_slack !== nothing && haskey(problem.psd_constraint_blocks, ci)
+            block = problem.blocks[problem.psd_constraint_blocks[ci]]
+            opt.constraint_dual[ci] = _convert_dual_output(T, dual_slack[block.global_positions], tolerance)
+        end
+    end
+    for ci in MOI.get(
+        opt.storage,
+        MOI.ListOfConstraintIndices{
+            MOI.VectorAffineFunction{T},
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+    )
+        func = MOI.get(opt.storage, MOI.ConstraintFunction(), ci)
+        opt.constraint_primal[ci] = _constraint_primal_value(func, opt.variable_primal)
+        if dual_slack !== nothing && haskey(problem.psd_constraint_blocks, ci)
+            block = problem.blocks[problem.psd_constraint_blocks[ci]]
+            opt.constraint_dual[ci] = _convert_dual_output(
+                T,
+                _psd_affine_dual_vector(dual_slack[block.global_positions], block),
+                tolerance,
+            )
+        end
+    end
+    return
+end
+
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
@@ -60,6 +242,8 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         numeric_affine = _numeric_affine_data(problem, F)
         anchor = nothing
         phase2_initial_point = nothing
+        dual_rows = nothing
+        dual_slack = nothing
         if _phase1_backend(opt.settings) == :hypatia
             _log(opt, "Phase I via Hypatia")
             attempt = try
@@ -170,7 +354,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         x_exact = anchor
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
             try
-                x_exact = _phase2_exact_solution(
+                phase2_result = _phase2_exact_solution(
                     opt,
                     problem,
                     anchor,
@@ -179,6 +363,17 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                     initial_point = phase2_initial_point,
                     subtitle = "Objective path-following",
                 )
+                x_exact = phase2_result.x_exact
+                dual_recovery = _recover_dual_kkt(
+                    problem,
+                    phase2_result.x_numeric,
+                    phase2_result.barrier_parameter,
+                    numeric_blocks,
+                    numeric_settings,
+                )
+                if dual_recovery !== nothing
+                    dual_rows, dual_slack = dual_recovery
+                end
             catch err
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
@@ -193,10 +388,17 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         for (index, variable) in enumerate(problem.original_variables)
             opt.variable_primal[variable] = _to_output_type(T, x_exact[index])
         end
+        _populate_constraint_results!(
+            opt,
+            problem,
+            x_exact;
+            dual_rows = dual_rows,
+            dual_slack = dual_slack,
+        )
         opt.objective_value = _to_output_type(T, objective_value)
         opt.termination_status = MOI.OPTIMAL
         opt.primal_status = MOI.FEASIBLE_POINT
-        opt.dual_status = MOI.NO_SOLUTION
+        opt.dual_status = dual_rows === nothing ? MOI.NO_SOLUTION : MOI.FEASIBLE_POINT
         opt.raw_status = "Solved"
         opt.result_count = 1
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9

@@ -887,7 +887,12 @@ function _phase2_exact_solution(
     initial_point::Union{Nothing,Vector{F}} = nothing,
     subtitle::String,
 ) where {F<:AbstractFloat}
-    problem.affine === nothing && return anchor
+    problem.affine === nothing &&
+        return (
+            x_exact = anchor,
+            x_numeric = _to_working_array(F, anchor),
+            barrier_parameter = one(F),
+        )
     particular, nullspace = problem.affine
     numeric_affine = _numeric_affine_data(problem, F)
 
@@ -917,7 +922,9 @@ function _phase2_exact_solution(
     previous_z = copy(z)
     stagnation_tolerance = max(F(1.0e-8), sqrt(eps(F)))
     stagnation_count = 0
+    last_barrier_parameter = barrier_parameter
     for outer_iteration in 1:opt.settings.phase2_outer_iterations
+        last_barrier_parameter = barrier_parameter
         previous_z .= z
         z = _newton_phase2!(
             opt,
@@ -963,13 +970,18 @@ function _phase2_exact_solution(
         barrier_parameter *= numeric_settings.path_parameter_growth
     end
 
-    return _phase2_exact_refinement(
-        x0 + N_big * z,
-        anchor,
-        problem,
-        opt.settings,
-        particular,
-        nullspace,
-        numeric_affine,
+    x_numeric = x0 + N_big * z
+    return (
+        x_exact = _phase2_exact_refinement(
+            x_numeric,
+            anchor,
+            problem,
+            opt.settings,
+            particular,
+            nullspace,
+            numeric_affine,
+        ),
+        x_numeric = x_numeric,
+        barrier_parameter = last_barrier_parameter,
     )
 end

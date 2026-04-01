@@ -1,3 +1,5 @@
+include("kse_timeaverage_helpers.jl")
+
 @testset "RationalSDP slow regressions" begin
     @testset "Sextic Lorenz SOS mean upper bound" begin
         model = rational_model(Rational{BigInt})
@@ -24,5 +26,19 @@
         @test termination_status(model) == MOI.OPTIMAL
         @test value(B) > 729//1
         @test value(B) < 730//1
+    end
+
+    @testset "Dualized KSE time-average bound variable" begin
+        result = solve_dualized_kse_timeaverage(; phase2_outer_iterations = 4)
+
+        @test result.termination_status == MOI.OPTIMAL
+        @test result.primal_status == MOI.FEASIBLE_POINT
+        @test result.B_value > 20//1
+        @test result.B_value < 21//1
+        @test_broken all(
+            iszero(value(coeff)) for
+            expression in result.certificate.expressions for
+            coeff in coefficients(expression)
+        )
     end
 end

@@ -66,6 +66,88 @@ include("testutils.jl")
         @test value(X[1, 1]) == 1//1
     end
 
+    @testset "Dualized model primal values" begin
+        model = dual_model(Rational{BigInt})
+        set_silent(model)
+        @variable(model, x >= 1//1)
+        @variable(model, X[1:1, 1:1], PSD)
+        @constraint(model, X[1, 1] >= 2//1)
+        @objective(model, Min, x + X[1, 1])
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test value(x) == 1//1
+        @test value(X[1, 1]) == 2//1
+    end
+
+    @testset "Dualized model with PSD equalities" begin
+        model = dual_model(Rational{BigInt})
+        set_silent(model)
+        @variable(model, X[1:2, 1:2], PSD)
+        @constraint(model, X[1, 1] == 2//1)
+        @constraint(model, X[1, 2] == 0//1)
+        @constraint(model, X[2, 2] >= 3//1)
+        @objective(model, Min, X[2, 2])
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test value(X[1, 1]) == 2//1
+        @test value(X[1, 2]) == 0//1
+        @test value(X[2, 2]) == 3//1
+    end
+
+    @testset "Dualized PSD affine values satisfy exact equalities" begin
+        model = dual_model(Rational{BigInt})
+        set_silent(model)
+        @variable(model, Q[1:2, 1:2], PSD)
+        @variable(model, t)
+        @constraint(model, Q[1, 1] == t)
+        @constraint(model, 2//1 * Q[2, 1] == -1//1)
+        @constraint(model, Q[2, 2] == 1//1)
+        @objective(model, Min, t)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test value(Q[1, 1]) == value(t)
+        @test 2//1 * value(Q[2, 1]) == -1//1
+        @test value(Q[2, 2]) == 1//1
+    end
+
+    @testset "Dualized Lorenz coefficient recovery" begin
+        model = dual_model(Rational{BigInt})
+        set_silent(model)
+        set_optimizer_attribute(model, "phase2_outer_iterations", 8)
+        @polyvar x[1:3]
+
+        f = [
+            10 * (x[2] - x[1]);
+            28 * x[1] - x[1] * x[3] - x[2];
+            x[1] * x[2] - 8//3 * x[3];
+        ]
+
+        basis_V = monomials(x, 0:2)
+        @variable(model, coeffs_V[1:length(basis_V)])
+        V = dot(coeffs_V, basis_V)
+        LV = dot(f, differentiate(V, x))
+
+        basis_b = monomials(x, 0:1)
+        @variable(model, Q[1:length(basis_b), 1:length(basis_b)], PSD)
+        @variable(model, B)
+        expression = B - x[3]^2 - LV - basis_b' * Q * basis_b
+        @constraint(model, coefficients(expression) .== 0)
+        @objective(model, Min, B)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test dual_status(model) == MOI.FEASIBLE_POINT
+        @test value(B) == 729//1
+        @test all(iszero(value(coeff)) for coeff in coefficients(expression))
+    end
+
     @testset "Exact phase II segment refinement" begin
         problem = RationalSDP.ProblemData(
             [MOI.VariableIndex(1)],

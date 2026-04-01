@@ -237,6 +237,8 @@ function ProblemData(
         b,
         affine,
         nothing,
+        Dict{Any,Vector{Int}}(),
+        Dict{Any,Int}(),
     )
 end
 
@@ -307,7 +309,7 @@ function _restrict_block(
     keep_directions::Vector{Int},
 )
     keep_lookup = Dict(direction => new_index for (new_index, direction) in enumerate(keep_directions))
-    variables = MOI.VariableIndex[]
+    variables = Union{Nothing,MOI.VariableIndex}[]
     global_positions = Int[]
     local_positions = Tuple{Int,Int}[]
     diagonal_positions = Int[]

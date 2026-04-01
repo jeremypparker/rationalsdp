@@ -12,7 +12,7 @@ MOIU.@model(
     (),
     (MOI.ScalarAffineFunction,),
     (MOI.VectorOfVariables,),
-    (),
+    (MOI.VectorAffineFunction,),
     false,
 )
 
@@ -55,7 +55,7 @@ end
 
 struct BlockStructure
     size::Int
-    variables::Vector{MOI.VariableIndex}
+    variables::Vector{Union{Nothing,MOI.VariableIndex}}
     global_positions::Vector{Int}
     local_positions::Vector{Tuple{Int,Int}}
     diagonal_positions::Vector{Int}
@@ -78,6 +78,8 @@ mutable struct ProblemData
     b::Vector{ExactRational}
     affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}}
     phase1_nullspace::Union{Nothing,Matrix{ExactRational}}
+    scalar_constraint_rows::Dict{Any,Vector{Int}}
+    psd_constraint_blocks::Dict{Any,Int}
 end
 
 struct NumericBlock
@@ -131,6 +133,8 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     result_count::Int
     variable_primal::Dict{MOI.VariableIndex,T}
     objective_value::Union{Nothing,T}
+    constraint_primal::Dict{Any,Any}
+    constraint_dual::Dict{Any,Any}
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -146,6 +150,8 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
         0,
         Dict{MOI.VariableIndex,T}(),
         nothing,
+        Dict{Any,Any}(),
+        Dict{Any,Any}(),
     )
 end
 
@@ -169,6 +175,8 @@ function _reset_results!(opt::Optimizer)
     opt.result_count = 0
     empty!(opt.variable_primal)
     opt.objective_value = nothing
+    empty!(opt.constraint_primal)
+    empty!(opt.constraint_dual)
     return
 end
 
@@ -555,6 +563,9 @@ function MOI.supports(
     attr::MOI.AbstractConstraintAttribute,
     ::Type{MOI.ConstraintIndex{F,S}},
 ) where {F,S}
+    if attr isa MOI.ConstraintDual || attr isa MOI.ConstraintPrimal
+        return true
+    end
     return MOI.supports(opt.storage, attr, MOI.ConstraintIndex{F,S})
 end
 
@@ -663,5 +674,12 @@ function MOI.get(
     attr::MOI.AbstractConstraintAttribute,
     ci::MOI.ConstraintIndex{F,S},
 ) where {F,S}
+    if attr isa MOI.ConstraintDual && haskey(opt.constraint_dual, ci)
+        MOI.check_result_index_bounds(opt, attr)
+        return opt.constraint_dual[ci]
+    elseif attr isa MOI.ConstraintPrimal && haskey(opt.constraint_primal, ci)
+        MOI.check_result_index_bounds(opt, attr)
+        return opt.constraint_primal[ci]
+    end
     return MOI.get(opt.storage, attr, ci)
 end

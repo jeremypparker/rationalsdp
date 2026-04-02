@@ -27,9 +27,13 @@ Base.@kwdef mutable struct Settings
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
     phase1_hypatia_margin_shrink::BigFloat = big"0.1"
     phase1_hypatia_objective_bias::BigFloat = big"1e-12"
-    dual_postsolve_backend::Symbol = :kkt
-    dual_postsolve_float_type::DataType = AbstractFloat
     working_float_type::DataType = Double64
+    facial_reduction::Bool = true
+    facial_reduction_max_rounds::Int = 8
+    facial_reduction_float_type::DataType = AbstractFloat
+    facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
+    facial_reduction_rank_tolerance::BigFloat = big"1e-8"
+    facial_reduction_irrational_behavior::Symbol = :error
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
     gradient_tolerance::BigFloat = big"1e-24"
@@ -136,7 +140,6 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     variable_primal::Dict{MOI.VariableIndex,T}
     objective_value::Union{Nothing,T}
     constraint_primal::Dict{Any,Any}
-    constraint_dual::Dict{Any,Any}
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -152,7 +155,6 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
         0,
         Dict{MOI.VariableIndex,T}(),
         nothing,
-        Dict{Any,Any}(),
         Dict{Any,Any}(),
     )
 end
@@ -178,7 +180,6 @@ function _reset_results!(opt::Optimizer)
     empty!(opt.variable_primal)
     opt.objective_value = nothing
     empty!(opt.constraint_primal)
-    empty!(opt.constraint_dual)
     return
 end
 
@@ -199,6 +200,7 @@ end
 function _log(opt::Optimizer, message::AbstractString)
     if !opt.silent && opt.settings.verbose
         println("[RationalSDP] ", message)
+        flush(stdout)
     end
     return
 end
@@ -415,21 +417,25 @@ function _phase1_hypatia_float_type(settings::Settings)
     return F
 end
 
-function _dual_postsolve_backend(settings::Settings)
-    backend = settings.dual_postsolve_backend
-    backend in (:kkt, :hypatia) ||
-        error("dual_postsolve_backend must be :kkt or :hypatia.")
-    return backend
+function _phase1_hypatia_float_type_is_auto(settings::Settings)
+    return settings.phase1_hypatia_float_type === AbstractFloat
 end
 
-function _dual_postsolve_float_type(settings::Settings)
-    F = settings.dual_postsolve_float_type
+function _facial_reduction_float_type(settings::Settings)
+    F = settings.facial_reduction_float_type
     if F === AbstractFloat
         return _working_float_type(settings)
     end
     F <: AbstractFloat ||
-        error("dual_postsolve_float_type must be a subtype of AbstractFloat or `auto`.")
+        error("facial_reduction_float_type must be a subtype of AbstractFloat or `auto`.")
     return F
+end
+
+function _facial_reduction_irrational_behavior(settings::Settings)
+    behavior = settings.facial_reduction_irrational_behavior
+    behavior in (:error, :warn) ||
+        error("facial_reduction_irrational_behavior must be :error or :warn.")
+    return behavior
 end
 
 _to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
@@ -582,7 +588,7 @@ function MOI.supports(
     attr::MOI.AbstractConstraintAttribute,
     ::Type{MOI.ConstraintIndex{F,S}},
 ) where {F,S}
-    if attr isa MOI.ConstraintDual || attr isa MOI.ConstraintPrimal
+    if attr isa MOI.ConstraintPrimal
         return true
     end
     return MOI.supports(opt.storage, attr, MOI.ConstraintIndex{F,S})
@@ -661,7 +667,7 @@ function MOI.get(
 )
     symbol = _setting_symbol(attr.name)
     symbol === :phase1_hypatia_float_type && return _phase1_hypatia_float_type(opt.settings)
-    symbol === :dual_postsolve_float_type && return _dual_postsolve_float_type(opt.settings)
+    symbol === :facial_reduction_float_type && return _facial_reduction_float_type(opt.settings)
     return getfield(opt.settings, symbol)
 end
 
@@ -694,10 +700,7 @@ function MOI.get(
     attr::MOI.AbstractConstraintAttribute,
     ci::MOI.ConstraintIndex{F,S},
 ) where {F,S}
-    if attr isa MOI.ConstraintDual && haskey(opt.constraint_dual, ci)
-        MOI.check_result_index_bounds(opt, attr)
-        return opt.constraint_dual[ci]
-    elseif attr isa MOI.ConstraintPrimal && haskey(opt.constraint_primal, ci)
+    if attr isa MOI.ConstraintPrimal && haskey(opt.constraint_primal, ci)
         MOI.check_result_index_bounds(opt, attr)
         return opt.constraint_primal[ci]
     end

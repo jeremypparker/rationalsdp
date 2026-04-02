@@ -290,16 +290,38 @@ function _hypatia_phase1_syssolver(::Type{F}) where {F<:AbstractFloat}
     return Hypatia.Solvers.SymIndefDenseSystemSolver{F}(), true
 end
 
+function _phase1_hypatia_prefers_sparse_float64(problem::ProblemData)
+    cone_rows =
+        length(problem.positive_scalars) +
+        sum((length(block.local_positions) for block in problem.blocks); init = 0)
+    nullspace_columns = problem.affine === nothing ? 0 : size(problem.affine[2], 2)
+    return cone_rows >= 512 || nullspace_columns >= 512
+end
+
+function _phase1_hypatia_effective_float_type(opt::Optimizer, problem::ProblemData)
+    configured_type = _phase1_hypatia_float_type(opt.settings)
+    if _phase1_hypatia_float_type_is_auto(opt.settings) &&
+       configured_type != Float64 &&
+       _phase1_hypatia_prefers_sparse_float64(problem)
+        _log(
+            opt,
+            "Hypatia Phase I: using Float64 sparse linear algebra for this large sparse model",
+        )
+        return Float64
+    end
+    return configured_type
+end
+
 function _build_hypatia_phase1_model(
     problem::ProblemData,
     settings::Settings,
+    phase1_nullspace::Matrix{ExactRational},
     ::Type{F},
     margin_upper::F,
 ) where {F<:AbstractFloat}
     problem.affine === nothing && error("Hypatia Phase I requires a consistent affine reduction.")
     particular, _ = problem.affine
-    nullspace = _phase1_nullspace(problem)
-    reduced_dimension = size(nullspace, 2)
+    reduced_dimension = size(phase1_nullspace, 2)
     total_dimension = reduced_dimension + 1
     margin_index = total_dimension
     scalar_margin_rows = length(problem.positive_scalars) + 2
@@ -312,7 +334,7 @@ function _build_hypatia_phase1_model(
     A_reduced = spzeros(F, 0, total_dimension)
     b_reduced = F[]
     particular_numeric = _to_working_array(F, particular)
-    nullspace_numeric = _to_working_array(F, nullspace)
+    nullspace_numeric = _to_working_array(F, phase1_nullspace)
     objective_bias = _to_working_float(F, settings.phase1_hypatia_objective_bias)
     if objective_bias > zero(F)
         reduced_objective = transpose(nullspace_numeric) * _to_working_array(F, problem.objective_vector_min)
@@ -412,15 +434,13 @@ function _phase1_hypatia_margin_caps(problem::ProblemData, settings::Settings)
 end
 
 function _hypatia_phase1_point(
-    problem::ProblemData,
+    particular::Vector{ExactRational},
+    phase1_nullspace::Matrix{ExactRational},
     coordinates::AbstractVector{F},
 ) where {F<:AbstractFloat}
-    problem.affine === nothing && error("Hypatia Phase I requires a consistent affine reduction.")
-    particular, _ = problem.affine
-    nullspace = _phase1_nullspace(problem)
     point = _to_working_array(F, particular)
     if !isempty(coordinates)
-        point .+= _to_working_array(F, nullspace) * coordinates
+        point .+= _to_working_array(F, phase1_nullspace) * coordinates
     end
     return point
 end
@@ -626,7 +646,13 @@ function _phase1_hypatia_anchor_once(
         particular, _ = problem.affine
         phase1_nullspace = _phase1_nullspace(problem)
         numeric_margin_upper = _to_working_float(HF, margin_upper)
-        model = _build_hypatia_phase1_model(problem, opt.settings, HF, numeric_margin_upper)
+        model = _build_hypatia_phase1_model(
+            problem,
+            opt.settings,
+            phase1_nullspace,
+            HF,
+            numeric_margin_upper,
+        )
         syssolver, use_dense_model = _hypatia_phase1_syssolver(HF)
         solver = Hypatia.Solvers.Solver{HF}(
             verbose = !opt.silent && opt.settings.verbose,
@@ -664,7 +690,7 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
-        candidate = _hypatia_phase1_point(problem, raw_solution[1:(end - 1)])
+        candidate = _hypatia_phase1_point(particular, phase1_nullspace, raw_solution[1:(end - 1)])
         margin = raw_solution[end]
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
         b_numeric = _to_working_array(HF, problem.b)
@@ -739,11 +765,18 @@ function _phase1_hypatia_anchor(
     opt::Optimizer,
     problem::ProblemData,
 )
-    primary_float_type = _phase1_hypatia_float_type(opt.settings)
+    primary_float_type = _phase1_hypatia_effective_float_type(opt, problem)
     last_attempt = nothing
     for margin_cap in _phase1_hypatia_margin_caps(problem, opt.settings)
         attempt = _phase1_hypatia_anchor_once(opt, problem, primary_float_type, margin_cap)
         attempt.anchor !== nothing && return attempt
+        if attempt.candidate !== nothing &&
+           attempt.reason == :exact_recovery_failed &&
+           attempt.margin !== nothing &&
+           attempt.margin <= zero(attempt.margin)
+            _log(opt, "Hypatia Phase I: boundary candidate detected; trying facial reduction")
+            return attempt
+        end
         last_attempt = attempt
     end
     return last_attempt
@@ -787,6 +820,125 @@ function _phase1_seed_point(
     end
 
     return _build_phase1_initial_point(problem, settings, numeric_blocks, numeric_affine)
+end
+
+function _phase1_anchor_attempt(
+    opt::Optimizer,
+    problem::ProblemData,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    numeric_settings = _numeric_settings(opt.settings, F)
+    numeric_blocks = _numeric_blocks(problem.blocks)
+    numeric_affine = _numeric_affine_data(problem, F)
+    anchor = nothing
+    phase2_initial_point = nothing
+    phase1_candidate = nothing
+
+    if _phase1_backend(opt.settings) == :hypatia
+        _log(opt, "Phase I via Hypatia")
+        attempt = try
+            _phase1_hypatia_anchor(opt, problem)
+        catch err
+            _log(opt, "Hypatia Phase I failed: $(typeof(err))")
+            nothing
+        end
+        if attempt !== nothing
+            anchor = attempt.anchor
+            if attempt.candidate !== nothing
+                phase1_candidate = _to_working_array(F, attempt.candidate)
+                phase2_initial_point = _to_working_array(F, attempt.candidate)
+            end
+        end
+    end
+
+    if anchor === nothing && _phase1_backend(opt.settings) == :native
+        use_iterative_phase1 =
+            numeric_settings.iterative_linear_solver &&
+            length(problem.objective_vector_raw) >= numeric_settings.iterative_solver_min_dimension
+        A_big = use_iterative_phase1 ?
+            _to_working_sparse_matrix(F, problem.A) :
+            _to_working_array(F, problem.A)
+        At_big = transpose(A_big)
+        b_big = _to_working_array(F, problem.b)
+        AtA_big = use_iterative_phase1 ? nothing : At_big * A_big
+        x = _phase1_seed_point(
+            nothing,
+            problem,
+            numeric_settings,
+            numeric_blocks,
+            numeric_affine,
+        )
+        phase1_center = copy(x)
+        penalty = numeric_settings.initial_penalty
+
+        phase1_columns = ["Iter", "Penalty", "Residual", "Barrier", "Time (s)"]
+        phase1_alignments = vcat([:left], fill(:right, length(phase1_columns) - 1))
+        phase1_widths = _phase_table_widths(phase1_columns, opt.settings.phase1_outer_iterations)
+        _log_table_header(
+            opt,
+            "Phase I",
+            phase1_columns,
+            phase1_widths;
+            subtitle = "Feasibility search",
+        )
+        phase1_start_time = time_ns()
+        last_phase1_recovery_probe = nothing
+        last_phase1_residual = typemax(F)
+        for outer_iteration in 1:opt.settings.phase1_outer_iterations
+            x = _newton_phase1!(
+                opt,
+                x,
+                problem,
+                numeric_blocks,
+                A_big,
+                At_big,
+                AtA_big,
+                b_big,
+                penalty,
+                phase1_center,
+                numeric_settings,
+            )
+            residual = _max_abs(A_big * x - b_big)
+            last_phase1_residual = residual
+            barrier_value, _, _ = _barrier_value_grad_hess(
+                x,
+                numeric_blocks,
+                problem.positive_scalars,
+                numeric_settings,
+            )
+            phase1_row = [
+                string(outer_iteration),
+                _format_metric(penalty),
+                _format_metric(residual),
+                _format_metric(barrier_value),
+                @sprintf("%.2f", (time_ns() - phase1_start_time) / 1.0e9),
+            ]
+            _log_table_row(opt, phase1_row, phase1_widths, phase1_alignments)
+            if _should_attempt_phase1_recovery(
+                residual,
+                outer_iteration,
+                last_phase1_recovery_probe,
+                numeric_settings,
+            )
+                anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+                last_phase1_recovery_probe = residual
+            end
+            if residual <= numeric_settings.feasibility_tolerance || anchor !== nothing
+                break
+            end
+            penalty *= numeric_settings.penalty_growth
+        end
+
+        if anchor === nothing && last_phase1_residual <= F(1.0e-6)
+            anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+        end
+    end
+
+    return (
+        anchor = anchor,
+        phase2_initial_point = phase2_initial_point,
+        phase1_candidate = phase1_candidate,
+    )
 end
 
 function _newton_phase2!(

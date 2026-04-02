@@ -28,8 +28,8 @@ include("kse_timeaverage_helpers.jl")
         @test value(B) < 730//1
     end
 
-    @testset "Dualized KSE time-average bound variable" begin
-        result = solve_dualized_kse_timeaverage(; phase2_outer_iterations = 4)
+    @testset "KSE time-average primal certificate" begin
+        result = solve_kse_timeaverage(; phase2_outer_iterations = 4)
 
         @test result.termination_status == MOI.OPTIMAL
         @test result.primal_status == MOI.FEASIBLE_POINT
@@ -40,5 +40,7 @@ include("kse_timeaverage_helpers.jl")
             expression in result.certificate.expressions for
             coeff in coefficients(expression)
         )
+        @test is_psd_exact(value.(result.certificate.Q_even))
+        @test is_psd_exact(value.(result.certificate.Q_odd))
     end
 end

@@ -3,7 +3,6 @@ using JuMP
 using DynamicPolynomials
 using RationalSDP
 using LinearAlgebra
-using Dualization
 import MathOptInterface as MOI
 
 function rational_model(::Type{T}) where {T<:Real}
@@ -12,8 +11,4 @@ function rational_model(::Type{T}) where {T<:Real}
     return model
 end
 
-function dual_model(::Type{T}) where {T<:Real}
-    model = GenericModel{T}(dual_optimizer(RationalSDP.Optimizer{T}, coefficient_type=T, assume_min_if_feasibility=true))
-    set_silent(model)
-    return model
-end
+is_psd_exact(matrix) = RationalSDP._positive_semidefinite_exact(Matrix(matrix))

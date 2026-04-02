@@ -333,11 +333,12 @@ function _extract_problem(opt::Optimizer{T}) where {T}
     c_raw = vcat(c_original_raw, zeros(ExactRational, psd_auxiliary_count + slack_count))
     c_min = vcat(c_original_min, zeros(ExactRational, psd_auxiliary_count + slack_count))
     affine = _solve_affine_system(A, b)
+    positive_scalars, pruned_scalar_faces = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, pruned_directions = _prune_psd_faces(blocks, A, b, affine)
-    if pruned_directions > 0
+    if pruned_scalar_faces > 0 || pruned_directions > 0
         _log(
             opt,
-            "pruned $(pruned_directions) PSD direction(s) fixed to the cone boundary before barrier solve",
+            "pruned $(pruned_scalar_faces) scalar and $(pruned_directions) PSD direction(s) fixed to the cone boundary before barrier solve",
         )
     end
 

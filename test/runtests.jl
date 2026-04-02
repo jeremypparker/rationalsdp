@@ -35,18 +35,18 @@ include("testutils.jl")
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
-        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
         set_optimizer_attribute(model, "working_float_type", BigFloat)
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
-        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == BigFloat
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == BigFloat
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "auto")
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
-        set_optimizer_attribute(model, "dual_postsolve_float_type", "Float64")
-        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == Float64
-        set_optimizer_attribute(model, "dual_postsolve_float_type", "auto")
-        @test get_optimizer_attribute(model, "dual_postsolve_float_type") == BigFloat
+        set_optimizer_attribute(model, "facial_reduction_float_type", "Float64")
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == Float64
+        set_optimizer_attribute(model, "facial_reduction_float_type", "auto")
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == BigFloat
         @variable(model, X[1:1, 1:1], PSD)
         @constraint(model, X[1, 1] == 1//1)
         @objective(model, Min, 0//1)
@@ -70,109 +70,6 @@ include("testutils.jl")
         optimize!(model)
         @test termination_status(model) == MOI.OPTIMAL
         @test value(X[1, 1]) == 1//1
-    end
-
-    @testset "Dualized model primal values" begin
-        model = dual_model(Rational{BigInt})
-        set_silent(model)
-        @variable(model, x >= 1//1)
-        @variable(model, X[1:1, 1:1], PSD)
-        @constraint(model, X[1, 1] >= 2//1)
-        @objective(model, Min, x + X[1, 1])
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        @test value(x) == 1//1
-        @test value(X[1, 1]) == 2//1
-    end
-
-    @testset "Dualized model with PSD equalities" begin
-        model = dual_model(Rational{BigInt})
-        set_silent(model)
-        @variable(model, X[1:2, 1:2], PSD)
-        @constraint(model, X[1, 1] == 2//1)
-        @constraint(model, X[1, 2] == 0//1)
-        @constraint(model, X[2, 2] >= 3//1)
-        @objective(model, Min, X[2, 2])
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        @test value(X[1, 1]) == 2//1
-        @test value(X[1, 2]) == 0//1
-        @test value(X[2, 2]) == 3//1
-    end
-
-    @testset "Dualized PSD affine values satisfy exact equalities" begin
-        model = dual_model(Rational{BigInt})
-        set_silent(model)
-        @variable(model, Q[1:2, 1:2], PSD)
-        @variable(model, t)
-        @constraint(model, Q[1, 1] == t)
-        @constraint(model, 2//1 * Q[2, 1] == -1//1)
-        @constraint(model, Q[2, 2] == 1//1)
-        @objective(model, Min, t)
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        @test value(Q[1, 1]) == value(t)
-        @test 2//1 * value(Q[2, 1]) == -1//1
-        @test value(Q[2, 2]) == 1//1
-    end
-
-    @testset "Dualized Lorenz coefficient recovery" begin
-        model = dual_model(Rational{BigInt})
-        set_silent(model)
-        set_optimizer_attribute(model, "phase2_outer_iterations", 8)
-        @polyvar x[1:3]
-
-        f = [
-            10 * (x[2] - x[1]);
-            28 * x[1] - x[1] * x[3] - x[2];
-            x[1] * x[2] - 8//3 * x[3];
-        ]
-
-        basis_V = monomials(x, 0:2)
-        @variable(model, coeffs_V[1:length(basis_V)])
-        V = dot(coeffs_V, basis_V)
-        LV = dot(f, differentiate(V, x))
-
-        basis_b = monomials(x, 0:1)
-        @variable(model, Q[1:length(basis_b), 1:length(basis_b)], PSD)
-        @variable(model, B)
-        expression = B - x[3]^2 - LV - basis_b' * Q * basis_b
-        @constraint(model, coefficients(expression) .== 0)
-        @objective(model, Min, B)
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        @test dual_status(model) == MOI.FEASIBLE_POINT
-        @test value(B) == 729//1
-        @test all(iszero(value(coeff)) for coeff in coefficients(expression))
-    end
-
-    @testset "Hypatia dual postsolve exact equality recovery" begin
-        model = dual_model(Rational{BigInt})
-        set_silent(model)
-        set_optimizer_attribute(model, "working_float_type", Float64)
-        set_optimizer_attribute(model, "dual_postsolve_backend", :hypatia)
-        @variable(model, Q[1:2, 1:2], PSD)
-        @variable(model, t)
-        @constraint(model, Q[1, 1] == t)
-        @constraint(model, 2//1 * Q[2, 1] == -1//1)
-        @constraint(model, Q[2, 2] == 1//1)
-        @objective(model, Min, t)
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        @test dual_status(model) == MOI.FEASIBLE_POINT
-        @test value(Q[1, 1]) == value(t)
-        @test 2//1 * value(Q[2, 1]) == -1//1
-        @test value(Q[2, 2]) == 1//1
     end
 
     @testset "Exact phase II segment refinement" begin
@@ -214,6 +111,50 @@ include("testutils.jl")
         @test VX[1, 2] == 0//1
         @test VX[2, 1] == 0//1
         @test VX[2, 2] == 1//1
+        @test is_psd_exact(VX)
+    end
+
+    @testset "Facial reduction on a rational hidden PSD face" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        @variable(model, X[1:2, 1:2], PSD)
+        @constraint(model, X[1, 1] == X[1, 2])
+        @constraint(model, X[2, 2] == X[1, 2])
+        @constraint(model, X[1, 1] == 1//1)
+        @objective(model, Min, 0//1)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        VX = value.(X)
+        @test VX == Rational{BigInt}[1//1 1//1; 1//1 1//1]
+        @test is_psd_exact(VX)
+    end
+
+    @testset "Irrational exposed face detection" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        @variable(model, x)
+        A = [
+            2//1 - x 2//1 * x -1//1 - x;
+            2//1 * x 2//1 + 2//1 * x 0//1;
+            -1//1 - x 0//1 -1//1 - 2//1 * x
+        ]
+        B = [
+            2//1 -1//1 - x x;
+            -1//1 - x -2//1 * x 2//1;
+            x 2//1 2//1 - 2//1 * x
+        ]
+        @constraint(model, Symmetric(A) in PSDCone())
+        @constraint(model, Symmetric(B) in PSDCone())
+        @objective(model, Min, 0//1)
+        err = try
+            optimize!(model)
+            nothing
+        catch caught
+            caught
+        end
+        @test err isa ErrorException
+        @test occursin("could not be represented exactly", sprint(showerror, err))
     end
 
     @testset "Exact feasibility with Rational{BigInt}" begin
@@ -231,6 +172,7 @@ include("testutils.jl")
         @test V[2, 2] == 2//1
         @test V[1, 2] == 1//2
         @test V[2, 1] == 1//2
+        @test is_psd_exact(V)
     end
 
     @testset "Mixed PSD and scalar inequalities" begin
@@ -262,6 +204,7 @@ include("testutils.jl")
         @test vx + vy >= 1//3
         @test vx - vy <= 1//1
         @test vy < -(333//1000)
+        @test is_psd_exact(VX)
     end
 
     @testset "LP scale with many interval constraints" begin
@@ -327,6 +270,8 @@ include("testutils.jl")
         @test UX[10] - UX[11] >= -1//2
         @test UX[12] + UX[13] + UX[14] >= 1//1
         @test UX[15] + UX[16] <= 3//2
+        @test is_psd_exact(VX)
+        @test is_psd_exact(VY)
     end
 
     @testset "SOS-style polynomial lower bound via DynamicPolynomials" begin
@@ -356,6 +301,7 @@ include("testutils.jl")
         @test value(Q[3, 3]) == 1//1
         @test value(Q[2, 3]) == 0//1
         @test value(t) < 251//1000
+        @test is_psd_exact(value.(Q))
     end
 
     @testset "SOS Lyapunov feasibility with face pruning" begin
@@ -390,6 +336,8 @@ include("testutils.jl")
         @test VQ1[2, 2] > 0//1
         @test VQ2[1, 1] > 0//1
         @test VQ2[2, 2] > 0//1
+        @test is_psd_exact(VQ1)
+        @test is_psd_exact(VQ2)
     end
 
     @testset "Lorenz SOS mean upper bound" begin
@@ -417,6 +365,7 @@ include("testutils.jl")
         @test termination_status(model) == MOI.OPTIMAL
         @test value(B) > 729//1
         @test value(B) < 730//1
+        @test is_psd_exact(value.(Q))
     end
 
     @testset "Quartic Lorenz SOS mean upper bound" begin
@@ -444,6 +393,7 @@ include("testutils.jl")
         @test termination_status(model) == MOI.OPTIMAL
         @test value(B) > 728//1
         @test value(B) < 730//1
+        @test is_psd_exact(value.(Q))
     end
 
     @testset "Alternative rational output type" begin

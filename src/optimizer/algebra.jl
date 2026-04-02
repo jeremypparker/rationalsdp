@@ -197,8 +197,16 @@ function _compute_phase1_nullspace(
     isempty(active_positions) && return zeros(ExactRational, size(nullspace, 1), 0)
 
     reduced = nullspace[active_positions, :]
-    reduced_augmented = hcat(copy(reduced), zeros(ExactRational, size(reduced, 1)))
-    _, pivots = _rref(reduced_augmented)
+    numeric_reduced = Matrix{Float64}(undef, size(reduced))
+    for column in axes(reduced, 2), row in axes(reduced, 1)
+        numeric_reduced[row, column] = Float64(reduced[row, column])
+    end
+    factorization = qr(numeric_reduced, ColumnNorm())
+    diagonal = abs.(diag(factorization.R))
+    rank_tolerance =
+        isempty(diagonal) ? 0.0 : maximum(diagonal) * max(size(numeric_reduced)...) * eps(Float64)
+    rank = count(value -> value > rank_tolerance, diagonal)
+    pivots = isempty(diagonal) ? Int[] : sort(factorization.p[1:rank])
     isempty(pivots) && return zeros(ExactRational, size(nullspace, 1), 0)
     return nullspace[:, pivots]
 end
@@ -354,6 +362,24 @@ function _append_zero_equalities(
     return A_augmented, b_augmented
 end
 
+function _prune_positive_scalar_faces(
+    positive_scalars::Vector{Int},
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+)
+    affine === nothing && return positive_scalars, 0
+    particular, nullspace = affine
+    pruned = Int[]
+    kept = Int[]
+    for index in positive_scalars
+        if _variable_fixed_zero(particular, nullspace, index)
+            push!(pruned, index)
+        else
+            push!(kept, index)
+        end
+    end
+    return kept, length(pruned)
+end
+
 function _prune_psd_faces(
     blocks::Vector{BlockStructure},
     A::Matrix{ExactRational},
@@ -404,6 +430,94 @@ function _leading_principal_determinants_positive(matrix::Matrix{ExactRational})
     return true
 end
 
+function _positive_semidefinite_exact(matrix::Matrix{ExactRational})
+    size(matrix, 1) == size(matrix, 2) || return false
+    n = size(matrix, 1)
+    n == 0 && return true
+    any(matrix .!= transpose(matrix)) && return false
+
+    remainder = copy(matrix)
+    active = collect(1:n)
+    while !isempty(active)
+        pivot_position = findfirst(index -> remainder[index, index] > 0, eachindex(active))
+        if pivot_position === nothing
+            for index in eachindex(active)
+                if !iszero(remainder[index, index])
+                    return false
+                end
+                for column in 1:length(active)
+                    if !iszero(remainder[index, column]) || !iszero(remainder[column, index])
+                        return false
+                    end
+                end
+            end
+            return true
+        end
+
+        if pivot_position != 1
+            permutation = [pivot_position; setdiff(collect(1:length(active)), pivot_position)]
+            remainder = remainder[permutation, permutation]
+            active = active[permutation]
+        end
+
+        pivot = remainder[1, 1]
+        pivot > 0 || return false
+        if length(active) == 1
+            return true
+        end
+
+        trailing = Matrix{ExactRational}(undef, length(active) - 1, length(active) - 1)
+        for row in 2:length(active), column in 2:length(active)
+            trailing[row - 1, column - 1] =
+                remainder[row, column] - remainder[row, 1] * remainder[1, column] / pivot
+        end
+        remainder = trailing
+        active = active[2:end]
+    end
+
+    return true
+end
+
+function _positive_definite_exact(matrix::Matrix{ExactRational})
+    size(matrix, 1) == size(matrix, 2) || return false
+    n = size(matrix, 1)
+    n == 0 && return true
+    any(matrix .!= transpose(matrix)) && return false
+
+    remainder = copy(matrix)
+    active = collect(1:n)
+    while !isempty(active)
+        pivot_position = findfirst(index -> remainder[index, index] > 0, eachindex(active))
+        pivot_position === nothing && return false
+        if pivot_position != 1
+            permutation = [pivot_position; setdiff(collect(1:length(active)), pivot_position)]
+            remainder = remainder[permutation, permutation]
+            active = active[permutation]
+        end
+
+        pivot = remainder[1, 1]
+        pivot > 0 || return false
+        length(active) == 1 && return true
+        trailing = Matrix{ExactRational}(undef, length(active) - 1, length(active) - 1)
+        for row in 2:length(active), column in 2:length(active)
+            trailing[row - 1, column - 1] =
+                remainder[row, column] - remainder[row, 1] * remainder[1, column] / pivot
+        end
+        remainder = trailing
+        active = active[2:end]
+    end
+
+    return true
+end
+
+function _nullspace_basis_exact(matrix::Matrix{ExactRational})
+    rhs = zeros(ExactRational, size(matrix, 1))
+    affine = _solve_affine_system(matrix, rhs)
+    affine === nothing && return zeros(ExactRational, size(matrix, 2), 0)
+    _, nullspace = affine
+    return nullspace
+end
+
 function _strictly_positive_exact(x::Vector{ExactRational}, positive_scalars::Vector{Int})
     for index in positive_scalars
         if !(x[index] > 0)
@@ -420,7 +534,7 @@ function _strictly_interior_exact(
 )
     _strictly_positive_exact(x, positive_scalars) || return false
     for block in blocks
-        if !_leading_principal_determinants_positive(_vector_to_matrix(x, block))
+        if !_positive_definite_exact(_vector_to_matrix(x, block))
             return false
         end
     end

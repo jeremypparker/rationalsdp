@@ -1,4 +1,5 @@
 include("testutils.jl")
+include("kse_timeaverage_helpers.jl")
 
 @testset "RationalSDP JuMP integration" begin
     @testset "Optimizer metadata" begin
@@ -407,6 +408,19 @@ include("testutils.jl")
         @test termination_status(model) == MOI.OPTIMAL
         @test value(X[1, 1]) == 3//1
         @test value(y) == 2//3
+    end
+
+    @testset "KSE time average bound" begin
+        model = rational_model(Rational{BigInt})
+        instance = build_explicit_kse_model(3//4, model)
+        optimize!(instance.model)
+
+        @test termination_status(instance.model) == MOI.OPTIMAL
+        @test all(iszero(value(coeff)) for expr in instance.certificate.expressions for coeff in coefficients(expr))
+        @test is_psd_exact(value.(instance.certificate.Q_even))
+        @test is_psd_exact(value.(instance.certificate.Q_odd))
+        @test value(instance.B) > 29//10
+        @test value(instance.B) < 3//1
     end
 end
 

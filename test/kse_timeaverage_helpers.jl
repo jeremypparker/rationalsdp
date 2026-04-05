@@ -1,7 +1,3 @@
-# Minimal KSE time-average helpers extracted for a self-contained primal
-# regression. This keeps the test local to RationalSDP instead of depending on
-# the separate inertial repository.
-
 _kse_reduce_s_degree(c, s, p::Number) = p
 
 function _kse_reduce_s_degree(c, s, p)
@@ -23,37 +19,6 @@ function _kse_reduce_s_degree(c, s, p)
     return result
 end
 
-_kse_max_degree(::Number, vars) = 0
-
-function _kse_max_degree(p, vars)
-    max_degree = 0
-    unique_vars = unique(collect(vars))
-    for monom in monomials(p)
-        degree_in_vars = sum(degree(monom, var) for var in unique_vars)
-        max_degree = max(max_degree, degree_in_vars)
-    end
-    return max_degree
-end
-
-function _kse_makebasis(ws, vars, state_degree::Int, space_degree::Int; odd::Bool = false, max_s_degree::Int = 1)
-    vars_with_trig = [collect(vars); ws.s; ws.c]
-    if state_degree < 0 || space_degree < 0
-        return typeof(ws.c * ws.v[1])[]
-    end
-
-    basis = typeof(ws.c * ws.v[1])[]
-    for monom in monomials(vars_with_trig, 0:(state_degree + space_degree))
-        degree(monom, ws.s) <= max_s_degree || continue
-        sum(degree(monom, Uvar) for Uvar in ws.U) + degree(monom, ws.s) + degree(monom, ws.c) <= space_degree || continue
-        sum(degree(monom, var) for var in vars) <= state_degree || continue
-        expected = odd ? -monom : monom
-        subs(monom, ws.oddvars => -ws.oddvars) == expected || continue
-        push!(basis, monom)
-    end
-
-    return basis
-end
-
 function _kse_makepoly_from_basis(model, basis)
     if isempty(basis)
         return 0, VariableRef[]
@@ -62,30 +27,8 @@ function _kse_makepoly_from_basis(model, basis)
     return dot(coeffs, basis), coeffs
 end
 
-function _kse_build_monom_index(poly_sets...)
-    monom_index = Dict{Any,Int}()
-    for polys in poly_sets
-        for poly in polys
-            for monom in monomials(poly)
-                get!(monom_index, monom, length(monom_index) + 1)
-            end
-        end
-    end
-    return monom_index
-end
-
-function _kse_coefficient_matrix(polys, monom_index)
-    matrix = zeros(Rational{BigInt}, length(monom_index), length(polys))
-    for (column, poly) in enumerate(polys)
-        for monom in monomials(poly)
-            matrix[monom_index[monom], column] = Rational{BigInt}(DynamicPolynomials.coefficient(poly, monom))
-        end
-    end
-    return matrix
-end
-
-function _kse_make_workspace(q::Int, k::Rational; model = nothing)
-    model = isnothing(model) ? GenericModel{Rational{BigInt}}() : model
+function _kse_make_workspace(q::Int, k; model = nothing)
+    model = isnothing(model) ? GenericModel{Float64}() : model
 
     @polyvar s c v[1:q+1]
     @polyvar U[1:q+1]
@@ -134,41 +77,6 @@ end
 
 _kse_reduce_trig(ws, p) = _kse_reduce_s_degree(ws.c, ws.s, p)
 
-function _kse_ddt_image(ws, w_monom)
-    V_monom = _kse_reduce_trig(ws, subs(w_monom, ws.U => ws.u_derivatives))
-    dwdt_monom = ws.dynamics * sum(
-        (-1)^(order - 1) * ws.ddx(differentiate(w_monom, ws.U[order]), order - 1)
-        for order in 1:ws.q
-    )
-    LV_monom = _kse_reduce_trig(ws, subs(dwdt_monom, ws.U => ws.u_derivatives))
-    return V_monom, LV_monom
-end
-
-function _kse_reduce_ddt_basis(ws, gauge_basis, w_basis)
-    isempty(w_basis) && return w_basis
-
-    candidate_images = [begin
-        _, LV_monom = _kse_ddt_image(ws, w_monom)
-        LV_monom
-    end for w_monom in w_basis]
-    gauge_images = [_kse_reduce_trig(ws, ws.ddx(basis_monom)) for basis_monom in gauge_basis]
-
-    monom_index = _kse_build_monom_index(gauge_images, candidate_images)
-    isempty(monom_index) && return w_basis[1:0]
-
-    gauge_matrix = _kse_coefficient_matrix(gauge_images, monom_index)
-    candidate_matrix = _kse_coefficient_matrix(candidate_images, monom_index)
-    residual =
-        size(gauge_matrix, 2) == 0 ?
-        candidate_matrix :
-        candidate_matrix - gauge_matrix * (gauge_matrix \ candidate_matrix)
-    factorization = qr(residual, ColumnNorm())
-    diagonal = abs.(diag(factorization.R))
-    rank_residual = count(value -> value > 0, diagonal)
-    keep = sort(factorization.p[1:rank_residual])
-    return w_basis[keep]
-end
-
 function _kse_make_ddt_auxiliary(ws, w_basis)
     w, coeffs = _kse_makepoly_from_basis(ws.model, w_basis)
     dwdt = ws.dynamics * sum(
@@ -187,22 +95,54 @@ function _kse_quadratic_form(basis_left, block, basis_right = basis_left)
 end
 
 function _kse_constrain_zero_polynomial(model, poly)
-    coeffs = [DynamicPolynomials.coefficient(poly, monom) for monom in monomials(poly)]
+    coeffs = DynamicPolynomials.coefficients(poly) 
     isempty(coeffs) || @constraint(model, coeffs .== 0)
     return poly
 end
 
-function _kse_enforce_nonnegativity(ws, p)
-    @assert subs(p, ws.oddvars => -ws.oddvars) == p
+function explicit_basis_odd_no_s(ws)
+    return [
+        ws.v[2],
+        ws.c^2 * ws.v[2],
+    ]
+end
 
-    degree_v = round(Int, _kse_max_degree(p, ws.v) / 2, RoundUp)
-    degree_c = round(Int, _kse_max_degree(p, [ws.c]) / 2, RoundUp)
+function explicit_basis_odd_s(ws)
+    return [
+        one(ws.c),
+        ws.v[3],
+        ws.v[1],
+        ws.c,
+        ws.c * ws.v[3],
+        ws.c * ws.v[1],
+    ]
+end
 
-    basis_even_no_s = _kse_makebasis(ws, ws.v, degree_v, degree_c; odd = false, max_s_degree = 0)
-    basis_even_s = _kse_makebasis(ws, ws.v, degree_v, degree_c - 1; odd = true, max_s_degree = 0)
-    basis_odd_no_s = _kse_makebasis(ws, ws.v, degree_v, degree_c; odd = true, max_s_degree = 0)
-    basis_odd_s = _kse_makebasis(ws, ws.v, degree_v, degree_c - 1; odd = false, max_s_degree = 0)
+function explicit_basis_even_no_s(ws)
+    return [
+        one(ws.c),
+        ws.c,
+        ws.c^2,
+        (1 - ws.c^2) * ws.v[3],
+        ws.c^2 * ws.v[1],
+    ]
+end
 
+function explicit_basis_even_s(ws)
+    return [
+        ws.v[2],
+        ws.c * ws.v[2],
+    ]
+end
+
+function _custom_enforce_nonnegativity_from_bases(
+    ws,
+    p;
+    basis_even_no_s,
+    basis_even_s,
+    basis_odd_no_s,
+    basis_odd_s,
+)
     function gram_matrix(basis_no_s, basis_s)
         dimension = length(basis_no_s) + length(basis_s)
         return @variable(ws.model, [1:dimension, 1:dimension], PSD)
@@ -223,9 +163,12 @@ function _kse_enforce_nonnegativity(ws, p)
     Q_even = gram_matrix(basis_even_no_s, basis_even_s)
 
     p_with_s = sum(
-        DynamicPolynomials.coefficient(p, monom) * monom
-        for monom in monomials(p)
-        if degree(monom, ws.s) == 1
+        (
+            DynamicPolynomials.coefficient(p, monom) * monom
+            for monom in monomials(p)
+            if degree(monom, ws.s) == 1
+        );
+        init = zero(ws.c),
     )
     p_without_s = p - p_with_s
 
@@ -238,49 +181,88 @@ function _kse_enforce_nonnegativity(ws, p)
         quadratic_s(Q_even, basis_even_no_s, basis_even_s) -
         quadratic_s(Q_odd, basis_odd_no_s, basis_odd_s)
 
-    constrained_without_s = _kse_constrain_zero_polynomial(ws.model, expression_without_s)
-    constrained_with_s = _kse_constrain_zero_polynomial(ws.model, expression_with_s)
+    constrained_without_s = _kse_constrain_zero_polynomial(
+        ws.model,
+        expression_without_s;
+    )
+    constrained_with_s = _kse_constrain_zero_polynomial(
+        ws.model,
+        expression_with_s;
+    )
 
     return (
         expressions = [constrained_without_s, constrained_with_s],
         Q_even = Q_even,
         Q_odd = Q_odd,
+        basis_even_no_s = basis_even_no_s,
+        basis_even_s = basis_even_s,
+        basis_odd_no_s = basis_odd_no_s,
+        basis_odd_s = basis_odd_s,
     )
 end
 
-function build_kse_timeaverage_model(; phase2_outer_iterations::Int = 4)
-    ws = _kse_make_workspace(4, 3 // 4; model = rational_model(Rational{BigInt}))
-    set_silent(ws.model)
-    set_optimizer_attribute(ws.model, "phase2_outer_iterations", phase2_outer_iterations)
 
-    gauge_basis = _kse_makebasis(ws, ws.v[1:4], 4, 4; odd = true)
-    f1, _ = _kse_makepoly_from_basis(ws.model, gauge_basis)
+function build_explicit_kse_model(k, model)
+    ws = _kse_make_workspace(4, k; model = model)
 
-    w_basis = _kse_makebasis(ws, ws.U[1:(div(ws.q, 2) + 1)], 3, 3)
-    w_basis = _kse_reduce_ddt_basis(ws, gauge_basis, w_basis)
-    _, LV, _ = _kse_make_ddt_auxiliary(ws, w_basis)
+    s = ws.s
+    c = ws.c
+    v = ws.v
+
+    gauge_basis = [
+        v[2]*v[3],
+        v[1]*v[4],
+        v[1]*v[2],
+        c*v[4],
+        c*v[2],
+        s*v[3],
+        s*v[1],
+        s*c,
+        c^2*v[2]*v[3],
+        c^2*v[1]*v[4],
+        c^2*v[1]*v[2],
+        c^3*v[4],
+        c^3*v[2],
+        s*v[1]^3,
+        s*c*v[2]^2,
+        s*c*v[1]*v[3],
+        s*c*v[1]^2,
+        s*c^2*v[3],
+        s*c^2*v[1],
+        s*c^3,
+        c^4*v[1]*v[2],
+        s*c^2*v[1]^3,
+        s*c^3*v[2]^2,
+        s*c^3*v[1]^2,
+    ]
+
+    f1, gauge_coeffs = _kse_makepoly_from_basis(ws.model, gauge_basis)
+
+    w_basis = [ws.U[1]^2; ws.s*ws.c*ws.U[3]]
+    _, LV, w_coeffs = _kse_make_ddt_auxiliary(ws, w_basis)
 
     @variable(ws.model, B >= 0)
+    #B = 3
     p1 = _kse_reduce_trig(ws, B - ws.u^2 + LV + ws.ddx(f1))
-    certificate = _kse_enforce_nonnegativity(ws, p1)
+
+    certificate = _custom_enforce_nonnegativity_from_bases(
+        ws,
+        p1;
+        basis_even_no_s = explicit_basis_even_no_s(ws),
+        basis_even_s = explicit_basis_even_s(ws),
+        basis_odd_no_s = explicit_basis_odd_no_s(ws),
+        basis_odd_s = explicit_basis_odd_s(ws),
+    )
     @objective(ws.model, Min, B)
 
     return (
         model = ws.model,
+        ws = ws,
         B = B,
         certificate = certificate,
-    )
-end
-
-function solve_kse_timeaverage(; phase2_outer_iterations::Int = 4)
-    instance = build_kse_timeaverage_model(;
-        phase2_outer_iterations = phase2_outer_iterations,
-    )
-    optimize!(instance.model)
-    return (
-        termination_status = termination_status(instance.model),
-        primal_status = primal_status(instance.model),
-        B_value = value(instance.B),
-        certificate = instance.certificate,
+        gauge_basis = gauge_basis,
+        gauge_coeffs = gauge_coeffs,
+        w_basis = w_basis,
+        w_coeffs = w_coeffs,
     )
 end

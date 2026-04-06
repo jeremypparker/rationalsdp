@@ -103,6 +103,7 @@ end
 function explicit_basis_odd_no_s(ws)
     return [
         ws.v[2],
+        ws.c * ws.v[2],
         ws.c^2 * ws.v[2],
     ]
 end
@@ -121,10 +122,12 @@ end
 function explicit_basis_even_no_s(ws)
     return [
         one(ws.c),
+        ws.v[1],
         ws.c,
         ws.c^2,
         (1 - ws.c^2) * ws.v[3],
         ws.c^2 * ws.v[1],
+        ws.c * ws.v[1]
     ]
 end
 
@@ -208,6 +211,7 @@ function build_explicit_kse_model(k, model)
     s = ws.s
     c = ws.c
     v = ws.v
+    U = ws.U
 
     gauge_basis = [
         v[2]*v[3],
@@ -238,7 +242,19 @@ function build_explicit_kse_model(k, model)
 
     f1, gauge_coeffs = _kse_makepoly_from_basis(ws.model, gauge_basis)
 
-    w_basis = [ws.U[1]^2; ws.s*ws.c*ws.U[3]]
+    w_basis = [
+        1,
+        U[2]^2,
+        U[1]*U[2],
+        U[1]^2,
+        s*c*U[3],
+        s*c*U[1],
+        c^2*U[2]^2,
+        c^2*U[1]*U[3],
+        c^2*U[1]^2,
+        s*c*U[2]*U[3],
+        s*c*U[1]*U[2]
+    ]
     _, LV, w_coeffs = _kse_make_ddt_auxiliary(ws, w_basis)
 
     @variable(ws.model, B >= 0)

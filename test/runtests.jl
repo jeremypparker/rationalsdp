@@ -419,8 +419,8 @@ include("kse_timeaverage_helpers.jl")
         @test all(iszero(value(coeff)) for expr in instance.certificate.expressions for coeff in coefficients(expr))
         @test is_psd_exact(value.(instance.certificate.Q_even))
         @test is_psd_exact(value.(instance.certificate.Q_odd))
-        @test value(instance.B) > 29//10
-        @test value(instance.B) < 3//1
+        @test value(instance.B) > 280//100
+        @test value(instance.B) < 281//100
     end
 end
 

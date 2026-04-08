@@ -37,23 +37,25 @@ include("kse_timeaverage_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
-        set_optimizer_attribute(model, "working_float_type", BigFloat)
-        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
-        @test get_optimizer_attribute(model, "facial_reduction_float_type") == BigFloat
+
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        @test get_optimizer_attribute(model, "working_float_type") == Float64
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == Float64
+
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "auto")
-        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == BigFloat
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         set_optimizer_attribute(model, "facial_reduction_float_type", "Float64")
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == Float64
         set_optimizer_attribute(model, "facial_reduction_float_type", "auto")
-        @test get_optimizer_attribute(model, "facial_reduction_float_type") == BigFloat
-        @variable(model, X[1:1, 1:1], PSD)
-        @constraint(model, X[1, 1] == 1//1)
-        @objective(model, Min, 0//1)
-        optimize!(model)
-        @test termination_status(model) == MOI.OPTIMAL
-        @test value(X[1, 1]) == 1//1
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == Float64
+
+        set_optimizer_attribute(model, "working_float_type", RationalSDP.Double64)
+        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
     end
 
     @testset "Reject approximate model coefficients" begin

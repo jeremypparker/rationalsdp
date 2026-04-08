@@ -101,6 +101,53 @@ include("kse_timeaverage_helpers.jl")
               RationalSDP._exact_objective_value(problem, anchor)
     end
 
+    @testset "Facial reduction helper regressions" begin
+        directions = [
+            Rational{BigInt}[1//1, 0//1],
+            Rational{BigInt}[2//1, 0//1],
+            Rational{BigInt}[0//1, 1//1],
+        ]
+        independent = RationalSDP._linearly_independent_directions(directions)
+        @test length(independent) == 2
+        @test any(direction == Rational{BigInt}[0//1, 1//1] for direction in independent)
+        @test any(
+            direction == Rational{BigInt}[1//1, 0//1] ||
+            direction == Rational{BigInt}[2//1, 0//1] for
+            direction in independent
+        )
+
+        block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing, nothing, nothing],
+            [1, 2, 3],
+            [(1, 1), (2, 1), (2, 2)],
+            [1, 3],
+        )
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            (
+                zeros(Rational{BigInt}, 3),
+                Matrix{Rational{BigInt}}(I, 3, 3),
+            ),
+        )
+        directions =
+            RationalSDP._candidate_kernel_directions(
+                RationalSDP.Optimizer{Rational{BigInt}}(),
+                problem,
+                1,
+                Float64[1.0 -1.0; -1.0 1.0],
+                Float64,
+            )
+        @test directions == [Rational{BigInt}[1//1, 1//1]]
+    end
+
     @testset "PSD face pruning from forced nullspace directions" begin
         model = rational_model(Rational{BigInt})
         @variable(model, X[1:2, 1:2], PSD)

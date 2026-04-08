@@ -1,5 +1,18 @@
 include("kse_timeaverage_helpers.jl")
 
+function explicit_basis_even_no_s_split_v3(ws)
+    return [
+        one(ws.c),
+        ws.v[1],
+        ws.c,
+        ws.c^2,
+        ws.v[3],
+        ws.c^2 * ws.v[3],
+        ws.c^2 * ws.v[1],
+        ws.c * ws.v[1],
+    ]
+end
+
 @testset "RationalSDP slow regressions" begin
     @testset "Working float type selection with BigFloat solve" begin
         model = rational_model(Rational{BigInt})
@@ -51,5 +64,26 @@ include("kse_timeaverage_helpers.jl")
         @test termination_status(model) == MOI.OPTIMAL
         @test value(B) > 729//1
         @test value(B) < 730//1
+    end
+
+    @testset "KSE time average bound with split even basis" begin
+        model = rational_model(Rational{BigInt})
+        instance = build_explicit_kse_model(
+            3//4,
+            model;
+            basis_even_no_s_builder = explicit_basis_even_no_s_split_v3,
+        )
+        optimize!(instance.model)
+
+        @test termination_status(instance.model) == MOI.OPTIMAL
+        @test all(
+            iszero(value(coeff)) for
+            expr in instance.certificate.expressions for
+            coeff in coefficients(expr)
+        )
+        @test is_psd_exact(value.(instance.certificate.Q_even))
+        @test is_psd_exact(value.(instance.certificate.Q_odd))
+        @test value(instance.B) > 280//100
+        @test value(instance.B) < 281//100
     end
 end

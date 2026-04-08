@@ -205,7 +205,7 @@ function _custom_enforce_nonnegativity_from_bases(
 end
 
 
-function build_explicit_kse_model(k, model)
+function build_explicit_kse_model(k, model; basis_even_no_s_builder = explicit_basis_even_no_s)
     ws = _kse_make_workspace(4, k; model = model)
 
     s = ws.s
@@ -264,7 +264,7 @@ function build_explicit_kse_model(k, model)
     certificate = _custom_enforce_nonnegativity_from_bases(
         ws,
         p1;
-        basis_even_no_s = explicit_basis_even_no_s(ws),
+        basis_even_no_s = basis_even_no_s_builder(ws),
         basis_even_s = explicit_basis_even_s(ws),
         basis_odd_no_s = explicit_basis_odd_no_s(ws),
         basis_odd_s = explicit_basis_odd_s(ws),

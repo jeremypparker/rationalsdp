@@ -160,6 +160,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             phase1_candidate = phase1_result.phase1_candidate
         end
 
+        if problem.affine === nothing
+            opt.termination_status = MOI.NUMERICAL_ERROR
+            opt.primal_status = MOI.NO_SOLUTION
+            opt.raw_status = "Inconsistent affine reduction"
+            opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+            _log(opt, "Phase I exact recovery failed")
+            return
+        end
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)
 

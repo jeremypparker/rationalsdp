@@ -1,15 +1,16 @@
-include("kse_timeaverage_helpers.jl")
-
-function explicit_basis_even_no_s_split_v3(ws)
+function explicit_basis_even_no_s_singular(ws)
     return [
         one(ws.c),
         ws.v[1],
-        ws.c,
-        ws.c^2,
         ws.v[3],
-        ws.c^2 * ws.v[3],
-        ws.c^2 * ws.v[1],
+        ws.c,
         ws.c * ws.v[1],
+        ws.c * ws.v[3],
+        ws.c^2,
+        ws.c^2 * ws.v[1],
+        ws.c^2 * ws.v[3],
+        ws.c^3 * ws.v[1],
+        ws.c * ws.v[1] * ws.v[3]
     ]
 end
 
@@ -71,7 +72,7 @@ end
         instance = build_explicit_kse_model(
             3//4,
             model;
-            basis_even_no_s_builder = explicit_basis_even_no_s_split_v3,
+            basis_even_no_s_builder = explicit_basis_even_no_s_singular,
         )
         optimize!(instance.model)
 

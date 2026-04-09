@@ -6,7 +6,7 @@ function _recovery_tolerances(settings::Settings, ::Type{F}) where {F<:AbstractF
     final_tolerance = _to_working_float(F, settings.rational_tolerance)
     while tolerance > final_tolerance
         push!(tolerances, tolerance)
-        tolerance /= F(1.0e4)
+        tolerance /= F(10)
     end
     push!(tolerances, final_tolerance)
     return tolerances

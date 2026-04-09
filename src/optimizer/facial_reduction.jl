@@ -89,17 +89,29 @@ function _heuristic_kernel_direction(
     ::Type{F},
 ) where {F<:AbstractFloat}
     matrix_scale = max(one(F), maximum(abs, block_matrix))
-    residual_tolerance = max(F(1.0e-10), sqrt(eps(F))) * matrix_scale
-    for tolerance in _recovery_tolerances(settings, F)
-        direction = ExactRational[
+    residual_tolerance = max(
+        F(1.0e-10),
+        sqrt(eps(F)),
+        F(100) * _to_working_float(F, settings.facial_reduction_exposure_tolerance),
+    ) * matrix_scale
+    tolerances = _recovery_tolerances(settings, F)
+    coarse_tolerance = max(
+        F(1.0e-4),
+        _to_working_float(F, settings.facial_reduction_exposure_tolerance),
+    )
+    if isempty(tolerances) || coarse_tolerance > first(tolerances)
+        pushfirst!(tolerances, coarse_tolerance)
+    end
+    for tolerance in tolerances
+        raw_direction = ExactRational[
             rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for value in candidate
         ]
-        direction = _normalize_rational_direction(direction)
-        any(!iszero, direction) || continue
-        numeric_direction = _to_working_array(F, direction)
-        residual = _max_abs(block_matrix * numeric_direction)
+        any(!iszero, raw_direction) || continue
+        numeric_direction = _to_working_array(F, raw_direction)
+        direction_scale = max(one(F), _max_abs(numeric_direction))
+        residual = _max_abs(block_matrix * numeric_direction) / direction_scale
         if residual <= residual_tolerance
-            return direction
+            return _normalize_rational_direction(raw_direction)
         end
     end
     return nothing
@@ -165,7 +177,7 @@ function _candidate_kernel_directions(
 
     if isempty(exact_directions)
         heuristic_directions = Vector{Vector{ExactRational}}()
-        for kernel_index in kernel_indices
+        for kernel_index in sort(kernel_indices; by = index -> abs(eigen_factor.values[index]))
             direction = _heuristic_kernel_direction(
                 block_matrix,
                 collect(view(eigen_factor.vectors, :, kernel_index)),
@@ -177,6 +189,7 @@ function _candidate_kernel_directions(
         end
         heuristic_directions = _linearly_independent_directions(heuristic_directions)
         if !isempty(heuristic_directions)
+            heuristic_directions = heuristic_directions[1:1]
             _log(
                 opt,
                 "Facial reduction: using rationalized boundary kernel directions for PSD block $(block_index)",
@@ -592,6 +605,16 @@ function _facially_reduce_problem(
         problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases)
     )
     reduced_problem = _apply_facial_reduction(problem, exposed_scalars, keep_bases)
+    if reduced_problem.affine === nothing
+        message =
+            "Facial reduction found a PSD block on the cone boundary, " *
+            "but the exposed nullspace directions could not be represented exactly over the rational coefficient field."
+        if _facial_reduction_irrational_behavior(opt.settings) == :warn
+            _log(opt, message)
+            return problem
+        end
+        throw(ErrorException(message))
+    end
     _log(
         opt,
         "facial reduction: fixed $(length(exposed_scalars)) scalar cone direction(s) and removed $(removed_psd_directions) PSD direction(s)",

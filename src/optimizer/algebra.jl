@@ -170,6 +170,33 @@ function _solve_affine_system(
     return particular, nullspace
 end
 
+function _restrict_affine_system(
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+    rows::Matrix{ExactRational},
+    rhs::Vector{ExactRational},
+)
+    affine === nothing && return nothing
+    size(rows, 1) == length(rhs) || error("Affine restriction rows and rhs must match.")
+    isempty(rhs) && return affine
+    particular, nullspace = affine
+    coordinate_affine = _solve_affine_system(rows * nullspace, rhs - rows * particular)
+    coordinate_affine === nothing && return nothing
+    coordinate_particular, coordinate_nullspace = coordinate_affine
+    return (
+        particular + nullspace * coordinate_particular,
+        nullspace * coordinate_nullspace,
+    )
+end
+
+function _coordinate_equality_rows(dimension::Int, indices::Vector{Int})
+    unique_indices = unique(sort(indices))
+    rows = zeros(ExactRational, length(unique_indices), dimension)
+    for (row_index, index) in enumerate(unique_indices)
+        rows[row_index, index] = 1 // 1
+    end
+    return rows
+end
+
 function _phase1_active_positions(problem::ProblemData)
     positions = Int[]
     append!(positions, problem.positive_scalars)
@@ -415,7 +442,11 @@ function _prune_psd_faces(
         changed || return blocks, A, b, affine, total_pruned
         A, b = _append_zero_equalities(A, b, zero_indices)
         blocks = new_blocks
-        affine = _solve_affine_system(A, b)
+        affine = _restrict_affine_system(
+            affine,
+            _coordinate_equality_rows(size(A, 2), zero_indices),
+            zeros(ExactRational, length(unique(sort(zero_indices)))),
+        )
         affine === nothing && return blocks, A, b, affine, total_pruned
     end
 end

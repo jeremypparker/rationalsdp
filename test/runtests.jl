@@ -101,6 +101,47 @@ include("kse_timeaverage_helpers.jl")
               RationalSDP._exact_objective_value(problem, anchor)
     end
 
+    @testset "Phase I exact recovery fallback from candidate point" begin
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[MOI.VariableIndex(1), MOI.VariableIndex(2)],
+            RationalSDP.BlockStructure[],
+            [1],
+            Rational{BigInt}[0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 2),
+            Rational{BigInt}[],
+            (
+                Rational{BigInt}[0//1, 0//1],
+                Rational{BigInt}[1//1 0//1; 0//1 1//1],
+            ),
+        )
+        settings = RationalSDP.Settings(rational_tolerance = big"1e-12")
+        phase1_particular = Rational{BigInt}[0//1, 0//1]
+        phase1_nullspace = Rational{BigInt}[1000000000000//1; 0//1]
+        coordinates = Float64[5.0e-13]
+        candidate = Float64[0.5, 0.0]
+
+        direct = RationalSDP._phase1_exact_feasible_point_from_coordinates(
+            coordinates,
+            phase1_particular,
+            reshape(phase1_nullspace, :, 1),
+            problem,
+            settings,
+        )
+        @test direct === nothing
+
+        recovered = RationalSDP._phase1_exact_feasible_point(
+            candidate,
+            problem,
+            settings,
+            RationalSDP._numeric_affine_data(problem, Float64),
+        )
+        @test recovered !== nothing
+        @test recovered[1] == 1//2
+        @test recovered[2] == 0//1
+    end
+
     @testset "Facial reduction helper regressions" begin
         directions = [
             Rational{BigInt}[1//1, 0//1],
@@ -178,6 +219,40 @@ include("kse_timeaverage_helpers.jl")
         VX = value.(X)
         @test VX == Rational{BigInt}[1//1 1//1; 1//1 1//1]
         @test is_psd_exact(VX)
+    end
+
+    @testset "Facial reduction affine lifting stays consistent" begin
+        block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing, nothing, nothing],
+            [1, 2, 3],
+            [(1, 1), (2, 1), (2, 2)],
+            [1, 3],
+        )
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            (
+                zeros(Rational{BigInt}, 3),
+                Matrix{Rational{BigInt}}(I, 3, 3),
+            ),
+        )
+        keep_basis = reshape(Rational{BigInt}[1//1, 1//1], 2, 1)
+        reduced_problem = RationalSDP._apply_facial_reduction(problem, Int[], Dict(1 => keep_basis))
+
+        @test [block.size for block in reduced_problem.blocks] == [1]
+        @test reduced_problem.affine !== nothing
+        particular, nullspace = reduced_problem.affine
+        @test size(reduced_problem.A, 2) == length(particular)
+        @test reduced_problem.A * particular == reduced_problem.b
+        @test reduced_problem.A * nullspace == zeros(Rational{BigInt}, size(reduced_problem.A, 1), size(nullspace, 2))
+        @test RationalSDP._vector_to_matrix(particular, reduced_problem.blocks[1]) == Rational{BigInt}[0//1;;]
     end
 
     @testset "Irrational exposed face detection" begin

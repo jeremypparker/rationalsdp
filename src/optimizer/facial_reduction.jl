@@ -455,6 +455,59 @@ function _face_reduction_rows(
     return rows, rhs
 end
 
+function _exact_left_inverse(matrix::Matrix{ExactRational})
+    gram = transpose(matrix) * matrix
+    size(gram, 1) == size(gram, 2) || error("Expected a square Gram matrix.")
+    inverse = inv(gram)
+    return inverse * transpose(matrix)
+end
+
+function _face_membership_rows(
+    block::BlockStructure,
+    keep_basis::Matrix{ExactRational},
+    dimension::Int,
+)
+    removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
+    rows = Vector{Vector{ExactRational}}()
+    for column in axes(removed_directions, 2)
+        direction = collect(view(removed_directions, :, column))
+        for row_index in 1:block.size
+            push!(rows, _block_row_linear_form(block, row_index, direction, dimension))
+        end
+    end
+    return rows
+end
+
+function _lift_reduced_block_affine(
+    block::BlockStructure,
+    reduced_block::BlockStructure,
+    keep_basis::Matrix{ExactRational},
+    affine::Tuple{Vector{ExactRational},Matrix{ExactRational}},
+)
+    particular, nullspace = affine
+    left_inverse = _exact_left_inverse(keep_basis)
+    reduced_particular_matrix =
+        left_inverse * _vector_to_matrix(particular, block) * transpose(left_inverse)
+    reduced_particular = zeros(ExactRational, length(reduced_block.global_positions))
+    for (local_index, (i, j)) in enumerate(reduced_block.local_positions)
+        reduced_particular[local_index] = reduced_particular_matrix[i, j]
+    end
+
+    reduced_nullspace = zeros(
+        ExactRational,
+        length(reduced_block.global_positions),
+        size(nullspace, 2),
+    )
+    for column in axes(nullspace, 2)
+        reduced_matrix =
+            left_inverse * _vector_to_matrix(view(nullspace, :, column), block) * transpose(left_inverse)
+        for (local_index, (i, j)) in enumerate(reduced_block.local_positions)
+            reduced_nullspace[local_index, column] = reduced_matrix[i, j]
+        end
+    end
+    return reduced_particular, reduced_nullspace
+end
+
 function _apply_facial_reduction(
     problem::ProblemData,
     exposed_scalars::Vector{Int},
@@ -503,12 +556,17 @@ function _apply_facial_reduction(
     b = copy(problem.b)
     extra_rows = Vector{Vector{ExactRational}}()
     extra_rhs = ExactRational[]
+    face_rows_old = Vector{Vector{ExactRational}}()
 
     for position in unique(sort(exposed_scalars))
         row = zeros(ExactRational, total_dimension)
         row[position] = 1 // 1
         push!(extra_rows, row)
         push!(extra_rhs, 0 // 1)
+
+        face_row = zeros(ExactRational, old_dimension)
+        face_row[position] = 1 // 1
+        push!(face_rows_old, face_row)
     end
 
     for (block_index, block) in enumerate(problem.blocks)
@@ -522,6 +580,7 @@ function _apply_facial_reduction(
         )
         append!(extra_rows, rows)
         append!(extra_rhs, rhs)
+        append!(face_rows_old, _face_membership_rows(block, keep_basis, old_dimension))
     end
 
     if !isempty(extra_rows)
@@ -541,7 +600,35 @@ function _apply_facial_reduction(
 
     positive_scalars = [index for index in problem.positive_scalars if !(index in exposed_scalars)]
     objective_extension = zeros(ExactRational, total_dimension - old_dimension)
-    affine = _solve_affine_system(A, b)
+    affine = if problem.affine === nothing
+        _solve_affine_system(A, b)
+    else
+        restricted_affine = isempty(face_rows_old) ? problem.affine : _restrict_affine_system(
+            problem.affine,
+            vcat(transpose.(face_rows_old)...),
+            zeros(ExactRational, length(face_rows_old)),
+        )
+        if restricted_affine === nothing
+            nothing
+        else
+            old_particular, old_nullspace = restricted_affine
+            lifted_particular = copy(old_particular)
+            lifted_nullspace = copy(old_nullspace)
+            for block_index in eachindex(problem.blocks)
+                reduced_block = get(block_replacements, block_index, nothing)
+                reduced_block === nothing && continue
+                reduced_particular, reduced_nullspace = _lift_reduced_block_affine(
+                    problem.blocks[block_index],
+                    reduced_block,
+                    keep_bases[block_index],
+                    restricted_affine,
+                )
+                lifted_particular = vcat(lifted_particular, reduced_particular)
+                lifted_nullspace = vcat(lifted_nullspace, reduced_nullspace)
+            end
+            (lifted_particular, lifted_nullspace)
+        end
+    end
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
     return ProblemData(

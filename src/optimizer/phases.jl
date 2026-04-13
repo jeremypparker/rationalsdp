@@ -711,15 +711,25 @@ function _phase1_hypatia_anchor_once(
         end
         recovery_threshold = max(HF(1.0e-6), sqrt(eps(HF)))
         if residual > recovery_threshold
+            anchor = nothing
+            if margin > zero(HF)
+                anchor = _phase1_exact_feasible_point_from_coordinates(
+                    raw_solution[1:(end - 1)],
+                    particular,
+                    phase1_nullspace,
+                    problem,
+                    opt.settings,
+                )
+            end
             attempt = Phase1HypatiaAttempt{HF}(
-                nothing,
+                anchor,
                 candidate,
                 string(status),
                 iterations,
                 margin,
                 residual,
                 total_time_sec,
-                :large_residual,
+                anchor === nothing ? :large_residual : :exact_anchor,
             )
             _log_phase1_hypatia_attempt(opt, attempt)
             return attempt
@@ -739,13 +749,22 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
-        anchor = _phase1_exact_feasible_point_from_coordinates(
-            raw_solution[1:(end - 1)],
-            particular,
-            phase1_nullspace,
+        numeric_affine = _numeric_affine_data(problem, HF)
+        anchor = _phase1_exact_feasible_point(
+            candidate,
             problem,
             opt.settings,
+            numeric_affine,
         )
+        if anchor === nothing
+            anchor = _phase1_exact_feasible_point_from_coordinates(
+                raw_solution[1:(end - 1)],
+                particular,
+                phase1_nullspace,
+                problem,
+                opt.settings,
+            )
+        end
         attempt = Phase1HypatiaAttempt{HF}(
             anchor,
             candidate,

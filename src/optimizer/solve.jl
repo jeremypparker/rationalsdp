@@ -80,7 +80,9 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
     _with_working_precision(opt.settings, function (F)
         numeric_settings = _numeric_settings(opt.settings, F)
         _log(opt, "Extracting problem")
+        _gc_checkpoint!(opt, "before extraction")
         problem = _extract_problem(opt)
+        _gc_checkpoint!(opt, "after extraction")
         _log(opt, "Problem extracted")
         _log_banner(opt, problem)
         if problem.affine === nothing

@@ -123,15 +123,22 @@ function _rref(aug::Matrix{ExactRational})
         end
         pivot_index == 0 && continue
         if pivot_index != pivot_row
-            aug[pivot_row, :], aug[pivot_index, :] = aug[pivot_index, :], aug[pivot_row, :]
+            for swap_col in 1:cols
+                aug[pivot_row, swap_col], aug[pivot_index, swap_col] =
+                    aug[pivot_index, swap_col], aug[pivot_row, swap_col]
+            end
         end
         pivot_value = aug[pivot_row, col]
-        aug[pivot_row, :] ./= pivot_value
+        for scale_col in 1:cols
+            aug[pivot_row, scale_col] /= pivot_value
+        end
         for row in 1:rows
             row == pivot_row && continue
             factor = aug[row, col]
             iszero(factor) && continue
-            aug[row, :] .-= factor .* aug[pivot_row, :]
+            for update_col in 1:cols
+                aug[row, update_col] -= factor * aug[pivot_row, update_col]
+            end
         end
         push!(pivot_columns, col)
         pivot_row += 1
@@ -143,13 +150,20 @@ end
 function _solve_affine_system(
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
+    ;
+    checkpoint::Union{Nothing,Function} = nothing,
 )
     p = size(A, 2)
     if size(A, 1) == 0
         return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
     end
-    aug = hcat(copy(A), copy(b))
+    checkpoint !== nothing && checkpoint("affine elimination: before augmented matrix")
+    aug = Matrix{ExactRational}(undef, size(A, 1), p + 1)
+    aug[:, 1:p] = A
+    aug[:, p + 1] = b
+    checkpoint !== nothing && checkpoint("affine elimination: after augmented matrix")
     reduced, pivots = _rref(aug)
+    checkpoint !== nothing && checkpoint("affine elimination: after exact rref")
     for row in 1:size(reduced, 1)
         if all(iszero, reduced[row, 1:p]) && !iszero(reduced[row, p + 1])
             return nothing

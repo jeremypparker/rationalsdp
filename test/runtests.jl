@@ -12,6 +12,7 @@ include("kse_timeaverage_helpers.jl")
         set_optimizer_attribute(model, "phase1_outer_iterations", 24)
         set_optimizer_attribute(model, "phase1_backend", "native")
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
+        set_optimizer_attribute(model, "phase1_hypatia_syssolver", "qrchol_dense")
         set_optimizer_attribute(model, "phase1_hypatia_margin_upper", "1e-4")
         set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
         set_optimizer_attribute(model, "phase1_hypatia_margin_shrink", "0.2")
@@ -22,6 +23,7 @@ include("kse_timeaverage_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
+        @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :qrchol_dense
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_upper") == big"1e-4"
         @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_shrink") == big"0.2"
@@ -36,6 +38,7 @@ include("kse_timeaverage_helpers.jl")
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :auto
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
 
         set_optimizer_attribute(model, "working_float_type", Float64)
@@ -56,6 +59,34 @@ include("kse_timeaverage_helpers.jl")
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
+    end
+
+    @testset "Hypatia Phase I system solver selection" begin
+        syssolver, use_dense_model, preprocess =
+            RationalSDP._hypatia_phase1_syssolver(RationalSDP.Settings(), Float64)
+        @test syssolver isa RationalSDP.Hypatia.Solvers.SymIndefSparseSystemSolver{Float64}
+        @test !use_dense_model
+        @test !preprocess
+
+        settings = RationalSDP.Settings(phase1_hypatia_syssolver = :qrchol_dense)
+        syssolver, use_dense_model, preprocess =
+            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Double64)
+        @test syssolver isa RationalSDP.Hypatia.Solvers.QRCholDenseSystemSolver{RationalSDP.Double64}
+        @test use_dense_model
+        @test preprocess
+
+        settings = RationalSDP.Settings(phase1_hypatia_syssolver = :symindef_indirect)
+        syssolver, use_dense_model, preprocess =
+            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Double64)
+        @test syssolver isa RationalSDP.Hypatia.Solvers.SymIndefIndirectSystemSolver{RationalSDP.Double64}
+        @test !use_dense_model
+        @test !preprocess
+
+        settings = RationalSDP.Settings(phase1_hypatia_syssolver = :symindef_sparse)
+        @test_throws ErrorException RationalSDP._hypatia_phase1_syssolver(
+            settings,
+            RationalSDP.Double64,
+        )
     end
 
     @testset "Reject approximate model coefficients" begin

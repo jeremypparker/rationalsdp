@@ -5,11 +5,13 @@ function _extract_affine_row(
     var_to_pos::Dict{MOI.VariableIndex,Int},
     p::Int,
 )
-    row = zeros(ExactRational, p)
+    indices = Int[]
+    values = ExactRational[]
     for term in func.terms
-        row[var_to_pos[term.variable]] += _exact_rational(term.coefficient)
+        push!(indices, var_to_pos[term.variable])
+        push!(values, _exact_rational(term.coefficient))
     end
-    return row, _exact_rational(func.constant)
+    return indices, values, _exact_rational(func.constant)
 end
 
 function _single_variable_row(
@@ -17,9 +19,7 @@ function _single_variable_row(
     var_to_pos::Dict{MOI.VariableIndex,Int},
     p::Int,
 )
-    row = zeros(ExactRational, p)
-    row[var_to_pos[variable]] = 1 // 1
-    return row
+    return Int[var_to_pos[variable]], ExactRational[1 // 1]
 end
 
 function _extract_vector_affine_rows(
@@ -28,13 +28,14 @@ function _extract_vector_affine_rows(
     p::Int,
 )
     dimension = MOI.output_dimension(func)
-    rows = [zeros(ExactRational, p) for _ in 1:dimension]
+    row_indices = [Int[] for _ in 1:dimension]
+    row_values = [ExactRational[] for _ in 1:dimension]
     offsets = ExactRational[_exact_rational(value) for value in func.constants]
     for term in func.terms
-        rows[term.output_index][var_to_pos[term.scalar_term.variable]] +=
-            _exact_rational(term.scalar_term.coefficient)
+        push!(row_indices[term.output_index], var_to_pos[term.scalar_term.variable])
+        push!(row_values[term.output_index], _exact_rational(term.scalar_term.coefficient))
     end
-    return rows, offsets
+    return row_indices, row_values, offsets
 end
 
 function _objective_data(storage, vars, var_to_pos)
@@ -64,28 +65,31 @@ end
 
 function _push_equality!(
     templates::Vector{EquationTemplate},
-    coefficients::Vector{ExactRational},
+    indices::Vector{Int},
+    values::Vector{ExactRational},
     rhs::ExactRational,
 )
-    push!(templates, EquationTemplate(coefficients, rhs, 0))
+    push!(templates, EquationTemplate(indices, values, rhs, 0))
     return
 end
 
 function _push_greater_than!(
     templates::Vector{EquationTemplate},
-    coefficients::Vector{ExactRational},
+    indices::Vector{Int},
+    values::Vector{ExactRational},
     rhs::ExactRational,
 )
-    push!(templates, EquationTemplate(coefficients, rhs, -1))
+    push!(templates, EquationTemplate(indices, values, rhs, -1))
     return
 end
 
 function _push_less_than!(
     templates::Vector{EquationTemplate},
-    coefficients::Vector{ExactRational},
+    indices::Vector{Int},
+    values::Vector{ExactRational},
     rhs::ExactRational,
 )
-    push!(templates, EquationTemplate(coefficients, rhs, 1))
+    push!(templates, EquationTemplate(indices, values, rhs, 1))
     return
 end
 
@@ -99,9 +103,12 @@ function _assemble_system(
     b = Vector{ExactRational}(undef, length(templates))
     positive_scalars = Int[]
     next_slack = original_dimension + 1
+    empty_indices = Int[]
+    empty_values = ExactRational[]
+    empty_template = EquationTemplate(empty_indices, empty_values, zero(ExactRational), 0)
     for (row_index, template) in enumerate(templates)
-        if original_dimension > 0
-            A[row_index, 1:original_dimension] = template.coefficients
+        for (index, value) in zip(template.indices, template.values)
+            A[row_index, index] += value
         end
         b[row_index] = template.rhs
         if template.slack_sign != 0
@@ -109,12 +116,184 @@ function _assemble_system(
             push!(positive_scalars, next_slack)
             next_slack += 1
         end
+        templates[row_index] = empty_template
     end
     return A, b, positive_scalars
 end
 
+function _extract_constraint_system(
+    opt::Optimizer{T},
+    storage,
+    original_variables,
+    var_to_pos,
+    base_dimension::Int,
+    psd_affine_indices,
+    blocks::Vector{BlockStructure},
+    psd_constraint_blocks::Dict{Any,Int},
+) where {T}
+    templates = EquationTemplate[]
+    next_auxiliary_position = length(original_variables) + 1
+    for ci in psd_affine_indices
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        positions = _triangle_positions(set.side_dimension)
+        length(positions) == MOI.output_dimension(func) || error("Malformed affine PSD block.")
+        row_indices, row_values, offsets = _extract_vector_affine_rows(func, var_to_pos, base_dimension)
+        global_positions = collect(next_auxiliary_position:(next_auxiliary_position + length(positions) - 1))
+        diagonal_positions = Int[]
+        for local_index in eachindex(positions)
+            indices = row_indices[local_index]
+            values = row_values[local_index]
+            push!(indices, global_positions[local_index])
+            push!(values, -(1 // 1))
+            _push_equality!(templates, indices, values, -offsets[local_index])
+            if positions[local_index][1] == positions[local_index][2]
+                push!(diagonal_positions, global_positions[local_index])
+            end
+        end
+        push!(
+            blocks,
+            BlockStructure(
+                set.side_dimension,
+                fill(nothing, length(positions)),
+                global_positions,
+                positions,
+                diagonal_positions,
+            ),
+        )
+        psd_constraint_blocks[ci] = length(blocks)
+        next_auxiliary_position += length(positions)
+    end
+
+    c_original_raw, constant_raw, c_original_min = _objective_data(storage, original_variables, var_to_pos)
+    scalar_constraint_rows = Dict{Any,Vector{Int}}()
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.ScalarAffineFunction{T},
+            MOI.EqualTo{T},
+        }(),
+    )
+        row_index = length(templates) + 1
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        _push_equality!(templates, indices, values, _exact_rational(set.value) - offset)
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.ScalarAffineFunction{T},
+            MOI.GreaterThan{T},
+        }(),
+    )
+        row_index = length(templates) + 1
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        _push_greater_than!(templates, indices, values, _exact_rational(set.lower) - offset)
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.ScalarAffineFunction{T},
+            MOI.LessThan{T},
+        }(),
+    )
+        row_index = length(templates) + 1
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        _push_less_than!(templates, indices, values, _exact_rational(set.upper) - offset)
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{
+            MOI.ScalarAffineFunction{T},
+            MOI.Interval{T},
+        }(),
+    )
+        row_index = length(templates) + 1
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        _push_greater_than!(templates, copy(indices), copy(values), _exact_rational(set.lower) - offset)
+        _push_less_than!(templates, indices, values, _exact_rational(set.upper) - offset)
+        scalar_constraint_rows[ci] = [row_index, row_index + 1]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.EqualTo{T}}(),
+    )
+        row_index = length(templates) + 1
+        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        _push_equality!(
+            templates,
+            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            _exact_rational(set.value),
+        )
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.GreaterThan{T}}(),
+    )
+        row_index = length(templates) + 1
+        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        _push_greater_than!(
+            templates,
+            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            _exact_rational(set.lower),
+        )
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.LessThan{T}}(),
+    )
+        row_index = length(templates) + 1
+        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        _push_less_than!(
+            templates,
+            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            _exact_rational(set.upper),
+        )
+        scalar_constraint_rows[ci] = [row_index]
+    end
+
+    for ci in MOI.get(
+        storage,
+        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.Interval{T}}(),
+    )
+        row_index = length(templates) + 1
+        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values = _single_variable_row(variable, var_to_pos, base_dimension)
+        _push_greater_than!(templates, copy(indices), copy(values), _exact_rational(set.lower))
+        _push_less_than!(templates, indices, values, _exact_rational(set.upper))
+        scalar_constraint_rows[ci] = [row_index, row_index + 1]
+    end
+
+    A, b, positive_scalars = _assemble_system(templates, base_dimension)
+    return A, b, positive_scalars, c_original_raw, constant_raw, c_original_min, scalar_constraint_rows
+end
+
 function _extract_problem(opt::Optimizer{T}) where {T}
     storage = opt.storage
+    _gc_checkpoint!(opt, "extraction start")
     original_variables = MOI.get(storage, MOI.ListOfVariableIndices())
     original_dimension = length(original_variables)
     var_to_pos = Dict{MOI.VariableIndex,Int}(vi => i for (i, vi) in enumerate(original_variables))
@@ -174,167 +353,26 @@ function _extract_problem(opt::Optimizer{T}) where {T}
         psd_constraint_blocks[ci] = length(blocks)
     end
 
-    templates = EquationTemplate[]
-    next_auxiliary_position = original_dimension + 1
-    for ci in psd_affine_indices
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        positions = _triangle_positions(set.side_dimension)
-        length(positions) == MOI.output_dimension(func) || error("Malformed affine PSD block.")
-        rows, offsets = _extract_vector_affine_rows(func, var_to_pos, base_dimension)
-        global_positions = collect(next_auxiliary_position:(next_auxiliary_position + length(positions) - 1))
-        diagonal_positions = Int[]
-        for local_index in eachindex(positions)
-            row = rows[local_index]
-            row[global_positions[local_index]] -= 1 // 1
-            _push_equality!(templates, row, -offsets[local_index])
-            if positions[local_index][1] == positions[local_index][2]
-                push!(diagonal_positions, global_positions[local_index])
-            end
-        end
-        push!(
+    A, b, positive_scalars, c_original_raw, constant_raw, c_original_min, scalar_constraint_rows =
+        _extract_constraint_system(
+            opt,
+            storage,
+            original_variables,
+            var_to_pos,
+            base_dimension,
+            psd_affine_indices,
             blocks,
-            BlockStructure(
-                set.side_dimension,
-                fill(nothing, length(positions)),
-                global_positions,
-                positions,
-                diagonal_positions,
-            ),
+            psd_constraint_blocks,
         )
-        psd_constraint_blocks[ci] = length(blocks)
-        next_auxiliary_position += length(positions)
-    end
-
-    c_original_raw, constant_raw, c_original_min = _objective_data(storage, original_variables, var_to_pos)
-    scalar_constraint_rows = Dict{Any,Vector{Int}}()
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.ScalarAffineFunction{T},
-            MOI.EqualTo{T},
-        }(),
-    )
-        row_index = length(templates) + 1
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        row, offset = _extract_affine_row(func, var_to_pos, base_dimension)
-        _push_equality!(templates, row, _exact_rational(set.value) - offset)
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.ScalarAffineFunction{T},
-            MOI.GreaterThan{T},
-        }(),
-    )
-        row_index = length(templates) + 1
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        row, offset = _extract_affine_row(func, var_to_pos, base_dimension)
-        _push_greater_than!(templates, row, _exact_rational(set.lower) - offset)
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.ScalarAffineFunction{T},
-            MOI.LessThan{T},
-        }(),
-    )
-        row_index = length(templates) + 1
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        row, offset = _extract_affine_row(func, var_to_pos, base_dimension)
-        _push_less_than!(templates, row, _exact_rational(set.upper) - offset)
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.ScalarAffineFunction{T},
-            MOI.Interval{T},
-        }(),
-    )
-        row_index = length(templates) + 1
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        row, offset = _extract_affine_row(func, var_to_pos, base_dimension)
-        _push_greater_than!(templates, copy(row), _exact_rational(set.lower) - offset)
-        _push_less_than!(templates, row, _exact_rational(set.upper) - offset)
-        scalar_constraint_rows[ci] = [row_index, row_index + 1]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.EqualTo{T}}(),
-    )
-        row_index = length(templates) + 1
-        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        _push_equality!(
-            templates,
-            _single_variable_row(variable, var_to_pos, base_dimension),
-            _exact_rational(set.value),
-        )
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.GreaterThan{T}}(),
-    )
-        row_index = length(templates) + 1
-        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        _push_greater_than!(
-            templates,
-            _single_variable_row(variable, var_to_pos, base_dimension),
-            _exact_rational(set.lower),
-        )
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.LessThan{T}}(),
-    )
-        row_index = length(templates) + 1
-        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        _push_less_than!(
-            templates,
-            _single_variable_row(variable, var_to_pos, base_dimension),
-            _exact_rational(set.upper),
-        )
-        scalar_constraint_rows[ci] = [row_index]
-    end
-
-    for ci in MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{MOI.VariableIndex,MOI.Interval{T}}(),
-    )
-        row_index = length(templates) + 1
-        variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        row = _single_variable_row(variable, var_to_pos, base_dimension)
-        _push_greater_than!(templates, copy(row), _exact_rational(set.lower))
-        _push_less_than!(templates, row, _exact_rational(set.upper))
-        scalar_constraint_rows[ci] = [row_index, row_index + 1]
-    end
-
-    A, b, positive_scalars = _assemble_system(templates, base_dimension)
+    _gc_checkpoint!(opt, "after system assembly")
     slack_count = length(positive_scalars)
     c_raw = vcat(c_original_raw, zeros(ExactRational, psd_auxiliary_count + slack_count))
     c_min = vcat(c_original_min, zeros(ExactRational, psd_auxiliary_count + slack_count))
-    affine = _solve_affine_system(A, b)
+    affine = _solve_affine_system(A, b; checkpoint = label -> _gc_checkpoint!(opt, label))
+    _gc_checkpoint!(opt, "after affine elimination")
     positive_scalars, pruned_scalar_faces = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, pruned_directions = _prune_psd_faces(blocks, A, b, affine)
+    _gc_checkpoint!(opt, "after cone pruning")
     if pruned_scalar_faces > 0 || pruned_directions > 0
         _log(
             opt,

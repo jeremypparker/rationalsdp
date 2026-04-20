@@ -22,6 +22,7 @@ Base.@kwdef mutable struct Settings
     phase2_outer_iterations::Int = 12
     phase1_backend::Symbol = :hypatia
     phase1_hypatia_float_type::DataType = AbstractFloat
+    phase1_hypatia_syssolver::Symbol = :auto
     phase1_hypatia_iter_limit::Int = 400
     phase1_hypatia_margin_upper::BigFloat = big"1.0"
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
@@ -57,6 +58,9 @@ Base.@kwdef mutable struct Settings
     threading_min_block_size::Int = 48
     iterative_linear_solver::Bool = true
     iterative_solver_min_dimension::Int = 384
+    gc_collect_extraction::Bool = false
+    gc_collect_full::Bool = true
+    gc_log::Bool = false
 end
 
 struct BlockStructure
@@ -68,7 +72,8 @@ struct BlockStructure
 end
 
 struct EquationTemplate
-    coefficients::Vector{ExactRational}
+    indices::Vector{Int}
+    values::Vector{ExactRational}
     rhs::ExactRational
     slack_sign::Int
 end
@@ -217,6 +222,58 @@ function _log_newton(opt::Optimizer, message::AbstractString)
     if !opt.silent && opt.settings.verbose && opt.settings.verbose_newton
         println("[RationalSDP] ", message)
     end
+    return
+end
+
+function _format_bytes(bytes::Integer)
+    value = float(bytes)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit_index = 1
+    while unit_index < length(units) && value >= 1024
+        value /= 1024
+        unit_index += 1
+    end
+    if unit_index == 1
+        return string(bytes, " ", units[unit_index])
+    end
+    return @sprintf("%.2f %s", value, units[unit_index])
+end
+
+function _gc_snapshot()
+    stats = Base.gc_num()
+    live_bytes = try
+        Int(Base.gc_live_bytes())
+    catch
+        -1
+    end
+    return (
+        live_bytes = live_bytes,
+        full_sweeps = Int(getfield(stats, :full_sweep)),
+        allocd = Int(getfield(stats, :allocd)),
+    )
+end
+
+function _log_gc_state(opt::Optimizer, label::AbstractString)
+    opt.settings.gc_log || return
+    snapshot = _gc_snapshot()
+    live_text = snapshot.live_bytes >= 0 ? _format_bytes(snapshot.live_bytes) : "unavailable"
+    _log(
+        opt,
+        "GC $(label): live=$(live_text), full_sweeps=$(snapshot.full_sweeps), " *
+        "allocd_since_gc=$(_format_bytes(snapshot.allocd))",
+    )
+    return
+end
+
+function _gc_checkpoint!(opt::Optimizer, label::AbstractString)
+    opt.settings.gc_log && _log_gc_state(opt, label * " (before)")
+    if opt.settings.gc_collect_extraction
+        GC.gc(false)
+        if opt.settings.gc_collect_full
+            GC.gc(true)
+        end
+    end
+    opt.settings.gc_log && _log_gc_state(opt, label * " (after)")
     return
 end
 
@@ -419,6 +476,24 @@ end
 
 function _phase1_hypatia_float_type_is_auto(settings::Settings)
     return settings.phase1_hypatia_float_type === AbstractFloat
+end
+
+function _phase1_hypatia_syssolver(settings::Settings)
+    syssolver = settings.phase1_hypatia_syssolver
+    syssolver in (
+        :auto,
+        :symindef_sparse,
+        :symindef_dense,
+        :symindef_indirect,
+        :qrchol_dense,
+        :naive_dense,
+        :naiveelim_dense,
+    ) || error(
+        "phase1_hypatia_syssolver must be one of " *
+        ":auto, :symindef_sparse, :symindef_dense, :symindef_indirect, " *
+        ":qrchol_dense, :naive_dense, :naiveelim_dense.",
+    )
+    return syssolver
 end
 
 function _facial_reduction_float_type(settings::Settings)

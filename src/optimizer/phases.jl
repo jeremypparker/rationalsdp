@@ -283,11 +283,28 @@ function _should_attempt_phase1_recovery(
     return residual * 32 <= last_probe_residual
 end
 
-function _hypatia_phase1_syssolver(::Type{F}) where {F<:AbstractFloat}
-    if F == Float64
-        return Hypatia.Solvers.SymIndefSparseSystemSolver{F}(), false
+function _hypatia_phase1_syssolver(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
+    choice = _phase1_hypatia_syssolver(settings)
+    if choice == :auto
+        if F == Float64
+            return Hypatia.Solvers.SymIndefSparseSystemSolver{F}(), false, false
+        end
+        return Hypatia.Solvers.SymIndefDenseSystemSolver{F}(), true, false
+    elseif choice == :symindef_sparse
+        F == Float64 || error("Hypatia sparse symmetric-indefinite solver is only supported for Float64.")
+        return Hypatia.Solvers.SymIndefSparseSystemSolver{F}(), false, false
+    elseif choice == :symindef_dense
+        return Hypatia.Solvers.SymIndefDenseSystemSolver{F}(), true, false
+    elseif choice == :symindef_indirect
+        return Hypatia.Solvers.SymIndefIndirectSystemSolver{F}(), false, false
+    elseif choice == :qrchol_dense
+        return Hypatia.Solvers.QRCholDenseSystemSolver{F}(), true, true
+    elseif choice == :naive_dense
+        return Hypatia.Solvers.NaiveDenseSystemSolver{F}(), true, false
+    elseif choice == :naiveelim_dense
+        return Hypatia.Solvers.NaiveElimDenseSystemSolver{F}(), true, false
     end
-    return Hypatia.Solvers.SymIndefDenseSystemSolver{F}(), true
+    error("Unhandled phase1_hypatia_syssolver choice $(choice).")
 end
 
 function _phase1_hypatia_prefers_sparse_float64(problem::ProblemData)
@@ -653,11 +670,14 @@ function _phase1_hypatia_anchor_once(
             HF,
             numeric_margin_upper,
         )
-        syssolver, use_dense_model = _hypatia_phase1_syssolver(HF)
+        problem.phase1_nullspace = nothing
+        phase1_nullspace = nothing
+        _gc_checkpoint!(opt, "before Hypatia load")
+        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
             verbose = !opt.silent && opt.settings.verbose,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
-            preprocess = false,
+            preprocess = preprocess,
             reduce = false,
             syssolver = syssolver,
             use_dense_model = use_dense_model,
@@ -690,6 +710,7 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
+        phase1_nullspace = _phase1_nullspace(problem)
         candidate = _hypatia_phase1_point(particular, phase1_nullspace, raw_solution[1:(end - 1)])
         margin = raw_solution[end]
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
@@ -846,9 +867,6 @@ function _phase1_anchor_attempt(
     problem::ProblemData,
     ::Type{F},
 ) where {F<:AbstractFloat}
-    numeric_settings = _numeric_settings(opt.settings, F)
-    numeric_blocks = _numeric_blocks(problem.blocks)
-    numeric_affine = _numeric_affine_data(problem, F)
     anchor = nothing
     phase2_initial_point = nothing
     phase1_candidate = nothing
@@ -871,6 +889,9 @@ function _phase1_anchor_attempt(
     end
 
     if anchor === nothing && _phase1_backend(opt.settings) == :native
+        numeric_settings = _numeric_settings(opt.settings, F)
+        numeric_blocks = _numeric_blocks(problem.blocks)
+        numeric_affine = _numeric_affine_data(problem, F)
         use_iterative_phase1 =
             numeric_settings.iterative_linear_solver &&
             length(problem.objective_vector_raw) >= numeric_settings.iterative_solver_min_dimension

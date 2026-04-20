@@ -153,8 +153,8 @@ function _best_exact_interior_on_segment(
     problem::ProblemData;
     max_bisections::Int,
 )
-    candidate_objective = _exact_objective_value(problem, candidate)
-    anchor_objective = _exact_objective_value(problem, anchor)
+    candidate_objective = _exact_phase2_objective_value(problem, candidate)
+    anchor_objective = _exact_phase2_objective_value(problem, anchor)
     candidate_objective < anchor_objective || return anchor
 
     if _strictly_interior_exact(candidate, problem.blocks, problem.positive_scalars)
@@ -206,7 +206,8 @@ function _phase2_exact_refinement(
             problem;
             max_bisections = settings.exact_refinement_bisections,
         )
-        if _exact_objective_value(problem, refined) < _exact_objective_value(problem, best)
+        if _exact_phase2_objective_value(problem, refined) <
+           _exact_phase2_objective_value(problem, best)
             best = refined
         end
     end
@@ -1054,6 +1055,10 @@ end
 
 function _exact_objective_value(problem::ProblemData, x::Vector{ExactRational})
     return dot(problem.objective_vector_raw, x) + problem.objective_constant_raw
+end
+
+function _exact_phase2_objective_value(problem::ProblemData, x::Vector{ExactRational})
+    return dot(problem.objective_vector_min, x)
 end
 
 function _barrier_dimension(problem::ProblemData)

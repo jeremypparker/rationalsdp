@@ -106,6 +106,22 @@ include("kse_timeaverage_helpers.jl")
         @test value(X[1, 1]) == 1//1
     end
 
+    @testset "Scalar max objective over an interval" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "phase1_backend", :native)
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        @variable(model, x)
+        @constraint(model, x >= 0//1)
+        @constraint(model, x <= 1//1)
+        @objective(model, Max, x)
+        optimize!(model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test value(x) <= 1//1
+        @test value(x) > 999//1000
+        @test objective_value(model) == value(x)
+    end
+
     @testset "Exact phase II segment refinement" begin
         problem = RationalSDP.ProblemData(
             [MOI.VariableIndex(1)],
@@ -578,6 +594,8 @@ include("kse_timeaverage_helpers.jl")
         @test value(instance.B) < 281//100
     end
 end
+
+include("sumofsquares_tests.jl")
 
 if "slow" in ARGS
     include("slowtests.jl")

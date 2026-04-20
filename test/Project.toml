@@ -5,7 +5,8 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 RationalSDP = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
+SumOfSquares = "4b9e565b-77fc-50a5-a571-1244f986bda1"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-RationalSDP = { path = ".." }
+RationalSDP = {path = ".."}

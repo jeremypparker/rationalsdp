@@ -178,11 +178,11 @@ include("kse_timeaverage_helpers.jl")
         )
         @test direct === nothing
 
-        recovered = RationalSDP._phase1_exact_feasible_point(
+        recovered = RationalSDP._phase1_exact_anchor_fallback(
             candidate,
             problem,
             settings,
-            RationalSDP._numeric_affine_data(problem, Float64),
+            Float64,
         )
         @test recovered !== nothing
         @test recovered[1] == 1//2
@@ -300,6 +300,139 @@ include("kse_timeaverage_helpers.jl")
         @test reduced_problem.A * particular == reduced_problem.b
         @test reduced_problem.A * nullspace == zeros(Rational{BigInt}, size(reduced_problem.A, 1), size(nullspace, 2))
         @test RationalSDP._vector_to_matrix(particular, reduced_problem.blocks[1]) == Rational{BigInt}[0//1;;]
+    end
+
+    @testset "Facial reduction oracle fallback exposes scalar faces" begin
+        block = RationalSDP.BlockStructure(
+            1,
+            Union{Nothing,MOI.VariableIndex}[nothing],
+            [2],
+            [(1, 1)],
+            [2],
+        )
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            [1],
+            Rational{BigInt}[0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1],
+            Rational{BigInt}[1//1 0//1; 0//1 1//1],
+            Rational{BigInt}[0//1, 1//1],
+            (
+                Rational{BigInt}[0//1, 1//1],
+                zeros(Rational{BigInt}, 2, 0),
+            ),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            working_float_type = Float64,
+            facial_reduction_float_type = Float64,
+        )
+        candidate = Float64[0.0, 1.0]
+
+        @test isempty(
+            RationalSDP._candidate_kernel_directions(
+                opt,
+                problem,
+                1,
+                RationalSDP._vector_to_matrix(candidate, block),
+                Float64,
+            ),
+        )
+
+        reduction = RationalSDP._facial_reduction_round(opt, problem, candidate, Float64)
+        @test reduction !== nothing
+        exposed_scalars, keep_bases = reduction
+        @test exposed_scalars == [1]
+        @test isempty(keep_bases)
+
+        reduced_problem = RationalSDP._apply_facial_reduction(problem, exposed_scalars, keep_bases)
+        @test isempty(reduced_problem.positive_scalars)
+        @test [reduced_block.size for reduced_block in reduced_problem.blocks] == [1]
+
+        reduced_via_driver = RationalSDP._facially_reduce_problem(
+            opt,
+            problem,
+            candidate,
+            Float64,
+        )
+        @test isempty(reduced_via_driver.positive_scalars)
+        @test [reduced_block.size for reduced_block in reduced_via_driver.blocks] == [1]
+    end
+
+    @testset "SIRS facial reduction keeps reduced affine candidate interior" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        set_optimizer_attribute(model, "facial_reduction_float_type", Float64)
+
+        @polyvar S I R L
+        N = 1
+
+        gamma = 1 // 10
+        mu = 1 // 10
+        beta = 1 // 1
+        delta = 0 // 1
+        alpha = 1 // 10
+        Lambda = mu
+        R0 = Lambda * beta / (mu * (mu + delta + gamma))
+        S1 = Lambda / mu * ((1 // 1) / R0)
+        I1 = Lambda * (alpha + mu) * (R0 - 1) /
+             (R0 * ((gamma + delta + mu) * (alpha + mu) - alpha * gamma))
+        R1 = I1 * gamma / (alpha + mu)
+        L1 = 0 // 1
+
+        dSdt = Lambda - beta * S * I / N - mu * S + alpha * R
+        dIdt = beta * S * I / N - (delta + gamma + mu) * I
+        dRdt = gamma * I - (alpha + mu) * R
+        dLdt = beta * S / N - (delta + gamma + mu)
+
+        basisV = monomials([S, I, R, L], 0:2)
+        @variable(model, coeffsV[1:length(basisV)])
+        V = dot(basisV, coeffsV)
+
+        dVdt =
+            differentiate(V, S) * dSdt +
+            differentiate(V, I) * dIdt +
+            differentiate(V, R) * dRdt +
+            differentiate(V, L) * dLdt
+
+        D = @set I >= 0 &&
+                 S >= 0 &&
+                 R >= 0 &&
+                 I - I1 - I1 * L >= 0
+
+        @constraint(model, V(S => S1, I => I1, R => R1, L => L1) == 0)
+        @constraint(model, V >= (S - S1)^2 + (I - I1 - I1 * L) + (R - R1)^2, SOSCone(), domain = D)
+        @constraint(model, -((S - S1)^2 + (I - I1)^2 + (R - R1)^2) >= dVdt, SOSCone(), domain = D)
+
+        MOI.Utilities.attach_optimizer(backend(model))
+        bridge_optimizer = getfield(backend(model), :optimizer)
+        opt = getfield(bridge_optimizer, :model)
+
+        problem = RationalSDP._extract_problem(opt)
+        result1 = RationalSDP._phase1_anchor_attempt(opt, problem, Float64)
+        @test result1.phase1_candidate !== nothing
+
+        reduction1 = RationalSDP._facial_reduction_round(
+            opt,
+            problem,
+            result1.phase1_candidate,
+            Float64,
+        )
+        @test reduction1 !== nothing
+        exposed_scalars1, keep_bases1 = reduction1
+        @test !isempty(keep_bases1)
+
+        reduced_problem = RationalSDP._apply_facial_reduction(problem, exposed_scalars1, keep_bases1)
+        result2 = RationalSDP._phase1_anchor_attempt(opt, reduced_problem, Float64)
+        @test result2.phase1_candidate !== nothing
+
+        for block in reduced_problem.blocks
+            X = RationalSDP._vector_to_matrix(result2.phase1_candidate, block)
+            eigs = eigvals(Symmetric((X + transpose(X)) / 2))
+            @test minimum(eigs) > -1.0e-6
+        end
     end
 
     @testset "Irrational exposed face detection" begin

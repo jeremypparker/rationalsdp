@@ -272,6 +272,21 @@ function _phase1_exact_feasible_point_from_coordinates(
     return nothing
 end
 
+function _phase1_exact_anchor_fallback(
+    candidate::Vector{F},
+    problem::ProblemData,
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    numeric_affine = _numeric_affine_data(problem, F)
+    return _phase1_exact_feasible_point(
+        candidate,
+        problem,
+        settings,
+        numeric_affine,
+    )
+end
+
 function _should_attempt_phase1_recovery(
     residual::F,
     iteration::Int,
@@ -690,13 +705,17 @@ function _phase1_hypatia_anchor_once(
         status = Hypatia.Solvers.get_status(solver)
         iterations = Hypatia.Solvers.get_num_iters(solver)
         total_time_sec = (time_ns() - start_time) / 1.0e9
+        solution_length = size(model.G, 2)
         raw_solution = try
-            Hypatia.Solvers.get_x(solver)
+            copy(Hypatia.Solvers.get_x(solver))
         catch
             nothing
         end
 
-        if raw_solution === nothing || length(raw_solution) != size(model.G, 2)
+        if raw_solution === nothing || length(raw_solution) != solution_length
+            solver = nothing
+            model = nothing
+            _gc_checkpoint!(opt, "after Hypatia solve (no point)")
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 nothing,
@@ -711,13 +730,20 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
-        phase1_nullspace = _phase1_nullspace(problem)
-        candidate = _hypatia_phase1_point(particular, phase1_nullspace, raw_solution[1:(end - 1)])
+        coordinates = raw_solution[1:(end - 1)]
         margin = raw_solution[end]
+        raw_solution_finite = all(isfinite, raw_solution)
+        raw_solution = nothing
+        solver = nothing
+        model = nothing
+        _gc_checkpoint!(opt, "after Hypatia solve")
+
+        phase1_nullspace = _phase1_nullspace(problem)
+        candidate = _hypatia_phase1_point(particular, phase1_nullspace, coordinates)
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
         b_numeric = _to_working_array(HF, problem.b)
         residual = size(A_numeric, 1) == 0 ? zero(HF) : _max_abs(A_numeric * candidate - b_numeric)
-        if !all(isfinite, raw_solution)
+        if !raw_solution_finite
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 candidate,
@@ -736,7 +762,7 @@ function _phase1_hypatia_anchor_once(
             anchor = nothing
             if margin > zero(HF)
                 anchor = _phase1_exact_feasible_point_from_coordinates(
-                    raw_solution[1:(end - 1)],
+                    coordinates,
                     particular,
                     phase1_nullspace,
                     problem,
@@ -771,20 +797,21 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
-        numeric_affine = _numeric_affine_data(problem, HF)
-        anchor = _phase1_exact_feasible_point(
-            candidate,
+        anchor = _phase1_exact_feasible_point_from_coordinates(
+            coordinates,
+            particular,
+            phase1_nullspace,
             problem,
             opt.settings,
-            numeric_affine,
         )
         if anchor === nothing
-            anchor = _phase1_exact_feasible_point_from_coordinates(
-                raw_solution[1:(end - 1)],
-                particular,
-                phase1_nullspace,
+            phase1_nullspace = nothing
+            _gc_checkpoint!(opt, "before phase1 exact recovery")
+            anchor = _phase1_exact_anchor_fallback(
+                candidate,
                 problem,
                 opt.settings,
+                HF,
             )
         end
         attempt = Phase1HypatiaAttempt{HF}(

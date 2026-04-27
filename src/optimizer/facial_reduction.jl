@@ -305,7 +305,7 @@ function _facial_reduction_oracle_attempt(
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         model = _build_facial_reduction_oracle(problem, HF)
-        syssolver, use_dense_model = _hypatia_phase1_syssolver(HF)
+        syssolver, use_dense_model, _ = _hypatia_phase1_syssolver(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
             verbose = false,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
@@ -455,6 +455,49 @@ function _face_reduction_rows(
     return rows, rhs
 end
 
+function _facial_reduction_oracle_round(
+    opt::Optimizer,
+    problem::ProblemData,
+    ::Type{HF},
+) where {HF<:AbstractFloat}
+    oracle_point = _facial_reduction_oracle_attempt(opt, problem, HF)
+    oracle_point === nothing && return nothing
+
+    scalar_slack, block_slack = _facial_reduction_slack(problem, oracle_point)
+    exposure_tolerance = max(
+        _to_working_float(HF, opt.settings.facial_reduction_exposure_tolerance),
+        HF(100) * eps(HF),
+    )
+    exposed_scalars = sort([
+        index for index in problem.positive_scalars if
+        get(scalar_slack, index, zero(HF)) > exposure_tolerance
+    ])
+
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for block_index in eachindex(problem.blocks)
+        directions = _facial_reduction_block_directions(
+            opt,
+            problem,
+            block_index,
+            block_slack[block_index],
+            HF,
+        )
+        isempty(directions) && continue
+        keep_basis = _orthogonal_complement_basis(directions, problem.blocks[block_index].size)
+        if size(keep_basis, 2) == problem.blocks[block_index].size
+            continue
+        end
+        keep_bases[block_index] = keep_basis
+    end
+
+    isempty(exposed_scalars) && isempty(keep_bases) && return nothing
+    _log(
+        opt,
+        "Facial reduction: oracle exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
+    )
+    return exposed_scalars, keep_bases
+end
+
 function _exact_left_inverse(matrix::Matrix{ExactRational})
     gram = transpose(matrix) * matrix
     size(gram, 1) == size(gram, 2) || error("Expected a square Gram matrix.")
@@ -600,35 +643,11 @@ function _apply_facial_reduction(
 
     positive_scalars = [index for index in problem.positive_scalars if !(index in exposed_scalars)]
     objective_extension = zeros(ExactRational, total_dimension - old_dimension)
-    affine = if problem.affine === nothing
-        _solve_affine_system(A, b)
-    else
-        restricted_affine = isempty(face_rows_old) ? problem.affine : _restrict_affine_system(
-            problem.affine,
-            vcat(transpose.(face_rows_old)...),
-            zeros(ExactRational, length(face_rows_old)),
-        )
-        if restricted_affine === nothing
-            nothing
-        else
-            old_particular, old_nullspace = restricted_affine
-            lifted_particular = copy(old_particular)
-            lifted_nullspace = copy(old_nullspace)
-            for block_index in eachindex(problem.blocks)
-                reduced_block = get(block_replacements, block_index, nothing)
-                reduced_block === nothing && continue
-                reduced_particular, reduced_nullspace = _lift_reduced_block_affine(
-                    problem.blocks[block_index],
-                    reduced_block,
-                    keep_bases[block_index],
-                    restricted_affine,
-                )
-                lifted_particular = vcat(lifted_particular, reduced_particular)
-                lifted_nullspace = vcat(lifted_nullspace, reduced_nullspace)
-            end
-            (lifted_particular, lifted_nullspace)
-        end
-    end
+
+    # Recompute the affine representation from the reduced system directly.
+    # Incrementally lifting the old affine basis can drift away from the exact
+    # reduced equations after multiple PSD face reductions on SOS-style models.
+    affine = _solve_affine_system(A, b)
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
     return ProblemData(
@@ -674,8 +693,16 @@ function _facial_reduction_round(
         keep_bases[block_index] = keep_basis
     end
 
-    isempty(keep_bases) && return nothing
-    return Int[], keep_bases
+    isempty(keep_bases) || return Int[], keep_bases
+    _log(
+        opt,
+        "Facial reduction: candidate kernel search found no exact face directions; trying exposing-vector oracle",
+    )
+    return _facial_reduction_oracle_round(
+        opt,
+        problem,
+        _facial_reduction_float_type(opt.settings),
+    )
 end
 
 function _facially_reduce_problem(
@@ -689,7 +716,8 @@ function _facially_reduce_problem(
     reduction === nothing && return problem
     exposed_scalars, keep_bases = reduction
     removed_psd_directions = sum(
-        problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases)
+        (problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases));
+        init = 0,
     )
     reduced_problem = _apply_facial_reduction(problem, exposed_scalars, keep_bases)
     if reduced_problem.affine === nothing

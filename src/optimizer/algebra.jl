@@ -147,6 +147,107 @@ function _rref(aug::Matrix{ExactRational})
     return aug, pivot_columns
 end
 
+function _sparse_augmented_row(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+    row_index::Int,
+    rhs_column::Int,
+)
+    row = Dict{Int,ExactRational}()
+    for column in 1:(rhs_column - 1)
+        value = A[row_index, column]
+        iszero(value) || (row[column] = value)
+    end
+    rhs = b[row_index]
+    iszero(rhs) || (row[rhs_column] = rhs)
+    return row
+end
+
+function _sparse_row_scale!(row::Dict{Int,ExactRational}, scale::ExactRational)
+    for column in collect(keys(row))
+        row[column] /= scale
+    end
+    return row
+end
+
+function _sparse_row_subtract_scaled!(
+    row::Dict{Int,ExactRational},
+    other::Dict{Int,ExactRational},
+    scale::ExactRational,
+)
+    for (column, value) in other
+        updated = get(row, column, zero(ExactRational)) - scale * value
+        if iszero(updated)
+            delete!(row, column)
+        else
+            row[column] = updated
+        end
+    end
+    return row
+end
+
+function _sparse_row_pivot_column(row::Dict{Int,ExactRational}, variable_count::Int)
+    pivot_column = 0
+    for column in keys(row)
+        if column <= variable_count && (pivot_column == 0 || column < pivot_column)
+            pivot_column = column
+        end
+    end
+    return pivot_column
+end
+
+function _solve_affine_system_sparse(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+)
+    variable_count = size(A, 2)
+    rhs_column = variable_count + 1
+    pivot_rows = Dict{Int,Dict{Int,ExactRational}}()
+    pivot_columns = Int[]
+
+    for row_index in axes(A, 1)
+        row = _sparse_augmented_row(A, b, row_index, rhs_column)
+        for pivot_column in pivot_columns
+            factor = get(row, pivot_column, zero(ExactRational))
+            iszero(factor) || _sparse_row_subtract_scaled!(row, pivot_rows[pivot_column], factor)
+        end
+
+        pivot_column = _sparse_row_pivot_column(row, variable_count)
+        if pivot_column == 0
+            iszero(get(row, rhs_column, zero(ExactRational))) || return nothing
+            continue
+        end
+
+        _sparse_row_scale!(row, row[pivot_column])
+        row[pivot_column] = one(ExactRational)
+        for existing_pivot in pivot_columns
+            factor = get(pivot_rows[existing_pivot], pivot_column, zero(ExactRational))
+            iszero(factor) ||
+                _sparse_row_subtract_scaled!(pivot_rows[existing_pivot], row, factor)
+        end
+        pivot_rows[pivot_column] = row
+        push!(pivot_columns, pivot_column)
+        sort!(pivot_columns)
+    end
+
+    particular = zeros(ExactRational, variable_count)
+    for pivot_column in pivot_columns
+        particular[pivot_column] = get(pivot_rows[pivot_column], rhs_column, zero(ExactRational))
+    end
+
+    pivot_set = Set(pivot_columns)
+    free_columns = [column for column in 1:variable_count if !(column in pivot_set)]
+    nullspace = zeros(ExactRational, variable_count, length(free_columns))
+    for (basis_index, free_column) in enumerate(free_columns)
+        nullspace[free_column, basis_index] = 1 // 1
+        for pivot_column in pivot_columns
+            coefficient = get(pivot_rows[pivot_column], free_column, zero(ExactRational))
+            iszero(coefficient) || (nullspace[pivot_column, basis_index] = -coefficient)
+        end
+    end
+    return particular, nullspace
+end
+
 function _solve_affine_system(
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
@@ -157,31 +258,10 @@ function _solve_affine_system(
     if size(A, 1) == 0
         return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
     end
-    checkpoint !== nothing && checkpoint("affine elimination: before augmented matrix")
-    aug = Matrix{ExactRational}(undef, size(A, 1), p + 1)
-    aug[:, 1:p] = A
-    aug[:, p + 1] = b
-    checkpoint !== nothing && checkpoint("affine elimination: after augmented matrix")
-    reduced, pivots = _rref(aug)
-    checkpoint !== nothing && checkpoint("affine elimination: after exact rref")
-    for row in 1:size(reduced, 1)
-        if all(iszero, reduced[row, 1:p]) && !iszero(reduced[row, p + 1])
-            return nothing
-        end
-    end
-    particular = zeros(ExactRational, p)
-    for (row, pivot_col) in enumerate(pivots)
-        particular[pivot_col] = reduced[row, p + 1]
-    end
-    free_columns = setdiff(collect(1:p), pivots)
-    nullspace = zeros(ExactRational, p, length(free_columns))
-    for (basis_index, free_col) in enumerate(free_columns)
-        nullspace[free_col, basis_index] = 1 // 1
-        for (row, pivot_col) in enumerate(pivots)
-            nullspace[pivot_col, basis_index] = -reduced[row, free_col]
-        end
-    end
-    return particular, nullspace
+    checkpoint !== nothing && checkpoint("affine elimination: before exact sparse rref")
+    affine = _solve_affine_system_sparse(A, b)
+    checkpoint !== nothing && checkpoint("affine elimination: after exact sparse rref")
+    return affine
 end
 
 function _restrict_affine_system(

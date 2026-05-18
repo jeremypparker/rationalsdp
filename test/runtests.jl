@@ -189,6 +189,27 @@ include("kse_timeaverage_helpers.jl")
         @test recovered[2] == 0//1
     end
 
+    @testset "Exact sparse affine elimination" begin
+        A = Rational{BigInt}[
+            0//1 0//1 1//1
+            1//1 0//1 1//1
+        ]
+        b = Rational{BigInt}[3//1, 5//1]
+        affine = RationalSDP._solve_affine_system(A, b)
+        @test affine !== nothing
+        particular, nullspace = affine
+        @test A * particular == b
+        @test A * nullspace == zeros(Rational{BigInt}, size(A, 1), size(nullspace, 2))
+        @test size(nullspace, 2) == 1
+
+        inconsistent_A = Rational{BigInt}[
+            1//1 1//1
+            2//1 2//1
+        ]
+        inconsistent_b = Rational{BigInt}[1//1, 3//1]
+        @test RationalSDP._solve_affine_system(inconsistent_A, inconsistent_b) === nothing
+    end
+
     @testset "Facial reduction helper regressions" begin
         directions = [
             Rational{BigInt}[1//1, 0//1],

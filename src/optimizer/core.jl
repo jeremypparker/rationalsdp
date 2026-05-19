@@ -61,6 +61,7 @@ Base.@kwdef mutable struct Settings
     gc_collect_extraction::Bool = false
     gc_collect_full::Bool = true
     gc_log::Bool = false
+    quasiconvex_bisection_iterations::Int = 24
 end
 
 struct BlockStructure
@@ -145,6 +146,15 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     variable_primal::Dict{MOI.VariableIndex,T}
     objective_value::Union{Nothing,T}
     constraint_primal::Dict{Any,Any}
+    quadratic_psd_functions::Dict{
+        MOI.ConstraintIndex{MOI.VectorQuadraticFunction{T},MOI.PositiveSemidefiniteConeTriangle},
+        MOI.VectorQuadraticFunction{T},
+    }
+    quadratic_psd_sets::Dict{
+        MOI.ConstraintIndex{MOI.VectorQuadraticFunction{T},MOI.PositiveSemidefiniteConeTriangle},
+        MOI.PositiveSemidefiniteConeTriangle,
+    }
+    next_quadratic_psd_index::Int
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -161,6 +171,21 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
         Dict{MOI.VariableIndex,T}(),
         nothing,
         Dict{Any,Any}(),
+        Dict{
+            MOI.ConstraintIndex{
+                MOI.VectorQuadraticFunction{T},
+                MOI.PositiveSemidefiniteConeTriangle,
+            },
+            MOI.VectorQuadraticFunction{T},
+        }(),
+        Dict{
+            MOI.ConstraintIndex{
+                MOI.VectorQuadraticFunction{T},
+                MOI.PositiveSemidefiniteConeTriangle,
+            },
+            MOI.PositiveSemidefiniteConeTriangle,
+        }(),
+        1,
     )
 end
 
@@ -604,12 +629,24 @@ end
 
 MOI.supports_incremental_interface(::Optimizer) = true
 MOI.copy_to(dest::Optimizer, src::MOI.ModelLike) = MOIU.default_copy_to(dest, src)
-MOI.is_empty(opt::Optimizer) = MOI.is_empty(opt.storage)
+MOI.is_empty(opt::Optimizer) =
+    MOI.is_empty(opt.storage) && isempty(opt.quadratic_psd_functions)
 
 function MOI.empty!(opt::Optimizer)
     MOI.empty!(opt.storage)
+    empty!(opt.quadratic_psd_functions)
+    empty!(opt.quadratic_psd_sets)
+    opt.next_quadratic_psd_index = 1
     _reset_results!(opt)
     return
+end
+
+function MOI.supports_constraint(
+    ::Optimizer{T},
+    ::Type{MOI.VectorQuadraticFunction{T}},
+    ::Type{MOI.PositiveSemidefiniteConeTriangle},
+) where {T<:Real}
+    return true
 end
 
 MOI.supports_constraint(
@@ -622,12 +659,34 @@ MOI.is_valid(opt::Optimizer, vi::MOI.VariableIndex) = MOI.is_valid(opt.storage, 
 
 function MOI.is_valid(
     opt::Optimizer,
+    ci::MOI.ConstraintIndex{MOI.VectorQuadraticFunction{T},MOI.PositiveSemidefiniteConeTriangle},
+) where {T<:Real}
+    return haskey(opt.quadratic_psd_functions, ci)
+end
+
+function MOI.is_valid(
+    opt::Optimizer,
     ci::MOI.ConstraintIndex{F,S},
 ) where {F,S}
     return MOI.is_valid(opt.storage, ci)
 end
 
 MOI.add_variable(opt::Optimizer) = MOI.add_variable(opt.storage)
+
+function MOI.add_constraint(
+    opt::Optimizer{T},
+    func::MOI.VectorQuadraticFunction{T},
+    set::MOI.PositiveSemidefiniteConeTriangle,
+) where {T<:Real}
+    ci = MOI.ConstraintIndex{
+        MOI.VectorQuadraticFunction{T},
+        MOI.PositiveSemidefiniteConeTriangle,
+    }(opt.next_quadratic_psd_index)
+    opt.next_quadratic_psd_index += 1
+    opt.quadratic_psd_functions[ci] = func
+    opt.quadratic_psd_sets[ci] = set
+    return ci
+end
 
 function MOI.add_constraint(
     opt::Optimizer,
@@ -665,6 +724,9 @@ function MOI.supports(
 ) where {F,S}
     if attr isa MOI.ConstraintPrimal
         return true
+    end
+    if F <: MOI.VectorQuadraticFunction && S <: MOI.PositiveSemidefiniteConeTriangle
+        return false
     end
     return MOI.supports(opt.storage, attr, MOI.ConstraintIndex{F,S})
 end
@@ -763,11 +825,37 @@ end
 MOI.get(opt::Optimizer, attr::MOI.AbstractModelAttribute) = MOI.get(opt.storage, attr)
 
 function MOI.get(
+    opt::Optimizer{T},
+    ::MOI.ListOfConstraintIndices{
+        MOI.VectorQuadraticFunction{T},
+        MOI.PositiveSemidefiniteConeTriangle,
+    },
+) where {T<:Real}
+    return collect(keys(opt.quadratic_psd_functions))
+end
+
+function MOI.get(
     opt::Optimizer,
     attr::MOI.AbstractVariableAttribute,
     vi::MOI.VariableIndex,
 )
     return MOI.get(opt.storage, attr, vi)
+end
+
+function MOI.get(
+    opt::Optimizer,
+    attr::MOI.AbstractConstraintAttribute,
+    ci::MOI.ConstraintIndex{MOI.VectorQuadraticFunction{T},MOI.PositiveSemidefiniteConeTriangle},
+) where {T<:Real}
+    if attr isa MOI.ConstraintPrimal && haskey(opt.constraint_primal, ci)
+        MOI.check_result_index_bounds(opt, attr)
+        return opt.constraint_primal[ci]
+    elseif attr isa MOI.ConstraintFunction
+        return opt.quadratic_psd_functions[ci]
+    elseif attr isa MOI.ConstraintSet
+        return opt.quadratic_psd_sets[ci]
+    end
+    throw(MOI.UnsupportedAttribute(attr))
 end
 
 function MOI.get(

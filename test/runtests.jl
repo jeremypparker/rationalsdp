@@ -749,6 +749,7 @@ include("kse_timeaverage_helpers.jl")
     end
 end
 
+include("quasiconvex_parameter_tests.jl")
 include("sumofsquares_tests.jl")
 
 if "slow" in ARGS

@@ -77,6 +77,13 @@ end
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
+    if _try_quasiconvex_parameter_solve!(opt)
+        opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+        return
+    end
+    if !isempty(opt.quadratic_psd_functions)
+        throw(_unsupported_quadratic_psd_error(opt))
+    end
     _with_working_precision(opt.settings, function (F)
         numeric_settings = _numeric_settings(opt.settings, F)
         _log(opt, "Extracting problem")

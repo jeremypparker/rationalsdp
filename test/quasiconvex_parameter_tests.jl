@@ -21,6 +21,29 @@
           "Solved by quasi-convex parameter search"
 end
 
+@testset "Quasiconvex scalar quadratic equality via JuMP" begin
+    model = rational_model(Rational{BigInt})
+    set_optimizer_attribute(model, "phase1_backend", :native)
+    set_optimizer_attribute(model, "working_float_type", Float64)
+    set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 3)
+
+    @variable(model, 0//1 <= gamma <= 2//1)
+    @variable(model, 0//1 <= x <= 1//1)
+    @constraint(model, gamma * x == 1//1)
+    @objective(model, Min, gamma)
+
+    optimize!(model)
+
+    @test termination_status(model) == MOI.OPTIMAL
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test objective_value(model) == value(gamma)
+    @test 1//1 <= value(gamma) <= 5//4
+    @test 0//1 <= value(x) <= 1//1
+    @test value(gamma) * value(x) == 1//1
+    @test MOI.get(backend(model), MOI.RawStatusString()) ==
+          "Solved by quasi-convex parameter search"
+end
+
 @testset "Unsupported quadratic PSD constraints fail clearly" begin
     model = rational_model(Rational{BigInt})
 

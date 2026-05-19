@@ -94,7 +94,7 @@ function _kse_quadratic_form(basis_left, block, basis_right = basis_left)
     return basis_left' * block * basis_right
 end
 
-function _kse_constrain_zero_polynomial(model, poly)
+function _constrain_zero_polynomial(model, poly)
     coeffs = DynamicPolynomials.coefficients(poly) 
     isempty(coeffs) || @constraint(model, coeffs .== 0)
     return poly
@@ -184,11 +184,11 @@ function _custom_enforce_nonnegativity_from_bases(
         quadratic_s(Q_even, basis_even_no_s, basis_even_s) -
         quadratic_s(Q_odd, basis_odd_no_s, basis_odd_s)
 
-    constrained_without_s = _kse_constrain_zero_polynomial(
+    constrained_without_s = _constrain_zero_polynomial(
         ws.model,
         expression_without_s;
     )
-    constrained_with_s = _kse_constrain_zero_polynomial(
+    constrained_with_s = _constrain_zero_polynomial(
         ws.model,
         expression_with_s;
     )
@@ -280,5 +280,84 @@ function build_explicit_kse_model(k, model; basis_even_no_s_builder = explicit_b
         gauge_coeffs = gauge_coeffs,
         w_basis = w_basis,
         w_coeffs = w_coeffs,
+    )
+end
+
+_lorenz_symmetric_parity(monom, x) = isodd(degree(monom, x[1]) + degree(monom, x[2]))
+
+function _lorenz_symmetric_monomials(x, degree_range, parity::Bool)
+    return [
+        monom for monom in monomials(x, degree_range) if
+        _lorenz_symmetric_parity(monom, x) == parity
+    ]
+end
+
+function _lorenz_symmetric_c_basis(x, dc::Int)
+    monomial_basis = [
+        monom + zero(x[1]) for
+        monom in _lorenz_symmetric_monomials(x, 1:(dc - 1), false)
+    ]
+    special_basis = [
+        x[1]^(dc - 2k) * (x[2]^2 + x[3]^2)^k for
+        k in 0:div(dc, 2)
+    ]
+    return [monomial_basis; special_basis]
+end
+
+function build_lorenz_symmetric_period_model(
+    model;
+    da::Int,
+    db::Int,
+    dc::Int,
+    lower_B,
+    upper_B,
+)
+    @polyvar x[1:3]
+
+    f = [
+        30 * (x[2] - x[1]);
+        84 * x[1] - 75 * x[1] * x[3] - 3 * x[2];
+        75 * x[1] * x[2] - 8 * x[3];
+    ]
+
+    a_basis = _lorenz_symmetric_monomials(x, 1:da, true)
+    be_basis = _lorenz_symmetric_monomials(x, 1:db, false)
+    bo_basis = _lorenz_symmetric_monomials(x, 1:db, true)
+    c_basis = _lorenz_symmetric_c_basis(x, dc)
+
+    function lie_derivative(poly)
+        return dot(f, differentiate(poly, x))
+    end
+
+    Lf_a = lie_derivative.(a_basis)
+    Lf_c = lie_derivative.(c_basis)
+
+    @variable(model, lower_B <= B <= upper_B)
+    @variable(model, Q[1:length(a_basis), 1:length(a_basis)], PSD)
+    @variable(model, Pe[1:length(be_basis), 1:length(be_basis)], PSD)
+    @variable(model, Po[1:length(bo_basis), 1:length(bo_basis)], PSD)
+    @variable(model, v[1:length(c_basis)])
+
+    gram = (Q,a) -> dot(a, Q*a)
+
+    certificate =
+        B * gram(Q, a_basis) - gram(Q, Lf_a) + dot(v, Lf_c) - gram(Pe, be_basis) - gram(Po, bo_basis)
+    _constrain_zero_polynomial(model, certificate)
+    @objective(model, Min, B)
+
+    return (
+        model = model,
+        x = x,
+        f = f,
+        B = B,
+        Q = Q,
+        Pe = Pe,
+        Po = Po,
+        v = v,
+        certificate = certificate,
+        a_basis = a_basis,
+        be_basis = be_basis,
+        bo_basis = bo_basis,
+        c_basis = c_basis,
     )
 end

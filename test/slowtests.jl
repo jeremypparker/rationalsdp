@@ -87,4 +87,24 @@ end
         @test value(instance.B) > 280//100
         @test value(instance.B) < 281//100
     end
+
+    @testset "Lorenz symmetric period bound with quasiconvex B" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        set_optimizer_attribute(model, "phase1_backend", :native)
+        set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 8)
+
+        instance = build_lorenz_symmetric_period_model(model; da = 2, db = 3, dc = 6, lower_B = 700, upper_B=750)
+        optimize!(instance.model)
+
+        @test termination_status(instance.model) == MOI.OPTIMAL
+        @test primal_status(instance.model) == MOI.FEASIBLE_POINT
+        @test MOI.get(backend(instance.model), MOI.RawStatusString()) ==
+              "Solved by quasi-convex parameter search"
+        @test 704//1 <= value(instance.B) <= 705//1
+        @test is_psd_exact(value.(instance.Q))
+        @test is_psd_exact(value.(instance.Pe))
+        @test is_psd_exact(value.(instance.Po))
+        @test all(iszero(value(coeff)) for coeff in coefficients(instance.certificate))
+    end
 end

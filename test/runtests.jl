@@ -1,5 +1,5 @@
 include("testutils.jl")
-include("kse_timeaverage_helpers.jl")
+include("slowtest_helpers.jl")
 
 @testset "RationalSDP JuMP integration" begin
     @testset "Optimizer metadata" begin

@@ -155,6 +155,9 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
         MOI.PositiveSemidefiniteConeTriangle,
     }
     next_quadratic_psd_index::Int
+    scalar_quadratic_functions::Dict{Any,MOI.ScalarQuadraticFunction{T}}
+    scalar_quadratic_sets::Dict{Any,Any}
+    next_scalar_quadratic_index::Int
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -185,6 +188,9 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
             },
             MOI.PositiveSemidefiniteConeTriangle,
         }(),
+        1,
+        Dict{Any,MOI.ScalarQuadraticFunction{T}}(),
+        Dict{Any,Any}(),
         1,
     )
 end
@@ -630,13 +636,18 @@ end
 MOI.supports_incremental_interface(::Optimizer) = true
 MOI.copy_to(dest::Optimizer, src::MOI.ModelLike) = MOIU.default_copy_to(dest, src)
 MOI.is_empty(opt::Optimizer) =
-    MOI.is_empty(opt.storage) && isempty(opt.quadratic_psd_functions)
+    MOI.is_empty(opt.storage) &&
+    isempty(opt.quadratic_psd_functions) &&
+    isempty(opt.scalar_quadratic_functions)
 
 function MOI.empty!(opt::Optimizer)
     MOI.empty!(opt.storage)
     empty!(opt.quadratic_psd_functions)
     empty!(opt.quadratic_psd_sets)
     opt.next_quadratic_psd_index = 1
+    empty!(opt.scalar_quadratic_functions)
+    empty!(opt.scalar_quadratic_sets)
+    opt.next_scalar_quadratic_index = 1
     _reset_results!(opt)
     return
 end
@@ -646,6 +657,14 @@ function MOI.supports_constraint(
     ::Type{MOI.VectorQuadraticFunction{T}},
     ::Type{MOI.PositiveSemidefiniteConeTriangle},
 ) where {T<:Real}
+    return true
+end
+
+function MOI.supports_constraint(
+    ::Optimizer{T},
+    ::Type{MOI.ScalarQuadraticFunction{T}},
+    ::Type{S},
+) where {T<:Real,S<:Union{MOI.EqualTo{T},MOI.GreaterThan{T},MOI.LessThan{T},MOI.Interval{T}}}
     return true
 end
 
@@ -662,6 +681,13 @@ function MOI.is_valid(
     ci::MOI.ConstraintIndex{MOI.VectorQuadraticFunction{T},MOI.PositiveSemidefiniteConeTriangle},
 ) where {T<:Real}
     return haskey(opt.quadratic_psd_functions, ci)
+end
+
+function MOI.is_valid(
+    opt::Optimizer,
+    ci::MOI.ConstraintIndex{MOI.ScalarQuadraticFunction{T},S},
+) where {T<:Real,S}
+    return haskey(opt.scalar_quadratic_functions, ci)
 end
 
 function MOI.is_valid(
@@ -685,6 +711,20 @@ function MOI.add_constraint(
     opt.next_quadratic_psd_index += 1
     opt.quadratic_psd_functions[ci] = func
     opt.quadratic_psd_sets[ci] = set
+    return ci
+end
+
+function MOI.add_constraint(
+    opt::Optimizer{T},
+    func::MOI.ScalarQuadraticFunction{T},
+    set::S,
+) where {T<:Real,S<:Union{MOI.EqualTo{T},MOI.GreaterThan{T},MOI.LessThan{T},MOI.Interval{T}}}
+    ci = MOI.ConstraintIndex{MOI.ScalarQuadraticFunction{T},S}(
+        opt.next_scalar_quadratic_index,
+    )
+    opt.next_scalar_quadratic_index += 1
+    opt.scalar_quadratic_functions[ci] = func
+    opt.scalar_quadratic_sets[ci] = set
     return ci
 end
 
@@ -835,6 +875,16 @@ function MOI.get(
 end
 
 function MOI.get(
+    opt::Optimizer{T},
+    ::MOI.ListOfConstraintIndices{MOI.ScalarQuadraticFunction{T},S},
+) where {T<:Real,S}
+    return MOI.ConstraintIndex{MOI.ScalarQuadraticFunction{T},S}[
+        ci for ci in keys(opt.scalar_quadratic_functions) if
+        ci isa MOI.ConstraintIndex{MOI.ScalarQuadraticFunction{T},S}
+    ]
+end
+
+function MOI.get(
     opt::Optimizer,
     attr::MOI.AbstractVariableAttribute,
     vi::MOI.VariableIndex,
@@ -854,6 +904,22 @@ function MOI.get(
         return opt.quadratic_psd_functions[ci]
     elseif attr isa MOI.ConstraintSet
         return opt.quadratic_psd_sets[ci]
+    end
+    throw(MOI.UnsupportedAttribute(attr))
+end
+
+function MOI.get(
+    opt::Optimizer,
+    attr::MOI.AbstractConstraintAttribute,
+    ci::MOI.ConstraintIndex{MOI.ScalarQuadraticFunction{T},S},
+) where {T<:Real,S}
+    if attr isa MOI.ConstraintPrimal && haskey(opt.constraint_primal, ci)
+        MOI.check_result_index_bounds(opt, attr)
+        return opt.constraint_primal[ci]
+    elseif attr isa MOI.ConstraintFunction
+        return opt.scalar_quadratic_functions[ci]
+    elseif attr isa MOI.ConstraintSet
+        return opt.scalar_quadratic_sets[ci]
     end
     throw(MOI.UnsupportedAttribute(attr))
 end

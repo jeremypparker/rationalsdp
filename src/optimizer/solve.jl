@@ -12,6 +12,23 @@ function _constraint_primal_value(
 end
 
 function _constraint_primal_value(
+    func::MOI.ScalarQuadraticFunction{T},
+    variable_primal::Dict{MOI.VariableIndex,T},
+) where {T}
+    value = func.constant
+    for term in func.affine_terms
+        value += term.coefficient * variable_primal[term.variable]
+    end
+    for term in func.quadratic_terms
+        value +=
+            term.coefficient *
+            variable_primal[term.variable_1] *
+            variable_primal[term.variable_2]
+    end
+    return value
+end
+
+function _constraint_primal_value(
     func::MOI.VectorAffineFunction{T},
     variable_primal::Dict{MOI.VariableIndex,T},
 ) where {T}
@@ -33,6 +50,10 @@ function _populate_constraint_results!(
         (MOI.ScalarAffineFunction{T}, MOI.GreaterThan{T}),
         (MOI.ScalarAffineFunction{T}, MOI.LessThan{T}),
         (MOI.ScalarAffineFunction{T}, MOI.Interval{T}),
+        (MOI.ScalarQuadraticFunction{T}, MOI.EqualTo{T}),
+        (MOI.ScalarQuadraticFunction{T}, MOI.GreaterThan{T}),
+        (MOI.ScalarQuadraticFunction{T}, MOI.LessThan{T}),
+        (MOI.ScalarQuadraticFunction{T}, MOI.Interval{T}),
         (MOI.VariableIndex, MOI.EqualTo{T}),
         (MOI.VariableIndex, MOI.GreaterThan{T}),
         (MOI.VariableIndex, MOI.LessThan{T}),
@@ -81,8 +102,8 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
         return
     end
-    if !isempty(opt.quadratic_psd_functions)
-        throw(_unsupported_quadratic_psd_error(opt))
+    if !isempty(opt.quadratic_psd_functions) || !isempty(opt.scalar_quadratic_functions)
+        throw(_unsupported_quadratic_error(opt))
     end
     _with_working_precision(opt.settings, function (F)
         numeric_settings = _numeric_settings(opt.settings, F)

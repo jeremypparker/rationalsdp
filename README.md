@@ -47,7 +47,6 @@ using JuMP
 using RationalSDP
 
 model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
-set_silent(model)
 
 @variable(model, X[1:2, 1:2], PSD)
 @variable(model, y)
@@ -70,9 +69,7 @@ Use exact integers and rationals in model data. Avoid float literals such as
 
 ## Minimal SumOfSquares Example
 
-`RationalSDP` is not an SOS modelling layer, but it can solve SOS models built
-with `SumOfSquares.jl` when the bridged JuMP/MOI problem uses supported
-constraints.
+`RationalSDP` is compatible with the latest versions of SumOfSquares.jl for SOS optimization.
 
 ```julia
 using JuMP
@@ -81,9 +78,6 @@ using DynamicPolynomials
 using SumOfSquares
 
 model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
-set_silent(model)
-set_optimizer_attribute(model, "phase1_backend", :native)
-set_optimizer_attribute(model, "working_float_type", Float64)
 
 @polyvar z
 @variable(model, t)
@@ -128,9 +122,6 @@ using RationalSDP
 import MathOptInterface as MOI
 
 model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
-set_silent(model)
-set_optimizer_attribute(model, "phase1_backend", :native)
-set_optimizer_attribute(model, "working_float_type", Float64)
 set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 12)
 
 @variable(model, 0//1 <= gamma <= 2//1)
@@ -241,23 +232,6 @@ Important current limitations:
 Use established SDP solvers when you need broad conic coverage, dual
 information, or production robustness.
 
-## Installation
-
-From a local clone:
-
-```julia
-using Pkg
-Pkg.activate(".")
-Pkg.instantiate()
-```
-
-From another environment:
-
-```julia
-using Pkg
-Pkg.develop(path = "/path/to/RationalSDP")
-```
-
 ## Tests
 
 Fast JuMP/SOS regression tests:
@@ -281,16 +255,3 @@ julia --project=. -e "using Pkg; Pkg.test()"
 The test suite includes affine SDP models, exact rational output checks,
 SumOfSquares integration, PSD face-pruning cases, and quasiconvex parameter
 models.
-
-## Benchmarks
-
-```julia
-julia --project=benchmark benchmark/runbenchmarks.jl
-```
-
-Set `RATIONALSDP_BENCH_REPS` to control repetitions.
-
-## License And Maintenance
-
-This repository is currently an experimental solver project. Small failing
-examples and regression tests are the most useful bug reports.

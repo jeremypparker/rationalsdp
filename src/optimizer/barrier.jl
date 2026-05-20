@@ -174,30 +174,6 @@ function _barrier_value_grad_diag(
     return value, grad, diag_hess, caches
 end
 
-function _barrier_hessian_mul!(
-    destination::Vector{F},
-    direction::Vector{F},
-    caches::Vector{PSDBarrierCache{F}},
-    positive_scalars::Vector{Int},
-    x::Vector{F},
-) where {F<:AbstractFloat}
-    fill!(destination, zero(F))
-    for cache in caches
-        block = cache.numeric_block.structure
-        D = _vector_to_matrix(direction, block)
-        M = cache.inverse_matrix * D * cache.inverse_matrix
-        for local_index in eachindex(block.local_positions)
-            i, j = block.local_positions[local_index]
-            global_index = block.global_positions[local_index]
-            destination[global_index] += i == j ? M[i, i] : 2 * M[i, j]
-        end
-    end
-    for index in positive_scalars
-        destination[index] += direction[index] / (x[index]^2)
-    end
-    return destination
-end
-
 function _apply_block_regularized_inverse!(
     destination::AbstractVector{F},
     rhs::AbstractVector{F},
@@ -446,9 +422,4 @@ function _solve_spd_system(matrix::Matrix{F}, rhs::Vector{F}) where {F<:Abstract
     catch
         throw(SPDSystemFactorizationError(size(matrix, 1)))
     end
-end
-
-function _l2_norm(vector::AbstractVector{F}) where {F<:AbstractFloat}
-    isempty(vector) && return zero(F)
-    return sqrt(sum(abs2, vector))
 end

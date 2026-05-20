@@ -498,13 +498,6 @@ function _facial_reduction_oracle_round(
     return exposed_scalars, keep_bases
 end
 
-function _exact_left_inverse(matrix::Matrix{ExactRational})
-    gram = transpose(matrix) * matrix
-    size(gram, 1) == size(gram, 2) || error("Expected a square Gram matrix.")
-    inverse = inv(gram)
-    return inverse * transpose(matrix)
-end
-
 function _face_membership_rows(
     block::BlockStructure,
     keep_basis::Matrix{ExactRational},
@@ -519,36 +512,6 @@ function _face_membership_rows(
         end
     end
     return rows
-end
-
-function _lift_reduced_block_affine(
-    block::BlockStructure,
-    reduced_block::BlockStructure,
-    keep_basis::Matrix{ExactRational},
-    affine::Tuple{Vector{ExactRational},Matrix{ExactRational}},
-)
-    particular, nullspace = affine
-    left_inverse = _exact_left_inverse(keep_basis)
-    reduced_particular_matrix =
-        left_inverse * _vector_to_matrix(particular, block) * transpose(left_inverse)
-    reduced_particular = zeros(ExactRational, length(reduced_block.global_positions))
-    for (local_index, (i, j)) in enumerate(reduced_block.local_positions)
-        reduced_particular[local_index] = reduced_particular_matrix[i, j]
-    end
-
-    reduced_nullspace = zeros(
-        ExactRational,
-        length(reduced_block.global_positions),
-        size(nullspace, 2),
-    )
-    for column in axes(nullspace, 2)
-        reduced_matrix =
-            left_inverse * _vector_to_matrix(view(nullspace, :, column), block) * transpose(left_inverse)
-        for (local_index, (i, j)) in enumerate(reduced_block.local_positions)
-            reduced_nullspace[local_index, column] = reduced_matrix[i, j]
-        end
-    end
-    return reduced_particular, reduced_nullspace
 end
 
 function _apply_facial_reduction(

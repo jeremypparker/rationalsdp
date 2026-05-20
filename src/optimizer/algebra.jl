@@ -566,16 +566,6 @@ function _prune_psd_faces(
     end
 end
 
-function _leading_principal_determinants_positive(matrix::Matrix{ExactRational})
-    n = size(matrix, 1)
-    for k in 1:n
-        if det(matrix[1:k, 1:k]) <= 0
-            return false
-        end
-    end
-    return true
-end
-
 function _positive_semidefinite_exact(matrix::Matrix{ExactRational})
     size(matrix, 1) == size(matrix, 2) || return false
     n = size(matrix, 1)

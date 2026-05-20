@@ -1,300 +1,296 @@
-# RationalSDP
+# RationalSDP.jl
 
-`RationalSDP.jl` is an experimental semidefinite programming solver for JuMP
-models with rational data. Its main goal is not raw speed or broad conic
-coverage; it is to take a rational SDP-like model, solve it with an interior
-point method, and return an exactly affine-feasible rational primal solution.
+`RationalSDP.jl` is an experimental semidefinite-programming optimizer for
+JuMP/MOI models with exact rational data. It solves SDP-like problems
+numerically, then returns an exactly affine-feasible rational primal point.
+
+The package is aimed at proof-oriented workflows.
 
 ## Status
 
-This project has absolutely been vibe-coded.
+This is research software. It is not a mature general-purpose SDP solver.
 
-That is meant literally: most of the implementation was built interactively with
-AI assistance rather than through a long, traditional solver-development cycle.
-So this is not a battle-hardened industrial optimizer, and you should treat it
-as experimental.
+The current implementation is primal-only, has a focused conic surface, and is
+optimized for exact rational primal recovery. It is useful for small and
+medium-sized SDP/SOS certificate searches, including some quasiconvex
+one-parameter problems that are solved by fixed-parameter feasibility searches.
 
-That said, it has also been developed in a test-driven way. New features and bug
-fixes have generally come with JuMP-based regression tests, and the current test
-suite covers:
+## Supported Model Features
 
-- PSD-only and mixed PSD/scalar models
-- scalar equalities, inequalities, and interval constraints
-- exact rational output with multiple rational output types
-- SOS-style examples built directly with `DynamicPolynomials`
-- Lyapunov-style SOS models, including cases that need PSD face pruning
-- larger mixed-cone examples and benchmark-sized regression cases
+RationalSDP currently supports:
 
-So the right mental model is: experimental, candidly AI-built, but not random.
-
-## What It Does
-
-`RationalSDP` currently supports:
-
-- PSD matrix variables in `MOI.PositiveSemidefiniteConeTriangle`
-- unconstrained scalar variables alongside PSD blocks
-- scalar `==`, `>=`, `<=`, and interval constraints
+- JuMP/MOI incremental models
+- rational scalar variables
+- PSD matrix variables
+- affine scalar constraints: `==`, `>=`, `<=`, and intervals
+- affine PSD constraints
 - linear objectives
-- exact rational primal recovery at the end of the solve
-- user-selectable output types such as `Rational{BigInt}` and `Rational{Int}`
-- user-selectable internal working float types, with `Double64` as the default
-- a Hypatia-backed centered Phase I solve on the cleaned extracted conic problem
-- solver settings exposed through JuMP / MOI optimizer attributes
-- threaded PSD barrier assembly for larger blocks
+- exact rational primal values via `value`
+- exact rational objective values via `objective_value`
+- `Rational{BigInt}` and other rational output types
+- selectable numerical working types: `Float64`, `Double64`, `BigFloat`, etc.
+- Hypatia-backed or native Phase I feasibility search
+- exact affine elimination before the barrier solve
+- PSD face pruning for some forced-boundary cases
+- optional facial-reduction passes
+- threaded PSD barrier assembly
+- SumOfSquares.jl models that bridge to supported JuMP/MOI constraints
+- one-parameter quasiconvex models where the objective parameter appears
+  bilinearly in supported quadratic constraints
 
-The solver is a two-stage primal interior-point method:
+The package does not return dual solutions or rigorous dual certificates.
 
-1. Phase I, by default, solves a centered conic feasibility model with Hypatia
-   to get a numerically central interior candidate.
-2. Phase II follows the barrier path to improve the objective.
-3. The final point is projected back to an exact rational primal solution.
+## Minimal JuMP Example
 
-## Current Limitations
+```julia
+using JuMP
+using RationalSDP
 
-This is the important section to read before you depend on it.
+model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
+set_silent(model)
 
-- It is a primal-only solver, not a primal-dual IPM.
-- It does not currently return dual certificates or dual variable values.
-- It is aimed at problems that admit a strictly feasible interior point.
-- It has some PSD face pruning, but not full general facial reduction.
-- It is focused on rational affine data and exact primal recovery, not on being
-  a broad high-performance conic solver.
+@variable(model, X[1:2, 1:2], PSD)
+@variable(model, y)
 
-If you want a mature production SDP solver with stronger robustness, better dual
-information, and wider problem coverage, you should still look at established
-solver stacks.
+@constraint(model, X[1, 1] == 1//1)
+@constraint(model, X[2, 2] == 1//1)
+@constraint(model, X[1, 2] == y)
+@constraint(model, y >= 1//2)
+@objective(model, Min, y)
+
+optimize!(model)
+
+termination_status(model)
+value(y)      # exact Rational{BigInt}
+value.(X)     # exact rational matrix
+```
+
+Use exact integers and rationals in model data. Avoid float literals such as
+`0.1` when you intend a proof-oriented exact model.
+
+## Minimal SumOfSquares Example
+
+`RationalSDP` is not an SOS modelling layer, but it can solve SOS models built
+with `SumOfSquares.jl` when the bridged JuMP/MOI problem uses supported
+constraints.
+
+```julia
+using JuMP
+using RationalSDP
+using DynamicPolynomials
+using SumOfSquares
+
+model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
+set_silent(model)
+set_optimizer_attribute(model, "phase1_backend", :native)
+set_optimizer_attribute(model, "working_float_type", Float64)
+
+@polyvar z
+@variable(model, t)
+
+poly = z^4 - z^2 + t
+@constraint(model, poly >= 0, SumOfSquares.SOSCone())
+@objective(model, Min, t)
+
+optimize!(model)
+
+termination_status(model)
+value(t)      # close to 1//4, returned as an exact rational
+```
+
+For larger SOS models, expect performance and robustness to depend strongly on
+the Gram basis and on whether the feasible set lies on a PSD face.
+
+## Quasiconvex One-Parameter Problems
+
+RationalSDP has a special path for models that are not affine SDPs because the
+objective parameter multiplies other variables, but become ordinary SDP
+feasibility problems once that parameter is fixed.
+
+The supported pattern is:
+
+- minimize a single scalar objective variable
+- give that objective variable finite lower and upper bounds
+- every quadratic term in every quadratic constraint must contain that objective
+  variable
+- for fixed parameter values, the model must reduce to a supported SDP
+
+Supported quadratic constraints include:
+
+- scalar quadratic constraints such as `gamma * x == 1`
+- vector quadratic PSD constraints such as `Symmetric([gamma * x 1; 1 x]) in PSDCone()`
+
+Example:
+
+```julia
+using JuMP
+using RationalSDP
+import MathOptInterface as MOI
+
+model = GenericModel{Rational{BigInt}}(Optimizer{Rational{BigInt}})
+set_silent(model)
+set_optimizer_attribute(model, "phase1_backend", :native)
+set_optimizer_attribute(model, "working_float_type", Float64)
+set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 12)
+
+@variable(model, 0//1 <= gamma <= 2//1)
+@variable(model, 0//1 <= x <= 1//1)
+
+@constraint(model, gamma * x == 1//1)
+@objective(model, Min, gamma)
+
+optimize!(model)
+
+value(gamma)
+MOI.get(backend(model), MOI.RawStatusString())
+```
+
+The solver currently uses a bounded parameter search. It assumes the feasible
+set is monotone in the objective parameter; it does not prove monotonicity from
+the model.
+
+General quadratic SDP constraints are not supported.
+
+## Solver Settings
+
+All fields of `RationalSDP.Settings` are exposed as JuMP optimizer attributes:
+
+```julia
+set_optimizer_attribute(model, "verbose", true)
+set_optimizer_attribute(model, "working_float_type", BigFloat)
+set_optimizer_attribute(model, "working_precision", 512)
+set_optimizer_attribute(model, "phase1_backend", :hypatia)
+set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 24)
+```
+
+The full set of optimizer attributes is:
+
+- `verbose`
+- `verbose_newton`
+- `live_progress`
+- `inner_log_frequency`
+- `max_iterations`
+- `phase1_outer_iterations`
+- `phase2_outer_iterations`
+- `working_float_type`
+- `working_precision`
+- `phase1_backend`
+- `phase1_hypatia_float_type`
+- `phase1_hypatia_syssolver`
+- `phase1_hypatia_iter_limit`
+- `phase1_hypatia_margin_upper`
+- `phase1_hypatia_min_margin_upper`
+- `phase1_hypatia_margin_shrink`
+- `phase1_hypatia_objective_bias`
+- `facial_reduction`
+- `facial_reduction_max_rounds`
+- `facial_reduction_float_type`
+- `facial_reduction_exposure_tolerance`
+- `facial_reduction_rank_tolerance`
+- `facial_reduction_irrational_behavior`
+- `feasibility_tolerance`
+- `optimality_gap_tolerance`
+- `gradient_tolerance`
+- `line_search_shrink`
+- `armijo_fraction`
+- `min_step`
+- `initial_scale`
+- `initial_penalty`
+- `penalty_growth`
+- `path_parameter_growth`
+- `phase1_center_weight`
+- `boundary_fraction`
+- `rational_tolerance`
+- `exact_refinement_bisections`
+- `threaded`
+- `threading_min_block_size`
+- `iterative_linear_solver`
+- `iterative_solver_min_dimension`
+- `gc_collect_extraction`
+- `gc_collect_full`
+- `gc_log`
+- `quasiconvex_bisection_iterations`
+
+The default working type is `Double64`. `Float64` is faster but less robust;
+`BigFloat` is slower but can help on ill-conditioned models.
+
+## Exactness Model
+
+RationalSDP expects rational model data. The numerical solve is used to locate a
+good point, but the returned primal solution is rational and is checked against
+the exact affine system.
+
+This does not mean every returned certificate is automatically a complete proof.
+For proof use, you should still independently check the final rational matrices,
+polynomial identities, and PSD conditions relevant to your argument.
+
+## Limitations
+
+Important current limitations:
+
+- primal solutions only
+- no dual variables
+- no dual infeasibility or proof certificates
+- no full general conic support
+- no general nonconvex quadratic support
+- quasiconvex support is restricted to one bounded objective parameter
+- exact recovery can fail on badly conditioned or nearly infeasible problems
+- facial reduction is partial
+- large SOS models can be slow
+
+Use established SDP solvers when you need broad conic coverage, dual
+information, or production robustness.
 
 ## Installation
 
-From a local clone of this repository:
+From a local clone:
 
 ```julia
-julia --project=. -e "using Pkg; Pkg.instantiate()"
+using Pkg
+Pkg.activate(".")
+Pkg.instantiate()
 ```
 
-If you want to use the package from another Julia environment after cloning:
+From another environment:
 
 ```julia
 using Pkg
 Pkg.develop(path = "/path/to/RationalSDP")
 ```
 
-## Quick Start
+## Tests
+
+Fast JuMP/SOS regression tests:
 
 ```julia
-using JuMP
-using RationalSDP
-
-model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
-set_optimizer_attribute(model, "verbose", true)
-
-@variable(model, X[1:2, 1:2], PSD)
-@variable(model, y)
-@constraint(model, X[1, 1] == 2//1)
-@constraint(model, X[2, 2] == 2//1)
-@constraint(model, X[1, 2] - y == 0//1)
-@constraint(model, y >= 1//2)
-@objective(model, Min, y)
-
-optimize!(model)
-
-println(value.(X))
-println(value(y))
-println(termination_status(model))
-println(primal_status(model))
-println(dual_status(model))
+julia --project=test test/runfasttests.jl
 ```
 
-On success, `value.(...)` returns exact rational values of the model's numeric
-type. When Phase II optimization is used, the solver now performs an exact
-rational refinement from the strictly interior anchor before returning the final
-point, which makes near-boundary optima more robust than a single final
-rationalization pass.
-
-## Exact Input Data
-
-For proof-oriented workflows, write model data using exact integers and
-rationals such as `2` and `1//10`, not `2.0` or `0.1`.
-
-The optimizer itself is now intentionally rational-typed. In other words, use
-constructors like `RationalSDP.Optimizer{Rational{BigInt}}`, not
-`RationalSDP.Optimizer{Float64}`.
-
-If a floating-point or irrational coefficient reaches `RationalSDP`, the solver
-now throws an error instead of silently rationalizing it. That is deliberate:
-silently turning approximate data into exact rationals can hide bugs in
-computer-assisted proofs.
-
-One JuMP caveat is worth knowing: if you build a
-`GenericModel{Rational{BigInt}}`, JuMP may convert a float literal like `0.1`
-into an exact binary rational before the solver sees it. At that point the
-solver cannot distinguish it from an explicitly supplied rational with the same
-value. So if exactness matters, the safe rule is still simple: avoid float
-literals entirely and write exact rationals yourself.
-
-## Configuring The Solver
-
-All fields of `RationalSDP.Settings` are exposed as optimizer attributes, so the
-preferred JuMP style is:
+Slow regression tests:
 
 ```julia
-model = GenericModel{Rational{BigInt}}(RationalSDP.Optimizer{Rational{BigInt}})
-set_optimizer_attribute(model, "verbose", true)
-set_optimizer_attribute(model, "phase1_outer_iterations", 100)
-set_optimizer_attribute(model, "working_float_type", RationalSDP.Double64)
-set_optimizer_attribute(model, "threaded", true)
+julia --project=test test/runslowtests.jl
 ```
 
-You can also query them back:
-
-```julia
-get_optimizer_attribute(model, "phase1_outer_iterations")
-```
-
-Some particularly useful settings are:
-
-- `verbose`: print the phase logs
-- `verbose_newton`: also print inner Newton progress
-- `phase1_backend`: choose `:hypatia` or `:native` for the Phase I feasibility search
-- `phase1_hypatia_float_type`: floating-point type used by the Hypatia Phase I backend, defaulting to `working_float_type`; set it explicitly or use `"auto"`
-- `phase1_hypatia_iter_limit`: iteration cap for the Hypatia Phase I backend
-- `phase1_hypatia_margin_upper`: largest centered-margin cap Hypatia Phase I is allowed to use
-- `phase1_hypatia_min_margin_upper`: smallest centered-margin cap Hypatia Phase I tries before relaxing
-- `phase1_hypatia_margin_shrink`: geometric factor used when relaxing the Hypatia Phase I margin cap
-- `phase1_hypatia_objective_bias`: tiny objective tie-break used inside Hypatia Phase I when the model has a nonzero objective
-- `phase1_outer_iterations`: maximum number of outer Phase I penalty updates
-- `phase2_outer_iterations`: maximum number of outer Phase II barrier updates
-- `working_float_type`: internal floating-point type used during the numerical solve
-- `working_precision`: `BigFloat` precision, used only when `working_float_type == BigFloat`
-- `rational_tolerance`: tolerance used during exact rational recovery
-- `exact_refinement_bisections`: dyadic refinement budget for exact rational Phase II improvement
-- `threaded`: enable threaded PSD barrier assembly
-- `threading_min_block_size`: block-size threshold before threading is used
-
-By default, the numerical solve uses `Double64` from `DoubleFloats`, which is a
-reasonable middle ground between `Float64` and `BigFloat`. Performance depends
-on the problem and on the linear algebra path taken by the chosen type, so it
-is worth benchmarking `Float64`, `Double64`, and `BigFloat` on your own models.
-If you want a different internal type, for example:
-
-```julia
-set_optimizer_attribute(model, "working_float_type", Float64)
-set_optimizer_attribute(model, "working_float_type", BigFloat)
-```
-
-By default, Phase I uses Hypatia with the same floating-point type as
-`working_float_type`. On optimization problems, it now tries a small
-centered-margin cap first and only relaxes that cap if exact recovery fails,
-which gives the native Phase II solver a much better interior anchor on harder
-SOS-style models. If you want to force the old in-package Phase I instead:
-
-```julia
-set_optimizer_attribute(model, "phase1_backend", :native)
-```
-
-## Logging
-
-With `verbose = true`, the solver prints:
-
-- a short solve summary
-- a live Phase I log
-- a live Phase II table, with one row printed after each outer iteration
-- a final completion line with solve time and exact objective
-
-When `phase1_backend == :hypatia`, the Phase I output comes from Hypatia's own
-iteration log plus a short RationalSDP summary line with the centered margin
-and affine residual. When `phase1_backend == :native`, RationalSDP prints its
-own Phase I table.
-
-Use `set_silent(model)` to suppress solver output through JuMP.
-
-## Output Types
-
-`Rational{BigInt}` is the safest output type and the default recommendation.
-It can represent the recovered exact solution without overflow.
-
-Smaller types such as `Rational{Int}` also work, but only when the exact
-recovered numerators and denominators fit in the chosen integer type.
-
-## Sum-Of-Squares / Polynomial Models
-
-The package is not a dedicated SOS layer, but it does work well with JuMP plus
-`DynamicPolynomials` if you build the Gram-matrix constraints yourself.
-
-The test suite includes:
-
-- direct SOS lower-bound examples
-- Lyapunov-style SOS feasibility examples
-- Lorenz-style polynomial bounds
-
-One practical caveat: if your SOS lift introduces obviously redundant Gram
-directions, the feasible set may lie on a face of the PSD cone. The solver has
-some automatic pruning for forced nullspace directions, but not full general
-facial reduction.
-
-## Testing
-
-For normal development, use the stable test environment instead of `Pkg.test`.
-That avoids the temporary test environment setup and keeps precompiled caches
-warm between runs.
-
-Run the fast test suite with:
-
-```julia
-julia test/runfasttests.jl
-```
-
-Run the full package test harness with:
+Package test entry point:
 
 ```julia
 julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
-The direct test scripts are JuMP-level integration tests, not just unit tests
-for internal helpers, so they are a decent indicator that the public workflow
-still works.
-
-There is also a separate slow-only regression script for heavier cases such as
-the degree-6 Lorenz SOS bound:
-
-```julia
-julia test/runslowtests.jl
-```
+The test suite includes affine SDP models, exact rational output checks,
+SumOfSquares integration, PSD face-pruning cases, and quasiconvex parameter
+models.
 
 ## Benchmarks
 
-Run the benchmark script with:
-
 ```julia
-julia benchmark/runbenchmarks.jl
+julia --project=benchmark benchmark/runbenchmarks.jl
 ```
 
-Set `RATIONALSDP_BENCH_REPS` to control the number of timed repetitions.
+Set `RATIONALSDP_BENCH_REPS` to control repetitions.
 
-The benchmark suite includes:
+## License And Maintenance
 
-- a box-constrained LP-style model
-- a larger mixed PSD/scalar model
-- a small SOS quartic model
-- a quartic Lorenz-style polynomial SDP relaxation
-
-## When This Solver Is A Good Fit
-
-`RationalSDP` is a good fit when:
-
-- you care about exact rational primal output
-- your model is naturally written in JuMP / MOI
-- your problem is SDP-flavored but still within the current scope
-- you are comfortable using an experimental solver with a growing test suite
-
-It is probably not the right fit when:
-
-- you need dual solutions or certificates
-- you need the broadest possible conic support
-- you need industrial-scale robustness more than exact rational recovery
-
-## License / Maintenance
-
-This repository is currently best viewed as an experimental research / hobby
-solver project. Contributions, bug reports, and new regression tests are very
-welcome, especially for small failing examples.
+This repository is currently an experimental solver project. Small failing
+examples and regression tests are the most useful bug reports.

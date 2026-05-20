@@ -210,6 +210,30 @@ include("slowtest_helpers.jl")
         @test RationalSDP._solve_affine_system(inconsistent_A, inconsistent_b) === nothing
     end
 
+    @testset "Phase II nullspace ignores unused affine directions" begin
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[MOI.VariableIndex(i) for i in 1:4],
+            RationalSDP.BlockStructure[],
+            [1],
+            Rational{BigInt}[0//1, 1//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 1//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 4),
+            Rational{BigInt}[],
+            (
+                zeros(Rational{BigInt}, 4),
+                Matrix{Rational{BigInt}}(I, 4, 4),
+            ),
+        )
+
+        phase2_nullspace = RationalSDP._phase2_nullspace(problem)
+
+        @test RationalSDP._phase2_relevant_positions(problem) == [1, 2]
+        @test size(phase2_nullspace) == (4, 2)
+        @test phase2_nullspace[1:2, :] == Matrix{Rational{BigInt}}(I, 2, 2)
+        @test all(iszero, phase2_nullspace[3:4, :])
+    end
+
     @testset "Facial reduction helper regressions" begin
         directions = [
             Rational{BigInt}[1//1, 0//1],

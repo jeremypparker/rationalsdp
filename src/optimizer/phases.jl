@@ -564,11 +564,11 @@ function _phase2_hypatia_candidate(
 ) where {F<:AbstractFloat}
     return _with_float_precision(F, opt.settings.working_precision, function (::Type{F})
         model = _build_hypatia_phase2_model(problem, phase2_nullspace, F)
-        syssolver, use_dense_model = _hypatia_phase1_syssolver(F)
+        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, F)
         solver = Hypatia.Solvers.Solver{F}(
             verbose = !opt.silent && opt.settings.verbose,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
-            preprocess = true,
+            preprocess = preprocess,
             reduce = true,
             syssolver = syssolver,
             use_dense_model = use_dense_model,
@@ -1118,14 +1118,30 @@ function _phase2_exact_solution(
             barrier_parameter = one(F),
         )
     particular, nullspace = problem.affine
-    numeric_affine = _numeric_affine_data(problem, F)
+    phase2_nullspace = _phase2_nullspace(problem)
+    if size(phase2_nullspace, 2) == 0
+        if size(nullspace, 2) > 0
+            _log(opt, "Phase II skipped: no objective/barrier-visible affine directions")
+        end
+        return (
+            x_exact = anchor,
+            x_numeric = _to_working_array(F, anchor),
+            barrier_parameter = one(F),
+        )
+    elseif size(phase2_nullspace, 2) < size(nullspace, 2)
+        _log(
+            opt,
+            "Phase II: reduced affine directions from $(size(nullspace, 2)) to $(size(phase2_nullspace, 2))",
+        )
+    end
+    numeric_affine = _numeric_affine_data(anchor, phase2_nullspace, F)
 
     numeric_settings = _numeric_settings(opt.settings, F)
     numeric_blocks = _numeric_blocks(problem.blocks)
     x0 = _to_working_array(F, anchor)
     N_big = _numeric_nullspace!(numeric_affine)
     c_big = _to_working_array(F, problem.objective_vector_min)
-    z = zeros(F, size(nullspace, 2))
+    z = zeros(F, size(phase2_nullspace, 2))
     if initial_point !== nothing && !isempty(z)
         z .= transpose(N_big) * (initial_point - x0)
     end
@@ -1201,8 +1217,8 @@ function _phase2_exact_solution(
             anchor,
             problem,
             opt.settings,
-            particular,
-            nullspace,
+            anchor,
+            phase2_nullspace,
             numeric_affine,
         ),
         x_numeric = x_numeric,

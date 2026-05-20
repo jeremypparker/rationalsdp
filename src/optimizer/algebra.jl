@@ -300,21 +300,11 @@ function _phase1_active_positions(problem::ProblemData)
     return unique(sort(positions))
 end
 
-function _compute_phase1_nullspace(
-    blocks::Vector{BlockStructure},
-    positive_scalars::Vector{Int},
-    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+function _independent_nullspace_columns(
+    nullspace::Matrix{ExactRational},
+    active_positions::Vector{Int},
 )
-    affine === nothing && return nothing
-    _, nullspace = affine
     size(nullspace, 2) == 0 && return nullspace
-
-    active_positions = Int[]
-    append!(active_positions, positive_scalars)
-    for block in blocks
-        append!(active_positions, block.global_positions)
-    end
-    active_positions = unique(sort(active_positions))
     isempty(active_positions) && return zeros(ExactRational, size(nullspace, 1), 0)
 
     reduced = nullspace[active_positions, :]
@@ -332,6 +322,23 @@ function _compute_phase1_nullspace(
     return nullspace[:, pivots]
 end
 
+function _compute_phase1_nullspace(
+    blocks::Vector{BlockStructure},
+    positive_scalars::Vector{Int},
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+)
+    affine === nothing && return nothing
+    _, nullspace = affine
+
+    active_positions = Int[]
+    append!(active_positions, positive_scalars)
+    for block in blocks
+        append!(active_positions, block.global_positions)
+    end
+    active_positions = unique(sort(active_positions))
+    return _independent_nullspace_columns(nullspace, active_positions)
+end
+
 function _phase1_nullspace(problem::ProblemData)
     problem.affine === nothing && error("Phase I nullspace requested without affine data.")
     if problem.phase1_nullspace === nothing
@@ -342,6 +349,20 @@ function _phase1_nullspace(problem::ProblemData)
         )
     end
     return problem.phase1_nullspace
+end
+
+function _phase2_relevant_positions(problem::ProblemData)
+    positions = _phase1_active_positions(problem)
+    for index in eachindex(problem.objective_vector_min)
+        iszero(problem.objective_vector_min[index]) || push!(positions, index)
+    end
+    return unique(sort(positions))
+end
+
+function _phase2_nullspace(problem::ProblemData)
+    problem.affine === nothing && error("Phase II nullspace requested without affine data.")
+    _, nullspace = problem.affine
+    return _independent_nullspace_columns(nullspace, _phase2_relevant_positions(problem))
 end
 
 function ProblemData(

@@ -7,6 +7,7 @@
 
 struct QuasiconvexParameterData{T<:Real}
     parameter::MOI.VariableIndex
+    sense::MOI.OptimizationSense
     lower::T
     upper::T
     quadratic_psd_constraints::Vector{
@@ -41,7 +42,8 @@ struct QuasiconvexProblemTemplate
 end
 
 function _objective_parameter(storage, ::Type{T}) where {T<:Real}
-    MOI.get(storage, MOI.ObjectiveSense()) == MOI.MIN_SENSE || return nothing
+    sense = MOI.get(storage, MOI.ObjectiveSense())
+    sense == MOI.MIN_SENSE || sense == MOI.MAX_SENSE || return nothing
     objective_type = MOI.get(storage, MOI.ObjectiveFunctionType())
     if objective_type == MOI.VariableIndex
         return MOI.get(storage, MOI.ObjectiveFunction{MOI.VariableIndex}())
@@ -141,6 +143,7 @@ function _detect_quasiconvex_parameter(opt::Optimizer{T}) where {T<:Real}
 
     return QuasiconvexParameterData{T}(
         parameter,
+        MOI.get(storage, MOI.ObjectiveSense()),
         lower,
         upper,
         quadratic_psd_constraints,
@@ -835,44 +838,69 @@ function _quasiconvex_feasible_point(
     return anchor
 end
 
+function _set_quasiconvex_endpoint_infeasible!(opt::Optimizer, endpoint_name::String)
+    opt.termination_status = MOI.INFEASIBLE
+    opt.primal_status = MOI.NO_SOLUTION
+    opt.dual_status = MOI.NO_SOLUTION
+    opt.raw_status = "Quasi-convex parameter $(endpoint_name) bound is infeasible"
+    return true
+end
+
+function _quasiconvex_parameter_search!(
+    opt::Optimizer{T},
+    data::QuasiconvexParameterData{T},
+    template::QuasiconvexProblemTemplate,
+) where {T<:Real}
+    feasible_side_is_upper = data.sense == MOI.MIN_SENSE
+    best_endpoint = feasible_side_is_upper ? data.lower : data.upper
+    fallback_endpoint = feasible_side_is_upper ? data.upper : data.lower
+    fallback_name = feasible_side_is_upper ? "upper" : "lower"
+
+    best_feasible, best_problem, best_point =
+        _fixed_parameter_feasible(opt, template, best_endpoint)
+    if best_feasible
+        _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_endpoint)
+        return true
+    end
+
+    fallback_feasible, fallback_problem, fallback_point =
+        _fixed_parameter_feasible(opt, template, fallback_endpoint)
+    fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
+
+    lower = data.lower
+    upper = data.upper
+    best_value = fallback_endpoint
+    best_problem = fallback_problem
+    best_point = fallback_point
+
+    for _ in 1:opt.settings.quasiconvex_bisection_iterations
+        midpoint = (lower + upper) / 2
+        feasible, problem, point = _fixed_parameter_feasible(opt, template, midpoint)
+        if feasible
+            best_value = midpoint
+            best_problem = problem
+            best_point = point
+            if feasible_side_is_upper
+                upper = midpoint
+            else
+                lower = midpoint
+            end
+        elseif feasible_side_is_upper
+            lower = midpoint
+        else
+            upper = midpoint
+        end
+    end
+
+    _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_value)
+    return true
+end
+
 function _try_quasiconvex_parameter_solve!(opt::Optimizer{T}) where {T<:Real}
     data = _detect_quasiconvex_parameter(opt)
     data === nothing && return false
     template = _fixed_parameter_template(opt, data)
-
-    lower = data.lower
-    upper = data.upper
-    lower_feasible, lower_child, lower_map = _fixed_parameter_feasible(opt, template, lower)
-    if lower_feasible
-        _populate_from_quasiconvex_child!(opt, data, lower_child, lower_map, lower)
-        return true
-    end
-
-    upper_feasible, upper_child, upper_map = _fixed_parameter_feasible(opt, template, upper)
-    if !upper_feasible
-        opt.termination_status = MOI.INFEASIBLE
-        opt.primal_status = MOI.NO_SOLUTION
-        opt.dual_status = MOI.NO_SOLUTION
-        opt.raw_status = "Quasi-convex parameter upper bound is infeasible"
-        return true
-    end
-
-    best_child = upper_child
-    best_map = upper_map
-    for _ in 1:opt.settings.quasiconvex_bisection_iterations
-        midpoint = (lower + upper) / 2
-        feasible, child, variable_map = _fixed_parameter_feasible(opt, template, midpoint)
-        if feasible
-            upper = midpoint
-            best_child = child
-            best_map = variable_map
-        else
-            lower = midpoint
-        end
-    end
-
-    _populate_from_quasiconvex_child!(opt, data, best_child, best_map, upper)
-    return true
+    return _quasiconvex_parameter_search!(opt, data, template)
 end
 
 function _unsupported_quadratic_message()

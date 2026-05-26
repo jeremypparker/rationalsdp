@@ -155,11 +155,17 @@ function _fixed_parameter_feasible(
     opt::Optimizer{T},
     template::QuasiconvexProblemTemplate,
     fixed_value::T,
+    facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {T<:Real}
     problem = _instantiate_fixed_parameter_problem(opt, template, fixed_value)
     return _with_working_precision(opt.settings, function (F)
-        x_exact = _quasiconvex_feasible_point(opt, problem, F)
-        return x_exact !== nothing, problem, x_exact
+        result = _quasiconvex_feasible_point(opt, problem, F; facial_reduction)
+        return (
+            result.anchor !== nothing,
+            problem,
+            result.anchor,
+            result.facial_reduction_rounds > 0,
+        )
     end)
 end
 
@@ -807,11 +813,13 @@ function _quasiconvex_feasible_point(
     opt::Optimizer,
     problem::ProblemData,
     ::Type{F},
+    ;
+    facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {F<:AbstractFloat}
-    problem.affine === nothing && return nothing
+    problem.affine === nothing && return (anchor = nothing, facial_reduction_rounds = 0)
     particular, nullspace = problem.affine
     barrier_dim = _barrier_dimension(problem)
-    barrier_dim == 0 && return particular
+    barrier_dim == 0 && return (anchor = particular, facial_reduction_rounds = 0)
 
     phase1_result = _phase1_anchor_attempt(opt, problem, F)
     anchor = phase1_result.anchor
@@ -819,7 +827,7 @@ function _quasiconvex_feasible_point(
 
     facial_reduction_round = 0
     while anchor === nothing &&
-          opt.settings.facial_reduction &&
+          facial_reduction &&
           phase1_candidate !== nothing &&
           facial_reduction_round < opt.settings.facial_reduction_max_rounds
         reduced_problem = _facially_reduce_problem(opt, problem, phase1_candidate, F)
@@ -835,7 +843,7 @@ function _quasiconvex_feasible_point(
         phase1_candidate = phase1_result.phase1_candidate
     end
 
-    return anchor
+    return (anchor = anchor, facial_reduction_rounds = facial_reduction_round)
 end
 
 function _set_quasiconvex_endpoint_infeasible!(opt::Optimizer, endpoint_name::String)
@@ -855,17 +863,45 @@ function _quasiconvex_parameter_search!(
     best_endpoint = feasible_side_is_upper ? data.lower : data.upper
     fallback_endpoint = feasible_side_is_upper ? data.upper : data.lower
     fallback_name = feasible_side_is_upper ? "upper" : "lower"
+    facial_reduction = opt.settings.facial_reduction
 
-    best_feasible, best_problem, best_point =
-        _fixed_parameter_feasible(opt, template, best_endpoint)
-    if best_feasible
-        _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_endpoint)
-        return true
+    if opt.settings.quasiconvex_skip_facial_reduction_after_clean_endpoint &&
+       opt.settings.facial_reduction
+        fallback_feasible, fallback_problem, fallback_point, fallback_used_reduction =
+            _fixed_parameter_feasible(opt, template, fallback_endpoint, true)
+        fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
+        facial_reduction = fallback_used_reduction
+        if !facial_reduction
+            _log(
+                opt,
+                "quasi-convex endpoint solved without facial reduction; skipping facial reduction for remaining parameter probes",
+            )
+        end
+
+        best_feasible, best_endpoint_problem, best_endpoint_point, _ =
+            _fixed_parameter_feasible(opt, template, best_endpoint, facial_reduction)
+        if best_feasible
+            _populate_from_quasiconvex_child!(
+                opt,
+                data,
+                best_endpoint_problem,
+                best_endpoint_point,
+                best_endpoint,
+            )
+            return true
+        end
+    else
+        best_feasible, best_problem, best_point, _ =
+            _fixed_parameter_feasible(opt, template, best_endpoint, facial_reduction)
+        if best_feasible
+            _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_endpoint)
+            return true
+        end
+
+        fallback_feasible, fallback_problem, fallback_point, _ =
+            _fixed_parameter_feasible(opt, template, fallback_endpoint, facial_reduction)
+        fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
     end
-
-    fallback_feasible, fallback_problem, fallback_point =
-        _fixed_parameter_feasible(opt, template, fallback_endpoint)
-    fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
 
     lower = data.lower
     upper = data.upper
@@ -875,7 +911,8 @@ function _quasiconvex_parameter_search!(
 
     for _ in 1:opt.settings.quasiconvex_bisection_iterations
         midpoint = (lower + upper) / 2
-        feasible, problem, point = _fixed_parameter_feasible(opt, template, midpoint)
+        feasible, problem, point, _ =
+            _fixed_parameter_feasible(opt, template, midpoint, facial_reduction)
         if feasible
             best_value = midpoint
             best_problem = problem

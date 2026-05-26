@@ -504,6 +504,71 @@ function _append_zero_equalities(
     return A_augmented, b_augmented
 end
 
+function _early_prune_psd_coordinate_faces(
+    blocks::Vector{BlockStructure},
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+)
+    known_zero = Set{Int}()
+    removed_directions = [Set{Int}() for _ in blocks]
+
+    changed = true
+    while changed
+        changed = false
+
+        for row in axes(A, 1)
+            iszero(b[row]) || continue
+            survivor = 0
+            survivor_count = 0
+            for column in axes(A, 2)
+                iszero(A[row, column]) && continue
+                column in known_zero && continue
+                survivor = column
+                survivor_count += 1
+                survivor_count > 1 && break
+            end
+            if survivor_count == 1 && !(survivor in known_zero)
+                push!(known_zero, survivor)
+                changed = true
+            end
+        end
+
+        for (block_index, block) in enumerate(blocks)
+            removed = removed_directions[block_index]
+            for local_direction in 1:block.size
+                local_direction in removed && continue
+                block.diagonal_positions[local_direction] in known_zero || continue
+                push!(removed, local_direction)
+                changed = true
+                for index in _block_direction_entry_indices(block, local_direction)
+                    if !(index in known_zero)
+                        push!(known_zero, index)
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+
+    isempty(known_zero) && return blocks, A, b, 0
+
+    new_blocks = BlockStructure[]
+    pruned_directions = 0
+    for (block_index, block) in enumerate(blocks)
+        remove_directions = sort(collect(removed_directions[block_index]))
+        if isempty(remove_directions)
+            push!(new_blocks, block)
+        else
+            pruned_directions += length(remove_directions)
+            keep_directions = setdiff(collect(1:block.size), remove_directions)
+            isempty(keep_directions) || push!(new_blocks, _restrict_block(block, keep_directions))
+        end
+    end
+
+    A, b = _append_zero_equalities(A, b, collect(known_zero))
+    return new_blocks, A, b, pruned_directions
+end
+
 function _prune_positive_scalar_faces(
     positive_scalars::Vector{Int},
     affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},

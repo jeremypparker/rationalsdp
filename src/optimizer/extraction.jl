@@ -365,6 +365,8 @@ function _extract_problem(opt::Optimizer{T}) where {T}
             psd_constraint_blocks,
         )
     _gc_checkpoint!(opt, "after system assembly")
+    blocks, A, b, early_pruned_directions = _early_prune_psd_coordinate_faces(blocks, A, b)
+    early_pruned_directions == 0 || _gc_checkpoint!(opt, "after coordinate PSD face reduction")
     slack_count = length(positive_scalars)
     c_raw = vcat(c_original_raw, zeros(ExactRational, psd_auxiliary_count + slack_count))
     c_min = vcat(c_original_min, zeros(ExactRational, psd_auxiliary_count + slack_count))
@@ -373,6 +375,7 @@ function _extract_problem(opt::Optimizer{T}) where {T}
     positive_scalars, pruned_scalar_faces = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, pruned_directions = _prune_psd_faces(blocks, A, b, affine)
     _gc_checkpoint!(opt, "after cone pruning")
+    pruned_directions += early_pruned_directions
     if pruned_scalar_faces > 0 || pruned_directions > 0
         _log(
             opt,

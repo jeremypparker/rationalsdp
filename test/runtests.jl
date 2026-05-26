@@ -210,6 +210,254 @@ include("slowtest_helpers.jl")
         @test RationalSDP._solve_affine_system(inconsistent_A, inconsistent_b) === nothing
     end
 
+    @testset "Early coordinate PSD face reduction" begin
+        BR = Rational{BigInt}
+
+        triangle_index(i, j) = i >= j ? div(i * (i - 1), 2) + j : div(j * (j - 1), 2) + i
+
+        function direct_psd_blocks_optimizer(dims::Vector{Int})
+            opt = RationalSDP.Optimizer{BR}(verbose = false)
+            block_variables = Vector{MOI.VariableIndex}[]
+            for dim in dims
+                variables = [MOI.add_variable(opt) for _ in 1:div(dim * (dim + 1), 2)]
+                MOI.add_constraint(
+                    opt,
+                    MOI.VectorOfVariables(variables),
+                    MOI.PositiveSemidefiniteConeTriangle(dim),
+                )
+                push!(block_variables, variables)
+            end
+            MOI.set(opt, MOI.ObjectiveSense(), MOI.FEASIBILITY_SENSE)
+            return opt, block_variables
+        end
+
+        function direct_psd_optimizer(dim::Int)
+            opt, block_variables = direct_psd_blocks_optimizer([dim])
+            variables = only(block_variables)
+            return opt, variables
+        end
+
+        function add_zero_variable_equality!(opt, variable)
+            MOI.add_constraint(opt, variable, MOI.EqualTo{BR}(zero(BR)))
+            return
+        end
+
+        function add_affine_equality!(opt, pairs, rhs)
+            terms = MOI.ScalarAffineTerm{BR}[
+                MOI.ScalarAffineTerm{BR}(coefficient, variable) for
+                (coefficient, variable) in pairs
+            ]
+            MOI.add_constraint(
+                opt,
+                MOI.ScalarAffineFunction{BR}(terms, zero(BR)),
+                MOI.EqualTo{BR}(rhs),
+            )
+            return
+        end
+
+        function has_coordinate_zero_row(A, b, index)
+            for row in axes(A, 1)
+                iszero(b[row]) || continue
+                A[row, index] == one(BR) || continue
+                if all(column -> column == index || iszero(A[row, column]), axes(A, 2))
+                    return true
+                end
+            end
+            return false
+        end
+
+        function fixed_zero(problem, index)
+            problem.affine === nothing && return false
+            particular, nullspace = problem.affine
+            return RationalSDP._variable_fixed_zero(particular, nullspace, index)
+        end
+
+        @testset "affine coordinate-zero closure cascades" begin
+            A = BR[
+                1//1 0//1 0//1
+                1//1 2//1 0//1
+                0//1 1//1 -3//1
+            ]
+            b = zeros(BR, 3)
+
+            blocks, A_reduced, b_reduced, pruned =
+                RationalSDP._early_prune_psd_coordinate_faces(RationalSDP.BlockStructure[], A, b)
+
+            @test isempty(blocks)
+            @test pruned == 0
+            @test all(index -> has_coordinate_zero_row(A_reduced, b_reduced, index), 1:3)
+        end
+
+        @testset "two-survivor zero row is not inferred" begin
+            A = BR[1//1 1//1]
+            b = BR[0//1]
+
+            blocks, A_reduced, b_reduced, pruned =
+                RationalSDP._early_prune_psd_coordinate_faces(RationalSDP.BlockStructure[], A, b)
+
+            @test isempty(blocks)
+            @test pruned == 0
+            @test A_reduced == A
+            @test b_reduced == b
+        end
+
+        @testset "helper restricts blocks before affine solve" begin
+            block = RationalSDP.BlockStructure(
+                3,
+                Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+                collect(1:6),
+                RationalSDP._triangle_positions(3),
+                [1, 3, 6],
+            )
+            A = zeros(BR, 1, 6)
+            A[1, 3] = one(BR)
+            b = BR[zero(BR)]
+
+            blocks, A_reduced, b_reduced, pruned =
+                RationalSDP._early_prune_psd_coordinate_faces([block], A, b)
+
+            @test pruned == 1
+            @test length(blocks) == 1
+            @test blocks[1].size == 2
+            @test blocks[1].global_positions == [1, 4, 6]
+            @test all(index -> has_coordinate_zero_row(A_reduced, b_reduced, index), [2, 3, 5])
+        end
+
+        @testset "PSD row-column zeros trigger diagonal cascade" begin
+            block = RationalSDP.BlockStructure(
+                3,
+                Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+                collect(1:6),
+                RationalSDP._triangle_positions(3),
+                [1, 3, 6],
+            )
+            A = zeros(BR, 2, 6)
+            A[1, 1] = one(BR)
+            A[2, 2] = one(BR)
+            A[2, 3] = 2 // 1
+            b = zeros(BR, 2)
+
+            blocks, A_reduced, b_reduced, pruned =
+                RationalSDP._early_prune_psd_coordinate_faces([block], A, b)
+
+            @test pruned == 2
+            @test length(blocks) == 1
+            @test blocks[1].size == 1
+            @test blocks[1].global_positions == [6]
+            @test all(index -> has_coordinate_zero_row(A_reduced, b_reduced, index), 1:5)
+        end
+
+        @testset "singleton diagonal removes its PSD row and column" begin
+            opt, variables = direct_psd_optimizer(3)
+            add_zero_variable_equality!(opt, variables[triangle_index(2, 2)])
+
+            problem = RationalSDP._extract_problem(opt)
+
+            @test length(problem.blocks) == 1
+            @test problem.blocks[1].size == 2
+            @test problem.blocks[1].global_positions == [1, 4, 6]
+            @test all(index -> fixed_zero(problem, index), [2, 3, 5])
+            @test all(index -> has_coordinate_zero_row(problem.A, problem.b, index), [2, 3, 5])
+        end
+
+        @testset "two singleton diagonals reduce a larger PSD block" begin
+            opt, variables = direct_psd_optimizer(4)
+            add_zero_variable_equality!(opt, variables[triangle_index(2, 2)])
+            add_zero_variable_equality!(opt, variables[triangle_index(4, 4)])
+
+            problem = RationalSDP._extract_problem(opt)
+
+            @test length(problem.blocks) == 1
+            @test problem.blocks[1].size == 2
+            @test problem.blocks[1].global_positions == [1, 4, 6]
+            @test all(index -> fixed_zero(problem, index), [2, 3, 5, 7, 8, 9, 10])
+            particular, nullspace = problem.affine
+            @test problem.A * particular == problem.b
+            @test problem.A * nullspace ==
+                  zeros(BR, size(problem.A, 1), size(nullspace, 2))
+        end
+
+        @testset "multi-block coordinate cascade regression" begin
+            opt, block_variables = direct_psd_blocks_optimizer([4, 4])
+            p = block_variables[1]
+            q = block_variables[2]
+
+            add_zero_variable_equality!(opt, p[triangle_index(1, 1)])
+            add_affine_equality!(
+                opt,
+                [(one(BR), p[triangle_index(2, 1)]), (2 // 1, p[triangle_index(2, 2)])],
+                zero(BR),
+            )
+            add_affine_equality!(
+                opt,
+                [(one(BR), p[triangle_index(3, 2)]), (-3 // 1, p[triangle_index(3, 3)])],
+                zero(BR),
+            )
+
+            add_zero_variable_equality!(opt, q[triangle_index(4, 4)])
+            add_affine_equality!(
+                opt,
+                [(one(BR), q[triangle_index(4, 3)]), (-3 // 1, q[triangle_index(3, 3)])],
+                zero(BR),
+            )
+            add_affine_equality!(
+                opt,
+                [(one(BR), q[triangle_index(3, 2)]), (2 // 1, q[triangle_index(2, 2)])],
+                zero(BR),
+            )
+
+            problem = RationalSDP._extract_problem(opt)
+
+            @test [block.size for block in problem.blocks] == [1, 1]
+            @test problem.blocks[1].global_positions == [triangle_index(4, 4)]
+            @test problem.blocks[2].global_positions == [length(p) + triangle_index(1, 1)]
+            @test all(index -> fixed_zero(problem, index), setdiff(1:20, [10, 11]))
+            particular, nullspace = problem.affine
+            @test problem.A * particular == problem.b
+            @test problem.A * nullspace ==
+                  zeros(BR, size(problem.A, 1), size(nullspace, 2))
+        end
+
+        @testset "non-singleton diagonal equality is left alone" begin
+            opt, variables = direct_psd_optimizer(3)
+            y = MOI.add_variable(opt)
+            add_affine_equality!(
+                opt,
+                [
+                    (one(BR), variables[triangle_index(1, 1)]),
+                    (one(BR), y),
+                ],
+                zero(BR),
+            )
+
+            problem = RationalSDP._extract_problem(opt)
+
+            @test length(problem.blocks) == 1
+            @test problem.blocks[1].size == 3
+            @test !fixed_zero(problem, triangle_index(1, 1))
+        end
+
+        @testset "singleton high-degree Gram coefficient removes a PSD direction" begin
+            opt, q = direct_psd_optimizer(3)
+            add_affine_equality!(opt, [(one(BR), q[1])], one(BR))
+            add_affine_equality!(opt, [(2 * one(BR), q[2])], zero(BR))
+            add_affine_equality!(opt, [(one(BR), q[3]), (2 * one(BR), q[4])], one(BR))
+            add_affine_equality!(opt, [(2 * one(BR), q[5])], zero(BR))
+            add_affine_equality!(opt, [(one(BR), q[6])], zero(BR))
+
+            problem = RationalSDP._extract_problem(opt)
+
+            @test length(problem.blocks) == 1
+            @test problem.blocks[1].size == 2
+            @test problem.blocks[1].global_positions == [1, 2, 3]
+            @test all(index -> fixed_zero(problem, index), [4, 5, 6])
+            particular, nullspace = problem.affine
+            @test problem.A * particular == problem.b
+            @test problem.A * nullspace ==
+                  zeros(BR, size(problem.A, 1), size(nullspace, 2))
+        end
+    end
+
     @testset "Phase II nullspace ignores unused affine directions" begin
         problem = RationalSDP.ProblemData(
             MOI.VariableIndex[MOI.VariableIndex(i) for i in 1:4],

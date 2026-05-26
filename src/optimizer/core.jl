@@ -62,6 +62,7 @@ Base.@kwdef mutable struct Settings
     gc_collect_full::Bool = true
     gc_log::Bool = false
     quasiconvex_bisection_iterations::Int = 24
+    quasiconvex_skip_facial_reduction_after_clean_endpoint::Bool = true
 end
 
 struct BlockStructure

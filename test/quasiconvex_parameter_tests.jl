@@ -3,6 +3,10 @@
     set_optimizer_attribute(model, "phase1_backend", :native)
     set_optimizer_attribute(model, "working_float_type", Float64)
     set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 3)
+    @test get_optimizer_attribute(
+        model,
+        "quasiconvex_skip_facial_reduction_after_clean_endpoint",
+    )
 
     @variable(model, 0//1 <= gamma <= 2//1)
     @variable(model, 0//1 <= x <= 1//1)
@@ -92,6 +96,15 @@ end
     set_optimizer_attribute(model, "phase1_backend", :native)
     set_optimizer_attribute(model, "working_float_type", Float64)
     set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 4)
+    set_optimizer_attribute(
+        model,
+        "quasiconvex_skip_facial_reduction_after_clean_endpoint",
+        false,
+    )
+    @test !get_optimizer_attribute(
+        model,
+        "quasiconvex_skip_facial_reduction_after_clean_endpoint",
+    )
 
     @variable(model, 0//1 <= gamma <= 2//1)
     @variable(model, x)

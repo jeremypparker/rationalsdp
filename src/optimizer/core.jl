@@ -233,6 +233,64 @@ end
 
 # Logging
 
+struct _HypatiaCenteringWarningFilter <: Logging.AbstractLogger
+    logger::Logging.AbstractLogger
+end
+
+function _is_hypatia_centering_warning(level, message, _module)
+    return level == Logging.Warn &&
+           startswith(string(_module), "Hypatia") &&
+           occursin("cannot step in centering direction", string(message))
+end
+
+Logging.min_enabled_level(logger::_HypatiaCenteringWarningFilter) =
+    Logging.min_enabled_level(logger.logger)
+
+Logging.shouldlog(
+    logger::_HypatiaCenteringWarningFilter,
+    level,
+    _module,
+    group,
+    id,
+) = Logging.shouldlog(logger.logger, level, _module, group, id)
+
+Logging.catch_exceptions(logger::_HypatiaCenteringWarningFilter) =
+    Logging.catch_exceptions(logger.logger)
+
+function Logging.handle_message(
+    logger::_HypatiaCenteringWarningFilter,
+    level,
+    message,
+    _module,
+    group,
+    id,
+    file,
+    line;
+    kwargs...,
+)
+    if _is_hypatia_centering_warning(level, message, _module)
+        return
+    end
+    return Logging.handle_message(
+        logger.logger,
+        level,
+        message,
+        _module,
+        group,
+        id,
+        file,
+        line;
+        kwargs...,
+    )
+end
+
+function _with_filtered_hypatia_logger(f::Function)
+    logger = _HypatiaCenteringWarningFilter(Logging.current_logger())
+    return Logging.with_logger(logger) do
+        f()
+    end
+end
+
 function _format_metric(x)
     value = try
         Float64(x)

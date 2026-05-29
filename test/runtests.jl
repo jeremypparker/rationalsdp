@@ -135,6 +135,48 @@ include("slowtest_helpers.jl")
         @test isempty(RationalSDP._phase1_hypatia_tolerance_kwargs(settings, Float64))
     end
 
+    @testset "Hypatia centering warning filter" begin
+        output = IOBuffer()
+        Logging.with_logger(Logging.ConsoleLogger(output, Logging.Warn)) do
+            RationalSDP._with_filtered_hypatia_logger() do
+                Logging.handle_message(
+                    Logging.current_logger(),
+                    Logging.Warn,
+                    "cannot step in centering direction",
+                    RationalSDP.Hypatia.Solvers,
+                    :test,
+                    :hypatia_centering_warning,
+                    "combined.jl",
+                    111,
+                )
+                Logging.handle_message(
+                    Logging.current_logger(),
+                    Logging.Warn,
+                    "different Hypatia warning",
+                    RationalSDP.Hypatia.Solvers,
+                    :test,
+                    :hypatia_other_warning,
+                    "combined.jl",
+                    112,
+                )
+                Logging.handle_message(
+                    Logging.current_logger(),
+                    Logging.Warn,
+                    "cannot step in centering direction",
+                    RationalSDP,
+                    :test,
+                    :rationalsdp_same_text_warning,
+                    "core.jl",
+                    1,
+                )
+            end
+        end
+        text = String(take!(output))
+        @test length(collect(eachmatch(r"cannot step in centering direction", text))) == 1
+        @test occursin("different Hypatia warning", text)
+        @test occursin("RationalSDP", text)
+    end
+
     @testset "Reject approximate model coefficients" begin
         @test_throws ArgumentError RationalSDP.Optimizer{Float64}()
         @test_throws ArgumentError RationalSDP._exact_rational(0.1)

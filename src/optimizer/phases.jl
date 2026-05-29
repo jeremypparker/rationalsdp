@@ -869,8 +869,10 @@ function _phase1_hypatia_anchor_once(
             use_dense_model = use_dense_model,
         )
         start_time = time_ns()
-        Hypatia.Solvers.load(solver, model)
-        Hypatia.Solvers.solve(solver)
+        _with_filtered_hypatia_logger() do
+            Hypatia.Solvers.load(solver, model)
+            Hypatia.Solvers.solve(solver)
+        end
 
         status = Hypatia.Solvers.get_status(solver)
         iterations = Hypatia.Solvers.get_num_iters(solver)

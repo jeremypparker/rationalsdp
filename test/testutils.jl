@@ -4,6 +4,7 @@ using DynamicPolynomials
 using RationalSDP
 using LinearAlgebra
 using SumOfSquares
+using Logging
 import MathOptInterface as MOI
 
 function rational_model(::Type{T}) where {T<:Real}

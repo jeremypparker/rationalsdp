@@ -2,6 +2,7 @@ module RationalSDP
 
 using DoubleFloats: Double64
 import Hypatia
+import Logging
 using LinearAlgebra
 using Printf
 using SparseArrays

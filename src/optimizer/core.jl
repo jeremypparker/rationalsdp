@@ -28,6 +28,16 @@ Base.@kwdef mutable struct Settings
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
     phase1_hypatia_margin_shrink::BigFloat = big"0.1"
     phase1_hypatia_objective_bias::BigFloat = big"1e-12"
+    phase1_hypatia_tol_rel_opt::BigFloat = big"-1"
+    phase1_hypatia_tol_abs_opt::BigFloat = big"-1"
+    phase1_hypatia_tol_feas::BigFloat = big"-1"
+    phase1_hypatia_default_tol_power::BigFloat = big"-1"
+    phase1_hypatia_default_tol_relax::BigFloat = big"-1"
+    phase1_hypatia_tol_slow::BigFloat = big"-1"
+    phase1_candidate_diagnostics::Bool = false
+    phase1_stop_after_candidate_diagnostics::Bool = false
+    phase1_exact_recovery_diagnostics::Bool = false
+    phase1_exact_recovery_pivot_log_frequency::Int = 10
     working_float_type::DataType = Double64
     facial_reduction::Bool = true
     facial_reduction_max_rounds::Int = 8
@@ -49,6 +59,7 @@ Base.@kwdef mutable struct Settings
     boundary_fraction::BigFloat = big"0.99"
     working_precision::Int = 448
     rational_tolerance::BigFloat = big"1e-40"
+    recovery_tolerance_shrink::BigFloat = big"0.1"
     exact_refinement_bisections::Int = 48
     verbose::Bool = true
     verbose_newton::Bool = false
@@ -232,6 +243,21 @@ function _format_metric(x)
         return @sprintf("%.3e", value)
     end
     return string(x)
+end
+
+function _format_exact_rational_compact(value::ExactRational; max_chars::Int = 96)
+    text = string(value)
+    ncodeunits(text) <= max_chars && return text
+    return first(text, max_chars) * "..."
+end
+
+function _bigint_bits(value::BigInt)
+    iszero(value) && return 0
+    return ndigits(abs(value); base = 2)
+end
+
+function _format_exact_rational_size(value::ExactRational)
+    return "num_bits=$(_bigint_bits(numerator(value))), den_bits=$(_bigint_bits(denominator(value)))"
 end
 
 function _log(opt::Optimizer, message::AbstractString)

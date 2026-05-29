@@ -17,8 +17,18 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
         set_optimizer_attribute(model, "phase1_hypatia_margin_shrink", "0.2")
         set_optimizer_attribute(model, "phase1_hypatia_objective_bias", "1e-12")
+        set_optimizer_attribute(model, "phase1_hypatia_tol_rel_opt", "1e-8")
+        set_optimizer_attribute(model, "phase1_hypatia_tol_abs_opt", "1e-9")
+        set_optimizer_attribute(model, "phase1_hypatia_tol_feas", "1e-10")
+        set_optimizer_attribute(model, "phase1_hypatia_default_tol_power", "0.75")
+        set_optimizer_attribute(model, "phase1_hypatia_default_tol_relax", "0.9")
+        set_optimizer_attribute(model, "phase1_hypatia_tol_slow", "1e-3")
+        set_optimizer_attribute(model, "phase1_candidate_diagnostics", true)
+        set_optimizer_attribute(model, "phase1_exact_recovery_diagnostics", true)
+        set_optimizer_attribute(model, "phase1_exact_recovery_pivot_log_frequency", 4)
         set_optimizer_attribute(model, "verbose", false)
         set_optimizer_attribute(model, "rational_tolerance", "1e-30")
+        set_optimizer_attribute(model, "recovery_tolerance_shrink", "0.01")
         set_optimizer_attribute(model, "working_float_type", "BigFloat")
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "phase1_backend") == :native
@@ -28,8 +38,18 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_shrink") == big"0.2"
         @test get_optimizer_attribute(model, "phase1_hypatia_objective_bias") == big"1e-12"
+        @test get_optimizer_attribute(model, "phase1_hypatia_tol_rel_opt") == big"1e-8"
+        @test get_optimizer_attribute(model, "phase1_hypatia_tol_abs_opt") == big"1e-9"
+        @test get_optimizer_attribute(model, "phase1_hypatia_tol_feas") == big"1e-10"
+        @test get_optimizer_attribute(model, "phase1_hypatia_default_tol_power") == big"0.75"
+        @test get_optimizer_attribute(model, "phase1_hypatia_default_tol_relax") == big"0.9"
+        @test get_optimizer_attribute(model, "phase1_hypatia_tol_slow") == big"1e-3"
+        @test get_optimizer_attribute(model, "phase1_candidate_diagnostics")
+        @test get_optimizer_attribute(model, "phase1_exact_recovery_diagnostics")
+        @test get_optimizer_attribute(model, "phase1_exact_recovery_pivot_log_frequency") == 4
         @test get_optimizer_attribute(model, "verbose") == false
         @test get_optimizer_attribute(model, "rational_tolerance") == big"1e-30"
+        @test get_optimizer_attribute(model, "recovery_tolerance_shrink") == big"0.01"
         @test get_optimizer_attribute(model, "working_float_type") == BigFloat
     end
 
@@ -87,6 +107,32 @@ include("slowtest_helpers.jl")
             settings,
             RationalSDP.Double64,
         )
+
+        settings = RationalSDP.Settings(
+            phase1_hypatia_tol_rel_opt = big"1e-8",
+            phase1_hypatia_tol_abs_opt = big"1e-9",
+            phase1_hypatia_tol_feas = big"1e-10",
+            phase1_hypatia_default_tol_power = big"0.75",
+            phase1_hypatia_default_tol_relax = big"0.9",
+            phase1_hypatia_tol_slow = big"1e-3",
+        )
+        tolerance_kwargs = RationalSDP._phase1_hypatia_tolerance_kwargs(settings, Float64)
+        @test (:tol_rel_opt => 1.0e-8) in tolerance_kwargs
+        @test (:tol_abs_opt => 1.0e-9) in tolerance_kwargs
+        @test (:tol_feas => 1.0e-10) in tolerance_kwargs
+        @test (:default_tol_power => 0.75) in tolerance_kwargs
+        @test (:default_tol_relax => 0.9) in tolerance_kwargs
+        @test (:tol_slow => 1.0e-3) in tolerance_kwargs
+        solver = RationalSDP.Hypatia.Solvers.Solver{Float64}(
+            ;
+            verbose = false,
+            iter_limit = 1,
+            tolerance_kwargs...,
+        )
+        @test solver isa RationalSDP.Hypatia.Solvers.Solver{Float64}
+
+        settings = RationalSDP.Settings(phase1_hypatia_tol_slow = big"-1")
+        @test isempty(RationalSDP._phase1_hypatia_tolerance_kwargs(settings, Float64))
     end
 
     @testset "Reject approximate model coefficients" begin
@@ -170,6 +216,7 @@ include("slowtest_helpers.jl")
         candidate = Float64[0.5, 0.0]
 
         direct = RationalSDP._phase1_exact_feasible_point_from_coordinates(
+            RationalSDP.Optimizer{Rational{BigInt}}(verbose = false),
             coordinates,
             phase1_particular,
             reshape(phase1_nullspace, :, 1),
@@ -179,6 +226,7 @@ include("slowtest_helpers.jl")
         @test direct === nothing
 
         recovered = RationalSDP._phase1_exact_anchor_fallback(
+            RationalSDP.Optimizer{Rational{BigInt}}(verbose = false),
             candidate,
             problem,
             settings,
@@ -208,6 +256,27 @@ include("slowtest_helpers.jl")
         ]
         inconsistent_b = Rational{BigInt}[1//1, 3//1]
         @test RationalSDP._solve_affine_system(inconsistent_A, inconsistent_b) === nothing
+    end
+
+    @testset "Exact recovery tolerance controls" begin
+        settings = RationalSDP.Settings(
+            rational_tolerance = big"1e-12",
+            recovery_tolerance_shrink = big"0.01",
+        )
+        tolerances = RationalSDP._recovery_tolerances(settings, Float64)
+        @test isapprox(tolerances[1], 1.0e-6)
+        @test isapprox(tolerances[2], 1.0e-8)
+        @test isapprox(tolerances[end], 1.0e-12)
+        @test_throws ErrorException RationalSDP._recovery_tolerances(
+            RationalSDP.Settings(recovery_tolerance_shrink = big"1.0"),
+            Float64,
+        )
+    end
+
+    @testset "Exact positive-definite checks reject bad diagonals" begin
+        @test RationalSDP._positive_definite_exact(Rational{BigInt}[2//1 1//1; 1//1 2//1])
+        @test !RationalSDP._positive_definite_exact(Rational{BigInt}[0//1 0//1; 0//1 1//1])
+        @test !RationalSDP._positive_definite_exact(Rational{BigInt}[1//1 2//1; 2//1 1//1])
     end
 
     @testset "Early coordinate PSD face reduction" begin
@@ -497,6 +566,163 @@ include("slowtest_helpers.jl")
             direction in independent
         )
 
+        D = Float64[
+            1.0 0.0
+            -1.0 1.0
+            0.0 -1.0
+        ]
+
+        function triangle_entries(matrix::AbstractMatrix)
+            return Rational{BigInt}[
+                matrix[i, j] for (i, j) in RationalSDP._triangle_positions(size(matrix, 1))
+            ]
+        end
+
+        function legacy_exposing_column_directions(
+            opt::RationalSDP.Optimizer,
+            problem::RationalSDP.ProblemData,
+            block_index::Int,
+            block_matrix::Matrix{F},
+            ::Type{F},
+        ) where {F<:AbstractFloat}
+            block = problem.blocks[block_index]
+            symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
+            eigenvalues = eigvals(symmetric_matrix)
+            isempty(eigenvalues) && return Vector{RationalSDP.ExactRational}[]
+            exposure_tolerance = max(
+                RationalSDP._to_working_float(
+                    F,
+                    opt.settings.facial_reduction_exposure_tolerance,
+                ),
+                F(100) * eps(F),
+            )
+            maximum(eigenvalues) <= exposure_tolerance &&
+                return Vector{RationalSDP.ExactRational}[]
+            singular_values = svdvals(Matrix(symmetric_matrix))
+            rank_tolerance = max(
+                RationalSDP._to_working_float(
+                    F,
+                    opt.settings.facial_reduction_rank_tolerance,
+                ),
+                F(100) * eps(F),
+            )
+            numeric_rank = count(value -> value > rank_tolerance, singular_values)
+            numeric_rank == 0 && return Vector{RationalSDP.ExactRational}[]
+
+            qr_factor = qr(Matrix(symmetric_matrix), ColumnNorm())
+            candidate_columns = unique(qr_factor.p[1:numeric_rank])
+            exact_directions = Vector{Vector{RationalSDP.ExactRational}}()
+            for column_index in candidate_columns
+                direction = RationalSDP._exact_face_direction(
+                    problem,
+                    block,
+                    collect(view(block_matrix, :, column_index)),
+                    opt.settings,
+                    F,
+                )
+                direction === nothing && continue
+                push!(exact_directions, direction)
+            end
+            return RationalSDP._linearly_independent_directions(exact_directions)
+        end
+
+        block3 = RationalSDP.BlockStructure(
+            3,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+            collect(1:6),
+            RationalSDP._triangle_positions(3),
+            [1, 3, 6],
+        )
+        rank_one_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block3],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0//1,
+            zeros(Rational{BigInt}, 6),
+            zeros(Rational{BigInt}, 0, 6),
+            Rational{BigInt}[],
+            (
+                triangle_entries(fill(1//1, 3, 3)),
+                zeros(Rational{BigInt}, 6, 0),
+            ),
+        )
+        M = Float64[
+            sqrt(2.0) 0.2 * pi
+            0.2 * pi sqrt(3.0)
+        ]
+        exposing_slack = D * M * transpose(D)
+        pivot_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_irrational_behavior = :warn,
+            rational_tolerance = big"1e-12",
+            recovery_tolerance_shrink = big"0.01",
+        )
+        legacy_directions = legacy_exposing_column_directions(
+            pivot_opt,
+            rank_one_problem,
+            1,
+            exposing_slack,
+            Float64,
+        )
+        @test isempty(legacy_directions)
+
+        exposing_directions = RationalSDP._facial_reduction_block_directions(
+            pivot_opt,
+            rank_one_problem,
+            1,
+            exposing_slack,
+            Float64,
+        )
+        @test length(exposing_directions) == 2
+        @test all(direction -> sum(direction) == 0//1, exposing_directions)
+        @test length(RationalSDP._linearly_independent_directions(exposing_directions)) == 2
+        keep_basis = RationalSDP._orthogonal_complement_basis(exposing_directions, 3)
+        @test size(keep_basis, 2) == 1
+
+        reduced_rank_one_problem =
+            RationalSDP._apply_facial_reduction(rank_one_problem, Int[], Dict(1 => keep_basis))
+        @test [block.size for block in reduced_rank_one_problem.blocks] == [1]
+        @test reduced_rank_one_problem.affine !== nothing
+        reduced_particular, reduced_nullspace = reduced_rank_one_problem.affine
+        @test reduced_rank_one_problem.A * reduced_particular == reduced_rank_one_problem.b
+        @test reduced_rank_one_problem.A * reduced_nullspace ==
+              zeros(
+                  Rational{BigInt},
+                  size(reduced_rank_one_problem.A, 1),
+                  size(reduced_nullspace, 2),
+              )
+
+        interior_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block3],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0//1,
+            zeros(Rational{BigInt}, 6),
+            zeros(Rational{BigInt}, 0, 6),
+            Rational{BigInt}[],
+            (
+                triangle_entries(Matrix{Rational{BigInt}}(I, 3, 3)),
+                zeros(Rational{BigInt}, 6, 0),
+            ),
+        )
+        @test all(
+            direction ->
+                RationalSDP._block_annihilation_violation(interior_problem, block3, direction) !==
+                nothing,
+            exposing_directions,
+        )
+        @test isempty(
+            RationalSDP._facial_reduction_block_directions(
+                pivot_opt,
+                interior_problem,
+                1,
+                exposing_slack,
+                Float64,
+            ),
+        )
+
         block = RationalSDP.BlockStructure(
             2,
             Union{Nothing,MOI.VariableIndex}[nothing, nothing, nothing],
@@ -504,7 +730,8 @@ include("slowtest_helpers.jl")
             [(1, 1), (2, 1), (2, 2)],
             [1, 3],
         )
-        problem = RationalSDP.ProblemData(
+        helper_opt = RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+        exact_boundary_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
             [block],
             Int[],
@@ -514,19 +741,109 @@ include("slowtest_helpers.jl")
             zeros(Rational{BigInt}, 0, 3),
             Rational{BigInt}[],
             (
-                zeros(Rational{BigInt}, 3),
-                Matrix{Rational{BigInt}}(I, 3, 3),
+                Rational{BigInt}[1//1, -1//1, 1//1],
+                zeros(Rational{BigInt}, 3, 0),
             ),
         )
         directions =
             RationalSDP._candidate_kernel_directions(
-                RationalSDP.Optimizer{Rational{BigInt}}(),
-                problem,
+                helper_opt,
+                exact_boundary_problem,
                 1,
                 Float64[1.0 -1.0; -1.0 1.0],
                 Float64,
             )
         @test directions == [Rational{BigInt}[1//1, 1//1]]
+
+        psd_certified_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            (
+                Rational{BigInt}[0//1, 0//1, 1//1],
+                reshape(Rational{BigInt}[0//1, 1//1, 0//1], 3, 1),
+            ),
+        )
+        direction = Rational{BigInt}[1//1, 0//1]
+        @test RationalSDP._block_annihilation_violation(
+            psd_certified_problem,
+            block,
+            direction,
+        ) !== nothing
+        @test RationalSDP._block_quadratic_vanish_violation(
+            psd_certified_problem,
+            block,
+            direction,
+        ) === nothing
+        directions =
+            RationalSDP._candidate_kernel_directions(
+                helper_opt,
+                psd_certified_problem,
+                1,
+                Float64[0.0 0.0; 0.0 1.0],
+                Float64,
+            )
+        @test directions == [direction]
+
+        trace_certified_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            (
+                Rational{BigInt}[0//1, 0//1, 0//1],
+                reshape(Rational{BigInt}[1//1, 0//1, -1//1], 3, 1),
+            ),
+        )
+        directions =
+            RationalSDP._candidate_kernel_directions(
+                helper_opt,
+                trace_certified_problem,
+                1,
+                zeros(Float64, 2, 2),
+                Float64,
+            )
+        @test directions == [
+            Rational{BigInt}[1//1, 0//1],
+            Rational{BigInt}[0//1, 1//1],
+        ]
+
+        uncertified_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            (
+                Rational{BigInt}[1//1, 0//1, 1//1],
+                zeros(Rational{BigInt}, 3, 0),
+            ),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_irrational_behavior = :warn,
+        )
+        @test isempty(
+            RationalSDP._candidate_kernel_directions(
+                opt,
+                uncertified_problem,
+                1,
+                Float64[1.0 -1.0; -1.0 1.0],
+                Float64,
+            ),
+        )
     end
 
     @testset "PSD face pruning from forced nullspace directions" begin
@@ -654,7 +971,7 @@ include("slowtest_helpers.jl")
         @test [reduced_block.size for reduced_block in reduced_via_driver.blocks] == [1]
     end
 
-    @testset "SIRS facial reduction keeps reduced affine candidate interior" begin
+    @testset "SIRS facial reduction handles uncertified boundary candidates" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "working_float_type", Float64)
         set_optimizer_attribute(model, "facial_reduction_float_type", Float64)
@@ -713,22 +1030,25 @@ include("slowtest_helpers.jl")
             result1.phase1_candidate,
             Float64,
         )
-        @test reduction1 !== nothing
-        exposed_scalars1, keep_bases1 = reduction1
-        @test !isempty(keep_bases1)
+        if reduction1 === nothing
+            @test reduction1 === nothing
+        else
+            exposed_scalars1, keep_bases1 = reduction1
+            @test !isempty(keep_bases1)
 
-        reduced_problem = RationalSDP._apply_facial_reduction(problem, exposed_scalars1, keep_bases1)
-        result2 = RationalSDP._phase1_anchor_attempt(opt, reduced_problem, Float64)
-        @test result2.phase1_candidate !== nothing
+            reduced_problem = RationalSDP._apply_facial_reduction(problem, exposed_scalars1, keep_bases1)
+            result2 = RationalSDP._phase1_anchor_attempt(opt, reduced_problem, Float64)
+            @test result2.phase1_candidate !== nothing
 
-        for block in reduced_problem.blocks
-            X = RationalSDP._vector_to_matrix(result2.phase1_candidate, block)
-            eigs = eigvals(Symmetric((X + transpose(X)) / 2))
-            @test minimum(eigs) > -1.0e-6
+            for block in reduced_problem.blocks
+                X = RationalSDP._vector_to_matrix(result2.phase1_candidate, block)
+                eigs = eigvals(Symmetric((X + transpose(X)) / 2))
+                @test minimum(eigs) > -1.0e-6
+            end
         end
     end
 
-    @testset "Irrational exposed face detection" begin
+    @testset "Uncertified facial reduction directions are skipped" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "working_float_type", Float64)
         @variable(model, x)
@@ -745,14 +1065,9 @@ include("slowtest_helpers.jl")
         @constraint(model, Symmetric(A) in PSDCone())
         @constraint(model, Symmetric(B) in PSDCone())
         @objective(model, Min, 0//1)
-        err = try
-            optimize!(model)
-            nothing
-        catch caught
-            caught
-        end
-        @test err isa ErrorException
-        @test occursin("could not be represented exactly", sprint(showerror, err))
+        optimize!(model)
+        @test termination_status(model) == MOI.NUMERICAL_ERROR
+        @test primal_status(model) == MOI.NO_SOLUTION
     end
 
     @testset "Exact feasibility with Rational{BigInt}" begin

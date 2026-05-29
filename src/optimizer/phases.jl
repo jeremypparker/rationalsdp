@@ -4,11 +4,15 @@ function _recovery_tolerances(settings::Settings, ::Type{F}) where {F<:AbstractF
     tolerances = F[]
     tolerance = max(F(1.0e-8), sqrt(_to_working_float(F, settings.rational_tolerance)))
     final_tolerance = _to_working_float(F, settings.rational_tolerance)
+    shrink = _to_working_float(F, settings.recovery_tolerance_shrink)
+    zero(F) < shrink < one(F) || error("recovery_tolerance_shrink must lie strictly between 0 and 1.")
     while tolerance > final_tolerance
         push!(tolerances, tolerance)
-        tolerance /= F(10)
+        tolerance *= shrink
     end
-    push!(tolerances, final_tolerance)
+    if isempty(tolerances) || tolerances[end] != final_tolerance
+        push!(tolerances, final_tolerance)
+    end
     return tolerances
 end
 
@@ -215,7 +219,205 @@ function _phase2_exact_refinement(
     return best
 end
 
+function _phase1_exact_recovery_log(opt::Optimizer, message::AbstractString)
+    opt.settings.phase1_exact_recovery_diagnostics || return
+    _log(opt, "Phase I exact recovery: " * message)
+    return
+end
+
+function _phase1_exact_recovery_elapsed(start_time)
+    return @sprintf("%.2f", (time_ns() - start_time) / 1.0e9)
+end
+
+function _phase1_exact_recovery_rationalize_coordinates(
+    opt::Optimizer,
+    coordinates::AbstractVector{F},
+    tolerance::F,
+    context::AbstractString,
+) where {F<:AbstractFloat}
+    if !opt.settings.phase1_exact_recovery_diagnostics
+        return [rationalize(BigInt, value; tol = tolerance) for value in coordinates]
+    end
+
+    start_time = time_ns()
+    rational_coordinates = Vector{ExactRational}(undef, length(coordinates))
+    log_frequency = max(1, div(length(coordinates), 8))
+    for index in eachindex(coordinates)
+        rational_coordinates[index] = rationalize(BigInt, coordinates[index]; tol = tolerance)
+        if index == 1 || index == length(coordinates) || index % log_frequency == 0
+            _phase1_exact_recovery_log(
+                opt,
+                "$(context): rationalized coordinate $(index)/$(length(coordinates)) in $(_phase1_exact_recovery_elapsed(start_time))s",
+            )
+        end
+    end
+    return rational_coordinates
+end
+
+function _project_exact_solution_from_rational_coordinates_recovery(
+    opt::Optimizer,
+    rational_coordinates::Vector{ExactRational},
+    particular::Vector{ExactRational},
+    nullspace::Matrix{ExactRational},
+    context::AbstractString,
+)
+    if !opt.settings.phase1_exact_recovery_diagnostics
+        return particular + nullspace * rational_coordinates
+    end
+
+    row_count, column_count = size(nullspace)
+    start_time = time_ns()
+    result = copy(particular)
+    nonzero_coordinates = count(!iszero, rational_coordinates)
+    _phase1_exact_recovery_log(
+        opt,
+        "$(context): exact projection rows=$(row_count), cols=$(column_count), nonzero_coordinates=$(nonzero_coordinates)",
+    )
+    log_frequency = max(1, div(row_count, 8))
+    for row in 1:row_count
+        accumulator = result[row]
+        row_terms = 0
+        @inbounds for column in 1:column_count
+            coefficient = rational_coordinates[column]
+            iszero(coefficient) && continue
+            entry = nullspace[row, column]
+            iszero(entry) && continue
+            accumulator += entry * coefficient
+            row_terms += 1
+        end
+        result[row] = accumulator
+        if row == 1 || row == row_count || row % log_frequency == 0
+            _phase1_exact_recovery_log(
+                opt,
+                "$(context): projected row $(row)/$(row_count), row_terms=$(row_terms), elapsed=$(_phase1_exact_recovery_elapsed(start_time))s",
+            )
+        end
+    end
+    return result
+end
+
+function _positive_definite_exact_recovery_check(
+    opt::Optimizer,
+    matrix::Matrix{ExactRational},
+    block_index::Int,
+    context::AbstractString,
+)
+    size(matrix, 1) == size(matrix, 2) ||
+        return (ok = false, reason = "block $(block_index) is not square")
+    n = size(matrix, 1)
+    n == 0 && return (ok = true, reason = "empty block")
+    any(matrix .!= transpose(matrix)) &&
+        return (ok = false, reason = "block $(block_index) is not symmetric")
+    for diagonal in 1:n
+        value = matrix[diagonal, diagonal]
+        if !(value > 0)
+            return (
+                ok = false,
+                reason = "block $(block_index) diagonal $(diagonal) is not positive: $(_format_exact_rational_compact(value))",
+            )
+        end
+    end
+
+    start_time = time_ns()
+    remainder = copy(matrix)
+    active = collect(1:n)
+    pivot_count = 0
+    log_frequency = max(0, opt.settings.phase1_exact_recovery_pivot_log_frequency)
+    while !isempty(active)
+        for diagonal in eachindex(active)
+            value = remainder[diagonal, diagonal]
+            if !(value > 0)
+                return (
+                    ok = false,
+                    reason = "block $(block_index) Schur diagonal $(active[diagonal]) is not positive after $(pivot_count) pivot(s): $(_format_exact_rational_compact(value))",
+                )
+            end
+        end
+        pivot_position = findfirst(index -> remainder[index, index] > 0, eachindex(active))
+        pivot_position === nothing &&
+            return (ok = false, reason = "block $(block_index) has no positive exact pivot")
+        if pivot_position != 1
+            permutation = [pivot_position; setdiff(collect(1:length(active)), pivot_position)]
+            remainder = remainder[permutation, permutation]
+            active = active[permutation]
+        end
+
+        pivot = remainder[1, 1]
+        pivot > 0 ||
+            return (ok = false, reason = "block $(block_index) pivot is not positive: $(_format_exact_rational_compact(pivot))")
+        pivot_count += 1
+        if opt.settings.phase1_exact_recovery_diagnostics &&
+           (pivot_count == 1 ||
+            length(active) == 1 ||
+            (log_frequency > 0 && pivot_count % log_frequency == 0))
+            _log(
+                opt,
+                "Phase I exact recovery: $(context), block $(block_index) pivot $(pivot_count)/$(n), active=$(length(active)), $(_format_exact_rational_size(pivot)), elapsed=$(_phase1_exact_recovery_elapsed(start_time))s",
+            )
+        end
+        length(active) == 1 && return (ok = true, reason = "positive definite")
+        trailing = Matrix{ExactRational}(undef, length(active) - 1, length(active) - 1)
+        for row in 2:length(active), column in 2:length(active)
+            trailing[row - 1, column - 1] =
+                remainder[row, column] - remainder[row, 1] * remainder[1, column] / pivot
+        end
+        remainder = trailing
+        active = active[2:end]
+    end
+
+    return (ok = true, reason = "positive definite")
+end
+
+function _strictly_interior_exact_recovery_check(
+    opt::Optimizer,
+    x::Vector{ExactRational},
+    blocks::Vector{BlockStructure},
+    positive_scalars::Vector{Int},
+    context::AbstractString,
+)
+    if !opt.settings.phase1_exact_recovery_diagnostics
+        return _strictly_interior_exact(x, blocks, positive_scalars)
+    end
+
+    for index in positive_scalars
+        if !(x[index] > 0)
+            _phase1_exact_recovery_log(
+                opt,
+                "$(context) failed: scalar slack at position $(index) is not positive: $(_format_exact_rational_compact(x[index]))",
+            )
+            return false
+        end
+    end
+
+    for (block_index, block) in enumerate(blocks)
+        block_start = time_ns()
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): checking exact positive definiteness of block $(block_index) (size=$(block.size))",
+        )
+        status = _positive_definite_exact_recovery_check(
+            opt,
+            _vector_to_matrix(x, block),
+            block_index,
+            context,
+        )
+        if !status.ok
+            _phase1_exact_recovery_log(
+                opt,
+                "$(context) failed after $(_phase1_exact_recovery_elapsed(block_start))s: $(status.reason)",
+            )
+            return false
+        end
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): block $(block_index) passed in $(_phase1_exact_recovery_elapsed(block_start))s",
+        )
+    end
+    return true
+end
+
 function _phase1_exact_feasible_point(
+    opt::Optimizer,
     x_phase1::Vector{F},
     problem::ProblemData,
     settings::Settings,
@@ -224,21 +426,57 @@ function _phase1_exact_feasible_point(
     problem.affine === nothing && return nothing
     particular, nullspace = problem.affine
     coefficients = _affine_coordinates(x_phase1, numeric_affine)
-    for tolerance in _recovery_tolerances(settings, F)
-        candidate = _project_exact_solution(
+    tolerances = _recovery_tolerances(settings, F)
+    _phase1_exact_recovery_log(
+        opt,
+        "fallback from full candidate with $(length(coefficients)) affine coordinate(s) and $(length(tolerances)) tolerance attempt(s)",
+    )
+    for (attempt_index, tolerance) in enumerate(tolerances)
+        context = "fallback attempt $(attempt_index)/$(length(tolerances)), tol=$(_format_metric(tolerance))"
+        attempt_start = time_ns()
+        _phase1_exact_recovery_log(opt, "$(context): rationalizing coordinates")
+        rational_coefficients = _phase1_exact_recovery_rationalize_coordinates(
+            opt,
             coefficients,
-            particular,
-            nullspace;
-            tolerance = tolerance,
+            tolerance,
+            context,
         )
-        if _strictly_interior_exact(candidate, problem.blocks, problem.positive_scalars)
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): rationalized coordinates in $(_phase1_exact_recovery_elapsed(attempt_start))s; projecting exact candidate",
+        )
+        candidate = _project_exact_solution_from_rational_coordinates_recovery(
+            opt,
+            rational_coefficients,
+            particular,
+            nullspace,
+            context,
+        )
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): projection finished in $(_phase1_exact_recovery_elapsed(attempt_start))s",
+        )
+        if _strictly_interior_exact_recovery_check(
+            opt,
+            candidate,
+            problem.blocks,
+            problem.positive_scalars,
+            context,
+        )
+            _phase1_exact_recovery_log(opt, "$(context): recovered exact strict interior point")
             return candidate
         end
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): no exact strict interior point after $(_phase1_exact_recovery_elapsed(attempt_start))s",
+        )
     end
+    _phase1_exact_recovery_log(opt, "fallback failed")
     return nothing
 end
 
 function _phase1_exact_feasible_point_from_coordinates(
+    opt::Optimizer,
     coordinates::AbstractVector{F},
     particular::Vector{ExactRational},
     nullspace::Matrix{ExactRational},
@@ -259,20 +497,67 @@ function _phase1_exact_feasible_point_from_coordinates(
     active_positive_scalars = [position_map[position] for position in problem.positive_scalars]
     particular_active = particular[active_positions]
     nullspace_active = nullspace[active_positions, :]
+    tolerances = _recovery_tolerances(settings, F)
+    _phase1_exact_recovery_log(
+        opt,
+        "coordinate recovery with $(length(coordinates)) coordinate(s), $(length(active_positions)) active cone position(s), and $(length(tolerances)) tolerance attempt(s)",
+    )
 
-    for tolerance in _recovery_tolerances(settings, F)
-        rational_coordinates = [
-            rationalize(BigInt, value; tol = tolerance) for value in coordinates
-        ]
-        candidate_active = particular_active + nullspace_active * rational_coordinates
-        if _strictly_interior_exact(candidate_active, active_blocks, active_positive_scalars)
-            return particular + nullspace * rational_coordinates
+    for (attempt_index, tolerance) in enumerate(tolerances)
+        context = "coordinate attempt $(attempt_index)/$(length(tolerances)), tol=$(_format_metric(tolerance))"
+        attempt_start = time_ns()
+        _phase1_exact_recovery_log(opt, "$(context): rationalizing coordinates")
+        rational_coordinates = _phase1_exact_recovery_rationalize_coordinates(
+            opt,
+            coordinates,
+            tolerance,
+            context,
+        )
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): rationalized coordinates in $(_phase1_exact_recovery_elapsed(attempt_start))s; projecting active cone positions",
+        )
+        candidate_active = _project_exact_solution_from_rational_coordinates_recovery(
+            opt,
+            rational_coordinates,
+            particular_active,
+            nullspace_active,
+            context,
+        )
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): active projection finished in $(_phase1_exact_recovery_elapsed(attempt_start))s",
+        )
+        if _strictly_interior_exact_recovery_check(
+            opt,
+            candidate_active,
+            active_blocks,
+            active_positive_scalars,
+            context,
+        )
+            _phase1_exact_recovery_log(
+                opt,
+                "$(context): active point is exact strict interior; reconstructing full vector",
+            )
+            return _project_exact_solution_from_rational_coordinates_recovery(
+                opt,
+                rational_coordinates,
+                particular,
+                nullspace,
+                context * " full reconstruction",
+            )
         end
+        _phase1_exact_recovery_log(
+            opt,
+            "$(context): no exact strict interior point after $(_phase1_exact_recovery_elapsed(attempt_start))s",
+        )
     end
+    _phase1_exact_recovery_log(opt, "coordinate recovery failed")
     return nothing
 end
 
 function _phase1_exact_anchor_fallback(
+    opt::Optimizer,
     candidate::Vector{F},
     problem::ProblemData,
     settings::Settings,
@@ -280,6 +565,7 @@ function _phase1_exact_anchor_fallback(
 ) where {F<:AbstractFloat}
     numeric_affine = _numeric_affine_data(problem, F)
     return _phase1_exact_feasible_point(
+        opt,
         candidate,
         problem,
         settings,
@@ -321,6 +607,38 @@ function _hypatia_phase1_syssolver(settings::Settings, ::Type{F}) where {F<:Abst
         return Hypatia.Solvers.NaiveElimDenseSystemSolver{F}(), true, false
     end
     error("Unhandled phase1_hypatia_syssolver choice $(choice).")
+end
+
+function _append_phase1_hypatia_tolerance!(
+    kwargs::Vector{Pair{Symbol,Any}},
+    name::Symbol,
+    settings_value::BigFloat,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    settings_value > 0 || return kwargs
+    push!(kwargs, name => _to_working_float(F, settings_value))
+    return kwargs
+end
+
+function _phase1_hypatia_tolerance_kwargs(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
+    kwargs = Pair{Symbol,Any}[]
+    _append_phase1_hypatia_tolerance!(kwargs, :tol_rel_opt, settings.phase1_hypatia_tol_rel_opt, F)
+    _append_phase1_hypatia_tolerance!(kwargs, :tol_abs_opt, settings.phase1_hypatia_tol_abs_opt, F)
+    _append_phase1_hypatia_tolerance!(kwargs, :tol_feas, settings.phase1_hypatia_tol_feas, F)
+    _append_phase1_hypatia_tolerance!(
+        kwargs,
+        :default_tol_power,
+        settings.phase1_hypatia_default_tol_power,
+        F,
+    )
+    _append_phase1_hypatia_tolerance!(
+        kwargs,
+        :default_tol_relax,
+        settings.phase1_hypatia_default_tol_relax,
+        F,
+    )
+    _append_phase1_hypatia_tolerance!(kwargs, :tol_slow, settings.phase1_hypatia_tol_slow, F)
+    return kwargs
 end
 
 function _phase1_hypatia_prefers_sparse_float64(problem::ProblemData)
@@ -539,9 +857,12 @@ function _phase1_hypatia_anchor_once(
         phase1_nullspace = nothing
         _gc_checkpoint!(opt, "before Hypatia load")
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
+        tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
+            ;
             verbose = !opt.silent && opt.settings.verbose,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
+            tolerance_kwargs...,
             preprocess = preprocess,
             reduce = false,
             syssolver = syssolver,
@@ -592,6 +913,14 @@ function _phase1_hypatia_anchor_once(
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
         b_numeric = _to_working_array(HF, problem.b)
         residual = size(A_numeric, 1) == 0 ? zero(HF) : _max_abs(A_numeric * candidate - b_numeric)
+        _log_phase1_candidate_diagnostics(
+            opt,
+            problem,
+            candidate,
+            margin,
+            residual,
+            HF,
+        )
         if !raw_solution_finite
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
@@ -606,11 +935,30 @@ function _phase1_hypatia_anchor_once(
             _log_phase1_hypatia_attempt(opt, attempt)
             return attempt
         end
+        if opt.settings.phase1_stop_after_candidate_diagnostics
+            _log(
+                opt,
+                "Phase I candidate diagnostics: stopping before exact recovery by phase1_stop_after_candidate_diagnostics",
+            )
+            attempt = Phase1HypatiaAttempt{HF}(
+                nothing,
+                candidate,
+                string(status),
+                iterations,
+                margin,
+                residual,
+                total_time_sec,
+                :exact_recovery_failed,
+            )
+            _log_phase1_hypatia_attempt(opt, attempt)
+            return attempt
+        end
         recovery_threshold = max(HF(1.0e-6), sqrt(eps(HF)))
         if residual > recovery_threshold
             anchor = nothing
             if margin > zero(HF)
                 anchor = _phase1_exact_feasible_point_from_coordinates(
+                    opt,
                     coordinates,
                     particular,
                     phase1_nullspace,
@@ -647,6 +995,7 @@ function _phase1_hypatia_anchor_once(
         end
 
         anchor = _phase1_exact_feasible_point_from_coordinates(
+            opt,
             coordinates,
             particular,
             phase1_nullspace,
@@ -657,6 +1006,7 @@ function _phase1_hypatia_anchor_once(
             phase1_nullspace = nothing
             _gc_checkpoint!(opt, "before phase1 exact recovery")
             anchor = _phase1_exact_anchor_fallback(
+                opt,
                 candidate,
                 problem,
                 opt.settings,
@@ -747,6 +1097,9 @@ function _phase1_anchor_attempt(
     anchor = nothing
     phase2_initial_point = nothing
     phase1_candidate = nothing
+    phase1_margin = nothing
+    phase1_residual = nothing
+    phase1_status = nothing
 
     if _phase1_backend(opt.settings) == :hypatia
         _log(opt, "Phase I via Hypatia")
@@ -758,6 +1111,9 @@ function _phase1_anchor_attempt(
         end
         if attempt !== nothing
             anchor = attempt.anchor
+            phase1_margin = attempt.margin
+            phase1_residual = attempt.residual
+            phase1_status = attempt.status
             if attempt.candidate !== nothing
                 phase1_candidate = _to_working_array(F, attempt.candidate)
                 phase2_initial_point = _to_working_array(F, attempt.candidate)
@@ -837,7 +1193,7 @@ function _phase1_anchor_attempt(
                 last_phase1_recovery_probe,
                 numeric_settings,
             )
-                anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+                anchor = _phase1_exact_feasible_point(opt, x, problem, opt.settings, numeric_affine)
                 last_phase1_recovery_probe = residual
             end
             if residual <= numeric_settings.feasibility_tolerance || anchor !== nothing
@@ -847,7 +1203,7 @@ function _phase1_anchor_attempt(
         end
 
         if anchor === nothing && last_phase1_residual <= F(1.0e-6)
-            anchor = _phase1_exact_feasible_point(x, problem, opt.settings, numeric_affine)
+            anchor = _phase1_exact_feasible_point(opt, x, problem, opt.settings, numeric_affine)
         end
     end
 
@@ -855,6 +1211,9 @@ function _phase1_anchor_attempt(
         anchor = anchor,
         phase2_initial_point = phase2_initial_point,
         phase1_candidate = phase1_candidate,
+        phase1_margin = phase1_margin,
+        phase1_residual = phase1_residual,
+        phase1_status = phase1_status,
     )
 end
 

@@ -31,8 +31,8 @@ RationalSDP currently supports:
 - selectable numerical working types: `Float64`, `Double64`, `BigFloat`, etc.
 - Hypatia-backed or native Phase I feasibility search
 - exact affine elimination before the barrier solve
-- PSD face pruning for some forced-boundary cases
-- optional facial-reduction passes
+- coordinate PSD face pruning for forced-boundary cases
+- optional facial-reduction passes with exact certification of reduced faces
 - threaded PSD barrier assembly
 - SumOfSquares.jl models that bridge to supported JuMP/MOI constraints
 - one-parameter quasiconvex models where the objective parameter appears
@@ -93,7 +93,10 @@ value(t)      # close to 1//4, returned as an exact rational
 ```
 
 For larger SOS models, expect performance and robustness to depend strongly on
-the Gram basis and on whether the feasible set lies on a PSD face.
+the Gram basis and on whether the feasible set lies on a PSD face. The solver
+can prune some forced zero directions exactly, and can run facial reduction, but
+it skips numerical face directions that cannot be certified from the exact
+affine equations and PSD implications.
 
 ## Quasiconvex One-Parameter Problems
 
@@ -156,15 +159,9 @@ set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 24)
 
 The full set of optimizer attributes is:
 
-- `verbose`
-- `verbose_newton`
-- `live_progress`
-- `inner_log_frequency`
 - `max_iterations`
 - `phase1_outer_iterations`
 - `phase2_outer_iterations`
-- `working_float_type`
-- `working_precision`
 - `phase1_backend`
 - `phase1_hypatia_float_type`
 - `phase1_hypatia_syssolver`
@@ -173,6 +170,17 @@ The full set of optimizer attributes is:
 - `phase1_hypatia_min_margin_upper`
 - `phase1_hypatia_margin_shrink`
 - `phase1_hypatia_objective_bias`
+- `phase1_hypatia_tol_rel_opt`
+- `phase1_hypatia_tol_abs_opt`
+- `phase1_hypatia_tol_feas`
+- `phase1_hypatia_default_tol_power`
+- `phase1_hypatia_default_tol_relax`
+- `phase1_hypatia_tol_slow`
+- `phase1_candidate_diagnostics`
+- `phase1_stop_after_candidate_diagnostics`
+- `phase1_exact_recovery_diagnostics`
+- `phase1_exact_recovery_pivot_log_frequency`
+- `working_float_type`
 - `facial_reduction`
 - `facial_reduction_max_rounds`
 - `facial_reduction_float_type`
@@ -191,8 +199,14 @@ The full set of optimizer attributes is:
 - `path_parameter_growth`
 - `phase1_center_weight`
 - `boundary_fraction`
+- `working_precision`
 - `rational_tolerance`
+- `recovery_tolerance_shrink`
 - `exact_refinement_bisections`
+- `verbose`
+- `verbose_newton`
+- `live_progress`
+- `inner_log_frequency`
 - `threaded`
 - `threading_min_block_size`
 - `iterative_linear_solver`
@@ -201,9 +215,17 @@ The full set of optimizer attributes is:
 - `gc_collect_full`
 - `gc_log`
 - `quasiconvex_bisection_iterations`
+- `quasiconvex_skip_facial_reduction_after_clean_endpoint`
 
 The default working type is `Double64`. `Float64` is faster but less robust;
 `BigFloat` is slower but can help on ill-conditioned models.
+
+Hypatia Phase I tolerance attributes use negative values to leave Hypatia's
+own defaults unchanged. The diagnostic attributes are off by default; enable
+`phase1_candidate_diagnostics` or `phase1_exact_recovery_diagnostics` when a
+model reaches a numerical boundary point but exact recovery fails. The
+`recovery_tolerance_shrink` setting controls how aggressively exact recovery
+tightens rationalization tolerances between attempts.
 
 ## Exactness Model
 
@@ -226,7 +248,8 @@ Important current limitations:
 - no general nonconvex quadratic support
 - quasiconvex support is restricted to one bounded objective parameter
 - exact recovery can fail on badly conditioned or nearly infeasible problems
-- facial reduction is partial
+- facial reduction is partial and only applies faces certified from exact
+  affine equations, PSD diagonal identities, or PSD trace identities
 - large SOS models can be slow
 
 Use established SDP solvers when you need broad conic coverage, dual

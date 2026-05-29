@@ -684,10 +684,16 @@ function _positive_definite_exact(matrix::Matrix{ExactRational})
     n = size(matrix, 1)
     n == 0 && return true
     any(matrix .!= transpose(matrix)) && return false
+    for diagonal in 1:n
+        matrix[diagonal, diagonal] > 0 || return false
+    end
 
     remainder = copy(matrix)
     active = collect(1:n)
     while !isempty(active)
+        for diagonal in eachindex(active)
+            remainder[diagonal, diagonal] > 0 || return false
+        end
         pivot_position = findfirst(index -> remainder[index, index] > 0, eachindex(active))
         pivot_position === nothing && return false
         if pivot_position != 1

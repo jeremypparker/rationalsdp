@@ -44,22 +44,139 @@ function _block_row_linear_form(
     return form
 end
 
+function _block_quadratic_linear_form(
+    block::BlockStructure,
+    direction::Vector{ExactRational},
+    dimension::Int,
+)
+    form = zeros(ExactRational, dimension)
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        coefficient = if i == j
+            direction[i] * direction[i]
+        else
+            2 * direction[i] * direction[j]
+        end
+        iszero(coefficient) && continue
+        form[block.global_positions[local_index]] += coefficient
+    end
+    return form
+end
+
 function _block_annihilates_direction_exact(
     problem::ProblemData,
     block::BlockStructure,
     direction::Vector{ExactRational},
 )
-    problem.affine === nothing && return false
+    return _block_annihilation_violation(problem, block, direction) === nothing
+end
+
+function _format_exact_direction(
+    direction::Vector{ExactRational};
+    max_entries::Int = 64,
+)
+    support = findall(!iszero, direction)
+    isempty(support) && return "support=0/$(length(direction)), entries=[]"
+
+    display_count = min(length(support), max_entries)
+    entries = String[]
+    for index in support[1:display_count]
+        push!(entries, "$(index)=>$(_format_exact_rational_compact(direction[index]))")
+    end
+    suffix = length(support) > display_count ? ", ..." : ""
+    return "support=$(length(support))/$(length(direction)), entries=[" *
+           join(entries, ", ") *
+           suffix *
+           "]"
+end
+
+function _block_annihilation_violation(
+    problem::ProblemData,
+    block::BlockStructure,
+    direction::Vector{ExactRational},
+)
+    problem.affine === nothing && return "no exact affine parametrization is available"
     particular, nullspace = problem.affine
     dimension = length(problem.objective_vector_raw)
     for row_index in 1:block.size
         form = _block_row_linear_form(block, row_index, direction, dimension)
-        iszero(dot(form, particular)) || return false
+        particular_value = dot(form, particular)
+        if !iszero(particular_value)
+            return "row=$(row_index), affine=particular, value=$(_format_exact_rational_compact(particular_value))"
+        end
         for basis_index in axes(nullspace, 2)
-            iszero(dot(form, view(nullspace, :, basis_index))) || return false
+            basis_value = dot(form, view(nullspace, :, basis_index))
+            if !iszero(basis_value)
+                return "row=$(row_index), affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
+            end
         end
     end
-    return true
+    return nothing
+end
+
+function _block_quadratic_vanish_violation(
+    problem::ProblemData,
+    block::BlockStructure,
+    direction::Vector{ExactRational},
+)
+    problem.affine === nothing && return "no exact affine parametrization is available"
+    particular, nullspace = problem.affine
+    dimension = length(problem.objective_vector_raw)
+    form = _block_quadratic_linear_form(block, direction, dimension)
+    particular_value = dot(form, particular)
+    if !iszero(particular_value)
+        return "quadratic=particular, value=$(_format_exact_rational_compact(particular_value))"
+    end
+    for basis_index in axes(nullspace, 2)
+        basis_value = dot(form, view(nullspace, :, basis_index))
+        if !iszero(basis_value)
+            return "quadratic=affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
+        end
+    end
+    return nothing
+end
+
+function _block_trace_vanish_violation(
+    problem::ProblemData,
+    block::BlockStructure,
+    directions::Vector{Vector{ExactRational}},
+)
+    isempty(directions) && return "no directions"
+    problem.affine === nothing && return "no exact affine parametrization is available"
+    particular, nullspace = problem.affine
+    dimension = length(problem.objective_vector_raw)
+    form = zeros(ExactRational, dimension)
+    for direction in directions
+        form .+= _block_quadratic_linear_form(block, direction, dimension)
+    end
+    particular_value = dot(form, particular)
+    if !iszero(particular_value)
+        return "trace=particular, value=$(_format_exact_rational_compact(particular_value))"
+    end
+    for basis_index in axes(nullspace, 2)
+        basis_value = dot(form, view(nullspace, :, basis_index))
+        if !iszero(basis_value)
+            return "trace=affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
+        end
+    end
+    return nothing
+end
+
+function _block_face_direction_certificate(
+    problem::ProblemData,
+    block::BlockStructure,
+    direction::Vector{ExactRational},
+)
+    row_violation = _block_annihilation_violation(problem, block, direction)
+    row_violation === nothing && return (kind = :affine_rows, violation = nothing)
+
+    diagonal_violation = _block_quadratic_vanish_violation(problem, block, direction)
+    diagonal_violation === nothing && return (kind = :psd_diagonal, violation = nothing)
+
+    return (
+        kind = :none,
+        violation =
+            "row certificate failed ($(row_violation)); PSD diagonal certificate failed ($(diagonal_violation))",
+    )
 end
 
 function _exact_face_direction(
@@ -75,7 +192,7 @@ function _exact_face_direction(
         ]
         direction = _normalize_rational_direction(direction)
         any(!iszero, direction) || continue
-        if _block_annihilates_direction_exact(problem, block, direction)
+        if _block_face_direction_certificate(problem, block, direction).kind != :none
             return direction
         end
     end
@@ -111,10 +228,82 @@ function _heuristic_kernel_direction(
         direction_scale = max(one(F), _max_abs(numeric_direction))
         residual = _max_abs(block_matrix * numeric_direction) / direction_scale
         if residual <= residual_tolerance
-            return _normalize_rational_direction(raw_direction)
+            return (
+                direction = _normalize_rational_direction(raw_direction),
+                residual = residual,
+                tolerance = tolerance,
+                residual_tolerance = residual_tolerance,
+            )
         end
     end
     return nothing
+end
+
+function _pivoted_rational_subspace_directions(
+    subspace::AbstractMatrix{F},
+    settings::Settings,
+    ::Type{F};
+    relation_tolerance = nothing,
+) where {F<:AbstractFloat}
+    dimension, column_count = size(subspace)
+    (dimension == 0 || column_count == 0) && return Vector{ExactRational}[]
+    all(isfinite, subspace) || return Vector{ExactRational}[]
+
+    subspace_matrix = Matrix{F}(subspace)
+    row_space_matrix = Matrix(transpose(subspace_matrix))
+    qr_factor = qr(row_space_matrix, ColumnNorm())
+    diagonal = abs.(diag(qr_factor.R))
+    isempty(diagonal) && return Vector{ExactRational}[]
+
+    scale = max(one(F), maximum(abs, subspace_matrix), maximum(diagonal))
+    rank_tolerance = max(
+        _to_working_float(F, settings.facial_reduction_rank_tolerance),
+        F(max(size(row_space_matrix)...)) * eps(F) * scale,
+        F(100) * eps(F),
+    )
+    rank = count(value -> value > rank_tolerance, diagonal)
+    rank == 0 && return Vector{ExactRational}[]
+
+    pivot_indices = collect(qr_factor.p[1:rank])
+    pivot_set = Set(pivot_indices)
+    remaining_indices = [index for index in 1:dimension if !(index in pivot_set)]
+
+    relations = if isempty(remaining_indices)
+        zeros(F, rank, 0)
+    else
+        row_space_matrix[:, pivot_indices] \ row_space_matrix[:, remaining_indices]
+    end
+
+    tolerances = if relation_tolerance === nothing
+        _recovery_tolerances(settings, F)
+    else
+        F[_to_working_float(F, relation_tolerance)]
+    end
+
+    for tolerance in tolerances
+        rational_relations = Matrix{ExactRational}(undef, size(relations)...)
+        for index in eachindex(relations)
+            rational_relations[index] =
+                rationalize(BigInt, BigFloat(relations[index]); tol = BigFloat(tolerance))
+        end
+
+        directions = Vector{Vector{ExactRational}}()
+        for pivot_offset in 1:rank
+            direction = zeros(ExactRational, dimension)
+            direction[pivot_indices[pivot_offset]] = 1 // 1
+            for (remaining_offset, remaining_index) in enumerate(remaining_indices)
+                direction[remaining_index] = rational_relations[pivot_offset, remaining_offset]
+            end
+            direction = _normalize_rational_direction(direction)
+            any(!iszero, direction) || continue
+            push!(directions, direction)
+        end
+
+        directions = _linearly_independent_directions(directions)
+        isempty(directions) || return directions
+    end
+
+    return Vector{ExactRational}[]
 end
 
 function _linearly_independent_directions(directions::Vector{Vector{ExactRational}})
@@ -123,6 +312,47 @@ function _linearly_independent_directions(directions::Vector{Vector{ExactRationa
     augmented = hcat(copy(matrix), zeros(ExactRational, size(matrix, 1)))
     _, pivots = _rref(augmented)
     return [directions[index] for index in pivots]
+end
+
+function _certified_pivoted_subspace_directions(
+    opt::Optimizer,
+    problem::ProblemData,
+    block::BlockStructure,
+    block_index::Int,
+    subspace::AbstractMatrix{F},
+    ::Type{F},
+    description::AbstractString,
+) where {F<:AbstractFloat}
+    candidates = _pivoted_rational_subspace_directions(subspace, opt.settings, F)
+    isempty(candidates) && return Vector{ExactRational}[]
+
+    accepted = Vector{Vector{ExactRational}}()
+    rejected = 0
+    last_violation = nothing
+    for direction in candidates
+        violation = _block_annihilation_violation(problem, block, direction)
+        if violation === nothing
+            push!(accepted, direction)
+        else
+            rejected += 1
+            last_violation = violation
+        end
+    end
+
+    accepted = _linearly_independent_directions(accepted)
+    if !isempty(accepted)
+        _log(
+            opt,
+            "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s))",
+        )
+        return accepted
+    end
+
+    _log(
+        opt,
+        "Facial reduction: rejected pivoted $(description) candidate for PSD block $(block_index); no exact affine row certificate for $(rejected) direction(s) ($(last_violation))",
+    )
+    return Vector{ExactRational}[]
 end
 
 function _orthogonal_complement_basis(directions::Vector{Vector{ExactRational}}, dimension::Int)
@@ -173,28 +403,87 @@ function _candidate_kernel_directions(
     ]
     isempty(kernel_indices) && return Vector{ExactRational}[]
 
+    kernel_subspace = Matrix(eigen_factor.vectors[:, kernel_indices])
+    pivoted_directions = _certified_pivoted_subspace_directions(
+        opt,
+        problem,
+        block,
+        block_index,
+        kernel_subspace,
+        F,
+        "boundary kernel",
+    )
+    isempty(pivoted_directions) || return pivoted_directions
+
     exact_directions = _exact_block_nullspace_directions(problem, block)
 
     if isempty(exact_directions)
         heuristic_directions = Vector{Vector{ExactRational}}()
+        individually_certified_directions = Vector{Vector{ExactRational}}()
+        rejected_heuristics = 0
         for kernel_index in sort(kernel_indices; by = index -> abs(eigen_factor.values[index]))
-            direction = _heuristic_kernel_direction(
+            heuristic = _heuristic_kernel_direction(
                 block_matrix,
                 collect(view(eigen_factor.vectors, :, kernel_index)),
                 opt.settings,
                 F,
             )
-            direction === nothing && continue
-            push!(heuristic_directions, direction)
+            heuristic === nothing && continue
+
+            direction = heuristic.direction
+            certificate = _block_face_direction_certificate(problem, block, direction)
+            direction_summary = _format_exact_direction(direction)
+            if certificate.kind != :none
+                certificate_label =
+                    certificate.kind == :affine_rows ? "affine row" : "PSD diagonal"
+                _log(
+                    opt,
+                    "Facial reduction: certified rationalized boundary kernel direction for PSD block $(block_index) ($(certificate_label) certificate; eig=$(_format_metric(eigen_factor.values[kernel_index])), residual=$(_format_metric(heuristic.residual)), rationalize_tol=$(_format_metric(heuristic.tolerance))): $(direction_summary)",
+                )
+                push!(heuristic_directions, direction)
+                push!(individually_certified_directions, direction)
+            else
+                rejected_heuristics += 1
+                _log(
+                    opt,
+                    "Facial reduction: rejected rationalized boundary kernel direction for PSD block $(block_index) (eig=$(_format_metric(eigen_factor.values[kernel_index])), residual=$(_format_metric(heuristic.residual)), rationalize_tol=$(_format_metric(heuristic.tolerance))); no exact face certificate ($(certificate.violation)): $(direction_summary)",
+                )
+                push!(heuristic_directions, direction)
+            end
         end
         heuristic_directions = _linearly_independent_directions(heuristic_directions)
-        if !isempty(heuristic_directions)
-            heuristic_directions = heuristic_directions[1:1]
+        if length(heuristic_directions) > 1
+            violation = _block_trace_vanish_violation(problem, block, heuristic_directions)
+            if violation === nothing
+                _log(
+                    opt,
+                    "Facial reduction: certified $(length(heuristic_directions))-dimensional rationalized boundary kernel subspace for PSD block $(block_index) (PSD trace certificate)",
+                )
+                return heuristic_directions
+            end
             _log(
                 opt,
-                "Facial reduction: using rationalized boundary kernel directions for PSD block $(block_index)",
+                "Facial reduction: rejected rationalized boundary kernel subspace for PSD block $(block_index); no exact PSD trace certificate ($(violation))",
             )
-            return heuristic_directions
+        end
+
+        individually_certified_directions =
+            _linearly_independent_directions(individually_certified_directions)
+        if !isempty(individually_certified_directions)
+            individually_certified_directions = individually_certified_directions[1:1]
+            _log(
+                opt,
+                "Facial reduction: using certified rationalized boundary kernel directions for PSD block $(block_index)",
+            )
+            return individually_certified_directions
+        end
+
+        if rejected_heuristics > 0
+            _log(
+                opt,
+                "Facial reduction: rejected $(rejected_heuristics) rationalized boundary kernel direction(s) for PSD block $(block_index); no uncertified heuristic face will be applied",
+            )
+            return Vector{ExactRational}[]
         end
 
         message =
@@ -208,6 +497,96 @@ function _candidate_kernel_directions(
     end
 
     return exact_directions
+end
+
+const _PHASE1_DIAGNOSTIC_THRESHOLDS = BigFloat[
+    big"1e-6",
+    big"1e-8",
+    big"1e-10",
+    big"1e-12",
+]
+
+function _phase1_threshold_summary(eigenvalues, ::Type{F}) where {F<:AbstractFloat}
+    parts = String[]
+    for threshold in _PHASE1_DIAGNOSTIC_THRESHOLDS
+        numeric_threshold = _to_working_float(F, threshold)
+        push!(
+            parts,
+            "<=$(_format_metric(numeric_threshold)):$(count(value -> value <= numeric_threshold, eigenvalues))",
+        )
+    end
+    return join(parts, ", ")
+end
+
+function _diagnose_phase1_candidate_kernel!(
+    opt::Optimizer,
+    problem::ProblemData,
+    block_index::Int,
+    block_matrix::Matrix{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    old_tolerance = opt.settings.facial_reduction_exposure_tolerance
+    try
+        for threshold in _PHASE1_DIAGNOSTIC_THRESHOLDS
+            opt.settings.facial_reduction_exposure_tolerance = threshold
+            directions = try
+                _candidate_kernel_directions(opt, problem, block_index, block_matrix, F)
+            catch err
+                _log(
+                    opt,
+                    "Phase I diagnostics: block $(block_index) loose kernel tol=$(_format_metric(_to_working_float(F, threshold))) raised $(typeof(err))",
+                )
+                continue
+            end
+            isempty(directions) && continue
+            _log(
+                opt,
+                "Phase I diagnostics: block $(block_index) loose kernel tol=$(_format_metric(_to_working_float(F, threshold))) recovered $(length(directions)) rationalized candidate-kernel direction(s)",
+            )
+            break
+        end
+    finally
+        opt.settings.facial_reduction_exposure_tolerance = old_tolerance
+    end
+    return
+end
+
+function _log_phase1_candidate_diagnostics(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Union{Nothing,Vector{F}},
+    margin,
+    residual,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    opt.settings.phase1_candidate_diagnostics || return
+    candidate === nothing && return
+
+    details = String[]
+    margin === nothing || push!(details, "margin=$(_format_metric(margin))")
+    residual === nothing || push!(details, "residual=$(_format_metric(residual))")
+    isempty(details) || _log(opt, "Phase I candidate diagnostics: " * join(details, ", "))
+
+    if !isempty(problem.positive_scalars)
+        scalar_values = candidate[problem.positive_scalars]
+        _log(
+            opt,
+            "Phase I candidate diagnostics: scalar slacks min=$(_format_metric(minimum(scalar_values))), <=0=$(count(value -> value <= zero(F), scalar_values))",
+        )
+    end
+
+    for (block_index, block) in enumerate(problem.blocks)
+        block_matrix = _vector_to_matrix(candidate, block)
+        symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
+        eigenvalues = eigvals(symmetric_matrix)
+        isempty(eigenvalues) && continue
+        _log(
+            opt,
+            "Phase I candidate diagnostics: block $(block_index) size=$(block.size), min_eig=$(_format_metric(minimum(eigenvalues))), max_eig=$(_format_metric(maximum(eigenvalues))), negative=$(count(value -> value < zero(F), eigenvalues)), $(_phase1_threshold_summary(eigenvalues, F))",
+        )
+        _diagnose_phase1_candidate_kernel!(opt, problem, block_index, block_matrix, F)
+    end
+    return
 end
 
 function _facial_reduction_free_positions(problem::ProblemData)
@@ -371,7 +750,8 @@ function _facial_reduction_block_directions(
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
-    eigenvalues = eigvals(symmetric_matrix)
+    eigen_factor = eigen(symmetric_matrix)
+    eigenvalues = eigen_factor.values
     isempty(eigenvalues) && return Vector{ExactRational}[]
 
     exposure_tolerance = max(
@@ -387,6 +767,23 @@ function _facial_reduction_block_directions(
     )
     numeric_rank = count(value -> value > rank_tolerance, singular_values)
     numeric_rank == 0 && return Vector{ExactRational}[]
+
+    range_indices = [
+        index for (index, value) in enumerate(eigen_factor.values) if value > rank_tolerance
+    ]
+    if !isempty(range_indices)
+        range_subspace = Matrix(eigen_factor.vectors[:, range_indices])
+        pivoted_directions = _certified_pivoted_subspace_directions(
+            opt,
+            problem,
+            block,
+            block_index,
+            range_subspace,
+            F,
+            "exposing-vector",
+        )
+        isempty(pivoted_directions) || return pivoted_directions
+    end
 
     qr_factor = qr(Matrix(symmetric_matrix), ColumnNorm())
     candidate_columns = unique(qr_factor.p[1:numeric_rank])

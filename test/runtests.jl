@@ -13,6 +13,7 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "phase1_backend", "native")
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         set_optimizer_attribute(model, "phase1_hypatia_syssolver", "qrchol_dense")
+        set_optimizer_attribute(model, "phase1_hypatia_target_margin", "0.02")
         set_optimizer_attribute(model, "phase1_hypatia_margin_upper", "1e-4")
         set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
         set_optimizer_attribute(model, "phase1_hypatia_margin_shrink", "0.2")
@@ -34,6 +35,7 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :qrchol_dense
+        @test get_optimizer_attribute(model, "phase1_hypatia_target_margin") == big"0.02"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_upper") == big"1e-4"
         @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_shrink") == big"0.2"

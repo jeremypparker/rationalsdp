@@ -166,6 +166,7 @@ The full set of optimizer attributes is:
 - `phase1_hypatia_float_type`
 - `phase1_hypatia_syssolver`
 - `phase1_hypatia_iter_limit`
+- `phase1_hypatia_target_margin`
 - `phase1_hypatia_margin_upper`
 - `phase1_hypatia_min_margin_upper`
 - `phase1_hypatia_margin_shrink`

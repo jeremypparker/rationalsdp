@@ -24,6 +24,7 @@ Base.@kwdef mutable struct Settings
     phase1_hypatia_float_type::DataType = AbstractFloat
     phase1_hypatia_syssolver::Symbol = :auto
     phase1_hypatia_iter_limit::Int = 400
+    phase1_hypatia_target_margin::BigFloat = big"1e-8"
     phase1_hypatia_margin_upper::BigFloat = big"1.0"
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
     phase1_hypatia_margin_shrink::BigFloat = big"0.1"
@@ -610,6 +611,12 @@ function _phase1_hypatia_syssolver(settings::Settings)
         ":qrchol_dense, :naive_dense, :naiveelim_dense.",
     )
     return syssolver
+end
+
+function _phase1_hypatia_target_margin(settings::Settings)
+    target = settings.phase1_hypatia_target_margin
+    target >= 0 || error("phase1_hypatia_target_margin must be nonnegative.")
+    return target
 end
 
 function _facial_reduction_float_type(settings::Settings)

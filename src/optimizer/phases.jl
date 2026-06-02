@@ -675,6 +675,8 @@ function _build_hypatia_phase1_model(
     reduced_dimension = size(phase1_nullspace, 2)
     total_dimension = reduced_dimension + 1
     margin_index = total_dimension
+    target_margin = _to_working_float(F, _phase1_hypatia_target_margin(settings))
+    margin_cap = target_margin > zero(F) ? min(margin_upper, target_margin) : margin_upper
     scalar_margin_rows = length(problem.positive_scalars) + 2
     psd_rows = sum((length(block.local_positions) for block in problem.blocks); init = 0)
     total_cone_dimension = scalar_margin_rows + psd_rows
@@ -721,7 +723,7 @@ function _build_hypatia_phase1_model(
     push!(values, -one(F))
     row += 1
 
-    h[row] = margin_upper
+    h[row] = margin_cap
     push!(row_indices, row)
     push!(column_indices, margin_index)
     push!(values, one(F))
@@ -763,20 +765,22 @@ function _phase1_hypatia_margin_caps(problem::ProblemData, settings::Settings)
     max_cap = settings.phase1_hypatia_margin_upper
     min_cap = settings.phase1_hypatia_min_margin_upper
     shrink = settings.phase1_hypatia_margin_shrink
+    target_margin = _phase1_hypatia_target_margin(settings)
+    effective_max_cap = target_margin > 0 ? min(max_cap, target_margin) : max_cap
 
     max_cap > 0 || error("phase1_hypatia_margin_upper must be positive.")
     min_cap > 0 || error("phase1_hypatia_min_margin_upper must be positive.")
     zero(shrink) < shrink < one(shrink) || error("phase1_hypatia_margin_shrink must lie strictly between 0 and 1.")
 
     if !any(!iszero, problem.objective_vector_min)
-        return BigFloat[max_cap]
+        return BigFloat[effective_max_cap]
     end
 
     caps = BigFloat[]
-    cap = min(max_cap, min_cap)
+    cap = min(effective_max_cap, min_cap)
     push!(caps, cap)
-    while cap < max_cap
-        next_cap = min(max_cap, cap / shrink)
+    while cap < effective_max_cap
+        next_cap = min(effective_max_cap, cap / shrink)
         next_cap == cap && break
         push!(caps, next_cap)
         cap = next_cap

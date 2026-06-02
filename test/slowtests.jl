@@ -107,4 +107,55 @@ end
         @test is_psd_exact(value.(instance.Po))
         @test all(iszero(value(coeff)) for coeff in coefficients(instance.certificate))
     end
+
+    @testset "SIRS log-domain SOS feasibility with facial reduction" begin
+        model = rational_model(Rational{BigInt})
+
+        @polyvar s i r G
+
+        gamma = 1 // 10
+        mu = 1 // 10
+        beta = 1 // 1
+        delta = 0 // 1
+        alpha = 1 // 10
+        Lambda = mu
+        R0 = Lambda * beta / (mu * (mu + delta + gamma))
+        S1 = Lambda / mu * ((1 // 1) / R0)
+        I1 = Lambda * (alpha + mu) * (R0 - 1) /
+             (R0 * ((gamma + delta + mu) * (alpha + mu) - alpha * gamma))
+        R1 = I1 * gamma / (alpha + mu)
+
+        S = s + S1
+        I = i + I1
+        R = r + R1
+
+        dsdt = Lambda - beta * S * I - mu * S + alpha * R
+        didt = beta * S * I - (delta + gamma + mu) * I
+        drdt = gamma * I - (alpha + mu) * R
+        dGdt = didt - I1 * (beta * S - (delta + gamma + mu))
+
+        basisV = monomials([s, i, r, G], 0:2)
+        @variable(model, coeffsV[1:length(basisV)])
+        V = dot(basisV, coeffsV)
+
+        dVdt =
+            differentiate(V, s) * dsdt +
+            differentiate(V, i) * didt +
+            differentiate(V, r) * drdt +
+            differentiate(V, G) * dGdt
+
+        D = @set i + I1 >= 0 &&
+                 s + S1 >= 0 &&
+                 r + R1 >= 0 &&
+                 G >= 0
+
+        @constraint(model, V(s => 0, i => 0, r => 0, G => 0) == 0)
+        @constraint(model, V >= s^2 + G + r^2, SOSCone(), domain = D)
+        @constraint(model, -(s^2 + i^2 + r^2) >= dVdt, SOSCone(), domain = D)
+
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+    end
 end

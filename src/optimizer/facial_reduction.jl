@@ -613,20 +613,8 @@ function _build_facial_reduction_oracle(
 ) where {F<:AbstractFloat}
     row_count = size(problem.A, 1)
     cone_positions = _phase1_active_positions(problem)
-    free_positions = _facial_reduction_free_positions(problem)
-
-    equality_rows = Vector{Vector{ExactRational}}()
-    equality_rhs = ExactRational[]
-    for position in free_positions
-        push!(equality_rows, collect(problem.A[:, position]))
-        push!(equality_rhs, 0 // 1)
-    end
-    push!(equality_rows, copy(problem.b))
-    push!(equality_rhs, 0 // 1)
-    push!(equality_rows, _facial_reduction_trace_row(problem))
-    push!(equality_rhs, 1 // 1)
-
-    A_eq = isempty(equality_rows) ? spzeros(F, 0, row_count) : _to_working_sparse_matrix(F, transpose(hcat(equality_rows...)))
+    equality_matrix, equality_rhs = _facial_reduction_oracle_equalities(problem)
+    A_eq = _to_working_sparse_matrix(F, equality_matrix)
     b_eq = _to_working_array(F, equality_rhs)
 
     scalar_rows = length(problem.positive_scalars)
@@ -739,6 +727,116 @@ function _facial_reduction_slack(problem::ProblemData, y::Vector{F}) where {F<:A
         block_slack[block_index] = _dual_vector_to_matrix(s, block)
     end
     return scalar_slack, block_slack
+end
+
+function _facial_reduction_slack(problem::ProblemData, y::Vector{ExactRational})
+    s = transpose(problem.A) * y
+    scalar_slack = Dict{Int,ExactRational}()
+    for index in problem.positive_scalars
+        scalar_slack[index] = s[index]
+    end
+    block_slack = Dict{Int,Matrix{ExactRational}}()
+    for (block_index, block) in enumerate(problem.blocks)
+        block_slack[block_index] = _dual_vector_to_matrix(s, block)
+    end
+    return s, scalar_slack, block_slack
+end
+
+function _facial_reduction_oracle_tolerances(
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    tolerances = _recovery_tolerances(settings, F)
+    coarse = max(F(1.0e-4), _to_working_float(F, settings.facial_reduction_exposure_tolerance))
+    if isempty(tolerances) || coarse > first(tolerances)
+        pushfirst!(tolerances, coarse)
+    end
+    return unique(tolerances)
+end
+
+function _facial_reduction_oracle_equalities(problem::ProblemData)
+    equality_rows = Vector{Vector{ExactRational}}()
+    equality_rhs = ExactRational[]
+    for position in _facial_reduction_free_positions(problem)
+        push!(equality_rows, collect(problem.A[:, position]))
+        push!(equality_rhs, 0 // 1)
+    end
+    push!(equality_rows, copy(problem.b))
+    push!(equality_rhs, 0 // 1)
+    push!(equality_rows, _facial_reduction_trace_row(problem))
+    push!(equality_rhs, 1 // 1)
+
+    return transpose(hcat(equality_rows...)), equality_rhs
+end
+
+function _exact_facial_reduction_oracle_slack(
+    opt::Optimizer,
+    problem::ProblemData,
+    oracle_point::Vector{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    free_positions = _facial_reduction_free_positions(problem)
+    trace_row = _facial_reduction_trace_row(problem)
+    equality_matrix, equality_rhs = _facial_reduction_oracle_equalities(problem)
+    oracle_affine = _solve_affine_system(Matrix(equality_matrix), equality_rhs)
+    oracle_affine === nothing && return nothing
+    particular, nullspace = oracle_affine
+    coordinates = if size(nullspace, 2) == 0
+        F[]
+    else
+        _to_working_array(F, nullspace) \
+            (oracle_point - _to_working_array(F, particular))
+    end
+
+    for tolerance in _facial_reduction_oracle_tolerances(opt.settings, F)
+        y = if isempty(coordinates)
+            particular
+        else
+            rational_coordinates = ExactRational[
+                rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
+                value in coordinates
+            ]
+            particular + nullspace * rational_coordinates
+        end
+        s, scalar_slack, block_slack = _facial_reduction_slack(problem, y)
+
+        all(index -> iszero(s[index]), free_positions) || continue
+        iszero(dot(problem.b, y)) || continue
+        dot(trace_row, y) == 1 // 1 || continue
+        all(value -> value >= 0 // 1, values(scalar_slack)) || continue
+        all(matrix -> _positive_semidefinite_exact(matrix), values(block_slack)) || continue
+
+        _log(
+            opt,
+            "Facial reduction oracle: recovered exact exposing-vector certificate (tol=$(_format_metric(tolerance)))",
+        )
+        return scalar_slack, block_slack
+    end
+
+    _log(opt, "Facial reduction oracle: no exact exposing-vector certificate recovered")
+    return nothing
+end
+
+function _exact_oracle_keep_bases(
+    opt::Optimizer,
+    problem::ProblemData,
+    block_slack::Dict{Int,Matrix{ExactRational}},
+)
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for (block_index, block) in enumerate(problem.blocks)
+        slack = block_slack[block_index]
+        any(!iszero, slack) || continue
+        keep_basis = _nullspace_basis_exact(slack)
+        if size(keep_basis, 2) == block.size
+            continue
+        end
+        keep_bases[block_index] = keep_basis
+        _log(
+            opt,
+            "Facial reduction: oracle certified exact exposed face for PSD block $(block_index)",
+        )
+    end
+    return keep_bases
 end
 
 function _facial_reduction_block_directions(
@@ -859,6 +957,23 @@ function _facial_reduction_oracle_round(
 ) where {HF<:AbstractFloat}
     oracle_point = _facial_reduction_oracle_attempt(opt, problem, HF)
     oracle_point === nothing && return nothing
+
+    exact_oracle_slack = _exact_facial_reduction_oracle_slack(opt, problem, oracle_point, HF)
+    if exact_oracle_slack !== nothing
+        scalar_slack_exact, block_slack_exact = exact_oracle_slack
+        exposed_scalars = sort([
+            index for index in problem.positive_scalars if
+            get(scalar_slack_exact, index, zero(ExactRational)) > 0 // 1
+        ])
+        keep_bases = _exact_oracle_keep_bases(opt, problem, block_slack_exact)
+        if !isempty(exposed_scalars) || !isempty(keep_bases)
+            _log(
+                opt,
+                "Facial reduction: oracle exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
+            )
+            return exposed_scalars, keep_bases
+        end
+    end
 
     scalar_slack, block_slack = _facial_reduction_slack(problem, oracle_point)
     exposure_tolerance = max(

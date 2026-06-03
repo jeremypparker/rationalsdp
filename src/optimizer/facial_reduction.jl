@@ -763,6 +763,7 @@ function _facial_reduction_oracle_attempt(
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
         tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
+            ;
             verbose = false,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
             tolerance_kwargs...,

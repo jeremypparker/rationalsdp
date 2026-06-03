@@ -982,7 +982,9 @@ include("slowtest_helpers.jl")
             verbose = false,
             working_float_type = Float64,
             facial_reduction_float_type = Float64,
+            phase1_hypatia_tol_rel_opt = big"1e-8",
         )
+        @test !isempty(RationalSDP._phase1_hypatia_tolerance_kwargs(opt.settings, Float64))
         candidate = Float64[0.0, 1.0]
 
         @test isempty(

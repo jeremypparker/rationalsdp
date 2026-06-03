@@ -1015,6 +1015,63 @@ include("slowtest_helpers.jl")
         @test [reduced_block.size for reduced_block in reduced_via_driver.blocks] == [1]
     end
 
+    @testset "Phase I dual slack evidence certifies scalar faces first" begin
+        block = RationalSDP.BlockStructure(
+            1,
+            Union{Nothing,MOI.VariableIndex}[nothing],
+            [2],
+            [(1, 1)],
+            [2],
+        )
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            [1],
+            Rational{BigInt}[0//1, 0//1],
+            0//1,
+            Rational{BigInt}[0//1, 0//1],
+            Rational{BigInt}[1//1 0//1; 0//1 1//1],
+            Rational{BigInt}[0//1, 1//1],
+            (
+                Rational{BigInt}[0//1, 1//1],
+                zeros(Rational{BigInt}, 2, 0),
+            ),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            working_float_type = Float64,
+            facial_reduction_float_type = Float64,
+        )
+        candidate = Float64[0.0, 1.0]
+        dual_slack = Float64[1.0, 0.0]
+
+        evidence = RationalSDP._cheap_facial_reduction_evidence(candidate, dual_slack, Float64)
+        @test [item.kind for item in evidence] == [:dual_slack, :boundary_primal]
+
+        certified = RationalSDP._first_certified_facial_reduction(
+            opt,
+            problem,
+            evidence,
+            Float64,
+        )
+        @test certified !== nothing
+        @test certified.source == "Phase I cone dual"
+        @test certified.exposed_scalars == [1]
+        @test isempty(certified.keep_bases)
+
+        reduction = RationalSDP._certified_facial_reduction_from_initial_evidence(
+            opt,
+            problem,
+            candidate,
+            dual_slack,
+            Float64,
+        )
+        @test reduction !== nothing
+        exposed_scalars, keep_bases = reduction
+        @test exposed_scalars == [1]
+        @test isempty(keep_bases)
+    end
+
     @testset "SIRS facial reduction handles uncertified boundary candidates" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "working_float_type", Float64)

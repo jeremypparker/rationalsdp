@@ -32,7 +32,7 @@ RationalSDP currently supports:
 - Hypatia-backed or native Phase I feasibility search
 - exact affine elimination before the barrier solve
 - coordinate PSD face pruning for forced-boundary cases
-- optional facial-reduction passes with exact certification of reduced faces
+- optional facial-reduction passes with exact evidence certification
 - threaded PSD barrier assembly
 - SumOfSquares.jl models that bridge to supported JuMP/MOI constraints
 - one-parameter quasiconvex models where the objective parameter appears
@@ -94,9 +94,32 @@ value(t)      # close to 1//4, returned as an exact rational
 
 For larger SOS models, expect performance and robustness to depend strongly on
 the Gram basis and on whether the feasible set lies on a PSD face. The solver
-can prune some forced zero directions exactly, and can run facial reduction, but
-it skips numerical face directions that cannot be certified from the exact
-affine equations and PSD implications.
+can prune some forced zero directions exactly and can run facial reduction when
+the exposed face can be certified from exact problem data.
+
+## Facial Reduction
+
+When Phase I finds a numerical point on or near the cone boundary,
+RationalSDP tries to move the problem to a smaller exact face before Phase II.
+The reduction code treats numerical information as evidence and only applies a
+face after exact certification.
+
+The cheap evidence pass tries, in order:
+
+- a cone-dual slack returned by the Hypatia Phase I solve
+- kernel directions from the Phase I boundary point
+
+If those do not certify a reducing face, RationalSDP launches a separate
+Hypatia exposing-vector oracle. By default this oracle uses the same Hypatia
+float type, system solver, iteration limit, and tolerance settings as Phase I;
+`facial_reduction_float_type` can still override the oracle float type.
+
+Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
+expose a nonzero face, vanish on free coordinates, and have an exact affine-row
+certificate. PSD kernel directions are accepted only when the exact affine rows
+or PSD implications prove the direction is forced to zero. As a final fallback,
+RationalSDP may try a tentative rationalized kernel reduction, but it is kept
+only if the exact reduced affine system remains consistent.
 
 ## Quasiconvex One-Parameter Problems
 
@@ -225,8 +248,9 @@ Hypatia Phase I tolerance attributes use negative values to leave Hypatia's
 own defaults unchanged. The diagnostic attributes are off by default; enable
 `phase1_candidate_diagnostics` or `phase1_exact_recovery_diagnostics` when a
 model reaches a numerical boundary point but exact recovery fails. The
-`recovery_tolerance_shrink` setting controls how aggressively exact recovery
-tightens rationalization tolerances between attempts.
+separate facial-reduction oracle reuses the Phase I Hypatia settings by
+default. The `recovery_tolerance_shrink` setting controls how aggressively
+exact recovery tightens rationalization tolerances between attempts.
 
 ## Exactness Model
 
@@ -249,8 +273,8 @@ Important current limitations:
 - no general nonconvex quadratic support
 - quasiconvex support is restricted to one bounded objective parameter
 - exact recovery can fail on badly conditioned or nearly infeasible problems
-- facial reduction is partial and only applies faces certified from exact
-  affine equations, PSD diagonal identities, or PSD trace identities
+- facial reduction is partial and only applies faces certified exactly, with a
+  narrow consistency-checked fallback for rationalized boundary kernels
 - large SOS models can be slow
 
 Use established SDP solvers when you need broad conic coverage, dual
@@ -277,5 +301,6 @@ julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
 The test suite includes affine SDP models, exact rational output checks,
-SumOfSquares integration, PSD face-pruning cases, and quasiconvex parameter
-models.
+SumOfSquares integration, PSD face-pruning and facial-reduction cases,
+quasiconvex parameter models, and slow SOS regressions from larger log-domain
+examples.

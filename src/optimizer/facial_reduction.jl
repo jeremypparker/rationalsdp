@@ -62,14 +62,6 @@ function _block_quadratic_linear_form(
     return form
 end
 
-function _block_annihilates_direction_exact(
-    problem::ProblemData,
-    block::BlockStructure,
-    direction::Vector{ExactRational},
-)
-    return _block_annihilation_violation(problem, block, direction) === nothing
-end
-
 function _format_exact_direction(
     direction::Vector{ExactRational};
     max_entries::Int = 64,
@@ -1006,6 +998,21 @@ function _exact_facial_reduction_oracle_slack(
     return nothing
 end
 
+struct _FacialReductionEvidence{F<:AbstractFloat}
+    kind::Symbol
+    source::String
+    vector::Vector{F}
+end
+
+struct _CertifiedFacialReduction
+    source::String
+    exposed_scalars::Vector{Int}
+    keep_bases::Dict{Int,Matrix{ExactRational}}
+end
+
+_facial_reduction_tuple(reduction::_CertifiedFacialReduction) =
+    reduction.exposed_scalars, reduction.keep_bases
+
 function _exact_slack_keep_bases(
     opt::Optimizer,
     problem::ProblemData,
@@ -1029,15 +1036,7 @@ function _exact_slack_keep_bases(
     return keep_bases
 end
 
-function _exact_oracle_keep_bases(
-    opt::Optimizer,
-    problem::ProblemData,
-    block_slack::Dict{Int,Matrix{ExactRational}},
-)
-    return _exact_slack_keep_bases(opt, problem, block_slack, "oracle")
-end
-
-function _facial_reduction_from_exact_slack(
+function _certified_reduction_from_exact_slack(
     opt::Optimizer,
     problem::ProblemData,
     scalar_slack_exact::Dict{Int,ExactRational},
@@ -1054,36 +1053,35 @@ function _facial_reduction_from_exact_slack(
             opt,
             "Facial reduction: $(source) exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
         )
-        return exposed_scalars, keep_bases
+        return _CertifiedFacialReduction(source, exposed_scalars, keep_bases)
     end
     return nothing
 end
 
-function _facial_reduction_phase1_dual_round(
+function _certify_dual_slack_evidence(
     opt::Optimizer,
     problem::ProblemData,
-    phase1_dual_slack::Union{Nothing,Vector{F}},
+    evidence::_FacialReductionEvidence{F},
     ::Type{F},
 ) where {F<:AbstractFloat}
-    phase1_dual_slack === nothing && return nothing
     exact_slack = _exact_exposing_slack_from_numeric_slack(
         opt,
         problem,
-        phase1_dual_slack,
+        evidence.vector,
         F,
-        "Phase I cone dual",
+        evidence.source,
     )
     if exact_slack === nothing
-        _log(opt, "Facial reduction: no exact exposing slack recovered from Phase I cone dual")
+        _log(opt, "Facial reduction: no exact exposing slack recovered from $(evidence.source)")
         return nothing
     end
     scalar_slack_exact, block_slack_exact = exact_slack
-    return _facial_reduction_from_exact_slack(
+    return _certified_reduction_from_exact_slack(
         opt,
         problem,
         scalar_slack_exact,
         block_slack_exact,
-        "Phase I cone dual",
+        evidence.source,
     )
 end
 
@@ -1103,6 +1101,29 @@ function _facial_reduction_oracle_float_type(opt::Optimizer, problem::ProblemDat
         return Float64
     end
     return configured_type
+end
+
+function _certify_boundary_primal_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence::_FacialReductionEvidence{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+
+    for (block_index, block) in enumerate(problem.blocks)
+        matrix = _vector_to_matrix(evidence.vector, block)
+        directions = _candidate_kernel_directions(opt, problem, block_index, matrix, F)
+        isempty(directions) && continue
+        keep_basis = _orthogonal_complement_basis(directions, block.size)
+        if size(keep_basis, 2) == problem.blocks[block_index].size
+            continue
+        end
+        keep_bases[block_index] = keep_basis
+    end
+
+    isempty(keep_bases) && return nothing
+    return _CertifiedFacialReduction(evidence.source, Int[], keep_bases)
 end
 
 function _facial_reduction_block_directions(
@@ -1179,6 +1200,85 @@ function _facial_reduction_block_directions(
     return exact_directions
 end
 
+function _certify_oracle_point_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence::_FacialReductionEvidence{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    exact_oracle_slack = _exact_facial_reduction_oracle_slack(
+        opt,
+        problem,
+        evidence.vector,
+        F,
+    )
+    if exact_oracle_slack !== nothing
+        scalar_slack_exact, block_slack_exact = exact_oracle_slack
+        reduction = _certified_reduction_from_exact_slack(
+            opt,
+            problem,
+            scalar_slack_exact,
+            block_slack_exact,
+            evidence.source,
+        )
+        reduction === nothing || return reduction
+    end
+
+    _, block_slack = _facial_reduction_slack(problem, evidence.vector)
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for block_index in eachindex(problem.blocks)
+        directions = _facial_reduction_block_directions(
+            opt,
+            problem,
+            block_index,
+            block_slack[block_index],
+            F,
+        )
+        isempty(directions) && continue
+        keep_basis = _orthogonal_complement_basis(directions, problem.blocks[block_index].size)
+        if size(keep_basis, 2) == problem.blocks[block_index].size
+            continue
+        end
+        keep_bases[block_index] = keep_basis
+    end
+
+    isempty(keep_bases) && return nothing
+    _log(
+        opt,
+        "Facial reduction: $(evidence.source) exposed 0 scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
+    )
+    return _CertifiedFacialReduction(evidence.source, Int[], keep_bases)
+end
+
+function _certify_facial_reduction_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence::_FacialReductionEvidence{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    evidence.kind == :dual_slack &&
+        return _certify_dual_slack_evidence(opt, problem, evidence, F)
+    evidence.kind == :boundary_primal &&
+        return _certify_boundary_primal_evidence(opt, problem, evidence, F)
+    evidence.kind == :oracle_point &&
+        return _certify_oracle_point_evidence(opt, problem, evidence, F)
+    error("Unhandled facial reduction evidence kind $(evidence.kind).")
+end
+
+function _first_certified_facial_reduction(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence_list::Vector{_FacialReductionEvidence{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    for evidence in evidence_list
+        reduction = _certify_facial_reduction_evidence(opt, problem, evidence, F)
+        reduction === nothing && continue
+        return reduction
+    end
+    return nothing
+end
+
 function _face_reduction_rows(
     block::BlockStructure,
     keep_basis::Matrix{ExactRational},
@@ -1224,56 +1324,43 @@ function _facial_reduction_oracle_round(
     oracle_point = _facial_reduction_oracle_attempt(opt, problem, HF)
     oracle_point === nothing && return nothing
 
-    exact_oracle_slack = _exact_facial_reduction_oracle_slack(opt, problem, oracle_point, HF)
-    if exact_oracle_slack !== nothing
-        scalar_slack_exact, block_slack_exact = exact_oracle_slack
-        exposed_scalars = sort([
-            index for index in problem.positive_scalars if
-            get(scalar_slack_exact, index, zero(ExactRational)) > 0 // 1
-        ])
-        keep_bases = _exact_oracle_keep_bases(opt, problem, block_slack_exact)
-        if !isempty(exposed_scalars) || !isempty(keep_bases)
-            _log(
-                opt,
-                "Facial reduction: oracle exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
-            )
-            return exposed_scalars, keep_bases
-        end
-    end
+    evidence = _FacialReductionEvidence(:oracle_point, "oracle", oracle_point)
+    reduction = _certify_facial_reduction_evidence(opt, problem, evidence, HF)
+    reduction === nothing && return nothing
+    return _facial_reduction_tuple(reduction)
+end
 
-    scalar_slack, block_slack = _facial_reduction_slack(problem, oracle_point)
-    exposure_tolerance = max(
-        _to_working_float(HF, opt.settings.facial_reduction_exposure_tolerance),
-        HF(100) * eps(HF),
-    )
-    exposed_scalars = sort([
-        index for index in problem.positive_scalars if
-        get(scalar_slack, index, zero(HF)) > exposure_tolerance
-    ])
-
-    keep_bases = Dict{Int,Matrix{ExactRational}}()
-    for block_index in eachindex(problem.blocks)
-        directions = _facial_reduction_block_directions(
-            opt,
-            problem,
-            block_index,
-            block_slack[block_index],
-            HF,
+function _cheap_facial_reduction_evidence(
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    evidence = _FacialReductionEvidence{F}[]
+    if phase1_dual_slack !== nothing
+        push!(
+            evidence,
+            _FacialReductionEvidence(:dual_slack, "Phase I cone dual", phase1_dual_slack),
         )
-        isempty(directions) && continue
-        keep_basis = _orthogonal_complement_basis(directions, problem.blocks[block_index].size)
-        if size(keep_basis, 2) == problem.blocks[block_index].size
-            continue
-        end
-        keep_bases[block_index] = keep_basis
     end
+    push!(evidence, _FacialReductionEvidence(:boundary_primal, "Phase I boundary point", candidate))
+    return evidence
+end
 
-    isempty(exposed_scalars) && isempty(keep_bases) && return nothing
-    _log(
+function _certified_facial_reduction_from_initial_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    reduction = _first_certified_facial_reduction(
         opt,
-        "Facial reduction: oracle exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
+        problem,
+        _cheap_facial_reduction_evidence(candidate, phase1_dual_slack, F),
+        F,
     )
-    return exposed_scalars, keep_bases
+    reduction === nothing && return nothing
+    return _facial_reduction_tuple(reduction)
 end
 
 function _face_membership_rows(
@@ -1431,36 +1518,17 @@ function _facial_reduction_round(
     ::Type{F},
 ) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
-    keep_bases = Dict{Int,Matrix{ExactRational}}()
-
-    for (block_index, block) in enumerate(problem.blocks)
-        matrix = _vector_to_matrix(candidate, block)
-        directions = _candidate_kernel_directions(opt, problem, block_index, matrix, F)
-        isempty(directions) && continue
-        keep_basis = _orthogonal_complement_basis(directions, block.size)
-        if size(keep_basis, 2) == problem.blocks[block_index].size
-            continue
-        end
-        keep_bases[block_index] = keep_basis
-    end
-
-    isempty(keep_bases) || return Int[], keep_bases
-    if phase1_dual_slack !== nothing
-        _log(
-            opt,
-            "Facial reduction: candidate kernel search found no exact face directions; trying Phase I cone dual slack",
-        )
-        reduction = _facial_reduction_phase1_dual_round(
-            opt,
-            problem,
-            phase1_dual_slack,
-            F,
-        )
-        reduction === nothing || return reduction
-    end
+    reduction = _certified_facial_reduction_from_initial_evidence(
+        opt,
+        problem,
+        candidate,
+        phase1_dual_slack,
+        F,
+    )
+    reduction === nothing || return reduction
     _log(
         opt,
-        "Facial reduction: trying exposing-vector oracle",
+        "Facial reduction: initial evidence found no exact reducing face; trying exposing-vector oracle",
     )
     return _facial_reduction_oracle_round(
         opt,

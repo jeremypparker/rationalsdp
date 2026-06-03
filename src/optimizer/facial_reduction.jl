@@ -481,7 +481,7 @@ function _candidate_kernel_directions(
         if rejected_heuristics > 0
             _log(
                 opt,
-                "Facial reduction: rejected $(rejected_heuristics) rationalized boundary kernel direction(s) for PSD block $(block_index); no uncertified heuristic face will be applied",
+                "Facial reduction: rejected $(rejected_heuristics) rationalized boundary kernel direction(s) for PSD block $(block_index); deferring uncertified directions to tentative fallback",
             )
             return Vector{ExactRational}[]
         end
@@ -497,6 +497,102 @@ function _candidate_kernel_directions(
     end
 
     return exact_directions
+end
+
+function _heuristic_kernel_direction_candidates(
+    opt::Optimizer,
+    problem::ProblemData,
+    block_index::Int,
+    block_matrix::Matrix{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    block = problem.blocks[block_index]
+    symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
+    eigen_factor = eigen(symmetric_matrix)
+    exposure_tolerance = max(
+        _to_working_float(F, opt.settings.facial_reduction_exposure_tolerance),
+        F(100) * eps(F),
+    )
+    kernel_indices = [
+        index for (index, value) in enumerate(eigen_factor.values) if abs(value) <= exposure_tolerance
+    ]
+    isempty(kernel_indices) && return NamedTuple[]
+
+    candidates = NamedTuple[]
+    for kernel_index in sort(kernel_indices; by = index -> abs(eigen_factor.values[index]))
+        heuristic = _heuristic_kernel_direction(
+            block_matrix,
+            collect(view(eigen_factor.vectors, :, kernel_index)),
+            opt.settings,
+            F,
+        )
+        heuristic === nothing && continue
+        push!(
+            candidates,
+            (
+                residual = heuristic.residual,
+                eigenvalue = eigen_factor.values[kernel_index],
+                tolerance = heuristic.tolerance,
+                block_index = block_index,
+                direction = heuristic.direction,
+            ),
+        )
+    end
+    return candidates
+end
+
+function _tentative_facial_reduction_problem(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    candidates = NamedTuple[]
+    for (block_index, block) in enumerate(problem.blocks)
+        matrix = _vector_to_matrix(candidate, block)
+        append!(
+            candidates,
+            _heuristic_kernel_direction_candidates(opt, problem, block_index, matrix, F),
+        )
+    end
+    sort!(candidates; by = item -> (abs(item.residual), abs(item.eigenvalue), item.block_index))
+
+    for item in candidates
+        keep_basis = _orthogonal_complement_basis(
+            [item.direction],
+            problem.blocks[item.block_index].size,
+        )
+        reduced_problem = _apply_facial_reduction(
+            problem,
+            Int[],
+            Dict(item.block_index => keep_basis),
+        )
+        if reduced_problem.affine === nothing
+            _log(
+                opt,
+                "Facial reduction: rejected tentative rationalized boundary kernel direction for PSD block $(item.block_index); exact reduced affine system is inconsistent",
+            )
+            continue
+        end
+        _log(
+            opt,
+            "Facial reduction: using tentative rationalized boundary kernel direction for PSD block $(item.block_index) (eig=$(_format_metric(item.eigenvalue)), residual=$(_format_metric(item.residual)), rationalize_tol=$(_format_metric(item.tolerance))); exact reduced affine system is consistent",
+        )
+        _log(opt, "facial reduction: fixed 0 scalar cone direction(s) and removed 1 PSD direction(s)")
+        return reduced_problem
+    end
+
+    isempty(candidates) || _log(
+        opt,
+        "Facial reduction: rejected $(length(candidates)) tentative rationalized boundary kernel direction(s)",
+    )
+    return nothing
+end
+
+function _is_inexact_facial_reduction_error(err)
+    err isa ErrorException || return false
+    message = err.msg
+    return occursin("could not be represented exactly over the rational coefficient field", message)
 end
 
 const _PHASE1_DIAGNOSTIC_THRESHOLDS = BigFloat[
@@ -672,19 +768,23 @@ function _facial_reduction_oracle_attempt(
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         model = _build_facial_reduction_oracle(problem, HF)
-        syssolver, use_dense_model, _ = _hypatia_phase1_syssolver(opt.settings, HF)
+        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
+        tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
             verbose = false,
             iter_limit = opt.settings.phase1_hypatia_iter_limit,
-            preprocess = true,
-            reduce = true,
+            tolerance_kwargs...,
+            preprocess = preprocess,
+            reduce = false,
             syssolver = syssolver,
             use_dense_model = use_dense_model,
         )
         start_time = time_ns()
         try
-            Hypatia.Solvers.load(solver, model)
-            Hypatia.Solvers.solve(solver)
+            _with_filtered_hypatia_logger() do
+                Hypatia.Solvers.load(solver, model)
+                Hypatia.Solvers.solve(solver)
+            end
         catch err
             _log(
                 opt,
@@ -769,6 +869,87 @@ function _facial_reduction_oracle_equalities(problem::ProblemData)
     return transpose(hcat(equality_rows...)), equality_rhs
 end
 
+function _slack_has_exposure(
+    scalar_slack::Dict{Int,ExactRational},
+    block_slack::Dict{Int,Matrix{ExactRational}},
+)
+    any(value -> value > 0 // 1, values(scalar_slack)) && return true
+    return any(matrix -> any(!iszero, matrix), values(block_slack))
+end
+
+function _dual_slack_has_exact_certificate(
+    problem::ProblemData,
+    slack::Vector{ExactRational},
+)
+    certificate_matrix = zeros(
+        ExactRational,
+        length(slack) + 1,
+        size(problem.A, 1),
+    )
+    certificate_matrix[1:length(slack), :] = transpose(problem.A)
+    certificate_matrix[end, :] = transpose(problem.b)
+    certificate_rhs = vcat(slack, 0 // 1)
+    return _solve_affine_system(certificate_matrix, certificate_rhs) !== nothing
+end
+
+function _exact_exposing_slack_from_numeric_slack(
+    opt::Optimizer,
+    problem::ProblemData,
+    numeric_slack::AbstractVector{F},
+    ::Type{F},
+    source::AbstractString,
+) where {F<:AbstractFloat}
+    length(numeric_slack) == length(problem.objective_vector_raw) || return nothing
+    all(isfinite, numeric_slack) || return nothing
+
+    free_positions = _facial_reduction_free_positions(problem)
+    for tolerance in _facial_reduction_oracle_tolerances(opt.settings, F)
+        slack = ExactRational[
+            rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
+            value in numeric_slack
+        ]
+        all(index -> iszero(slack[index]), free_positions) || continue
+
+        scalar_slack = Dict{Int,ExactRational}()
+        for index in problem.positive_scalars
+            scalar_slack[index] = slack[index]
+        end
+        all(value -> value >= 0 // 1, values(scalar_slack)) || continue
+
+        block_slack = Dict{Int,Matrix{ExactRational}}()
+        for (block_index, block) in enumerate(problem.blocks)
+            block_slack[block_index] = _dual_vector_to_matrix(slack, block)
+        end
+        all(matrix -> _positive_semidefinite_exact(matrix), values(block_slack)) || continue
+        _slack_has_exposure(scalar_slack, block_slack) || continue
+        _dual_slack_has_exact_certificate(problem, slack) || continue
+
+        _log(
+            opt,
+            "Facial reduction: recovered exact exposing slack from $(source) (tol=$(_format_metric(tolerance)))",
+        )
+        return scalar_slack, block_slack
+    end
+
+    return nothing
+end
+
+function _exact_facial_reduction_oracle_slack_from_rounded_slack(
+    opt::Optimizer,
+    problem::ProblemData,
+    oracle_point::Vector{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    numeric_slack = transpose(_to_working_array(F, problem.A)) * oracle_point
+    return _exact_exposing_slack_from_numeric_slack(
+        opt,
+        problem,
+        numeric_slack,
+        F,
+        "oracle dual slack",
+    )
+end
+
 function _exact_facial_reduction_oracle_slack(
     opt::Optimizer,
     problem::ProblemData,
@@ -813,14 +994,23 @@ function _exact_facial_reduction_oracle_slack(
         return scalar_slack, block_slack
     end
 
+    rounded_slack = _exact_facial_reduction_oracle_slack_from_rounded_slack(
+        opt,
+        problem,
+        oracle_point,
+        F,
+    )
+    rounded_slack === nothing || return rounded_slack
+
     _log(opt, "Facial reduction oracle: no exact exposing-vector certificate recovered")
     return nothing
 end
 
-function _exact_oracle_keep_bases(
+function _exact_slack_keep_bases(
     opt::Optimizer,
     problem::ProblemData,
     block_slack::Dict{Int,Matrix{ExactRational}},
+    source::AbstractString,
 )
     keep_bases = Dict{Int,Matrix{ExactRational}}()
     for (block_index, block) in enumerate(problem.blocks)
@@ -833,10 +1023,86 @@ function _exact_oracle_keep_bases(
         keep_bases[block_index] = keep_basis
         _log(
             opt,
-            "Facial reduction: oracle certified exact exposed face for PSD block $(block_index)",
+            "Facial reduction: $(source) certified exact exposed face for PSD block $(block_index)",
         )
     end
     return keep_bases
+end
+
+function _exact_oracle_keep_bases(
+    opt::Optimizer,
+    problem::ProblemData,
+    block_slack::Dict{Int,Matrix{ExactRational}},
+)
+    return _exact_slack_keep_bases(opt, problem, block_slack, "oracle")
+end
+
+function _facial_reduction_from_exact_slack(
+    opt::Optimizer,
+    problem::ProblemData,
+    scalar_slack_exact::Dict{Int,ExactRational},
+    block_slack_exact::Dict{Int,Matrix{ExactRational}},
+    source::AbstractString,
+)
+    exposed_scalars = sort([
+        index for index in problem.positive_scalars if
+        get(scalar_slack_exact, index, zero(ExactRational)) > 0 // 1
+    ])
+    keep_bases = _exact_slack_keep_bases(opt, problem, block_slack_exact, source)
+    if !isempty(exposed_scalars) || !isempty(keep_bases)
+        _log(
+            opt,
+            "Facial reduction: $(source) exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
+        )
+        return exposed_scalars, keep_bases
+    end
+    return nothing
+end
+
+function _facial_reduction_phase1_dual_round(
+    opt::Optimizer,
+    problem::ProblemData,
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    phase1_dual_slack === nothing && return nothing
+    exact_slack = _exact_exposing_slack_from_numeric_slack(
+        opt,
+        problem,
+        phase1_dual_slack,
+        F,
+        "Phase I cone dual",
+    )
+    if exact_slack === nothing
+        _log(opt, "Facial reduction: no exact exposing slack recovered from Phase I cone dual")
+        return nothing
+    end
+    scalar_slack_exact, block_slack_exact = exact_slack
+    return _facial_reduction_from_exact_slack(
+        opt,
+        problem,
+        scalar_slack_exact,
+        block_slack_exact,
+        "Phase I cone dual",
+    )
+end
+
+function _facial_reduction_oracle_float_type(opt::Optimizer, problem::ProblemData)
+    if opt.settings.facial_reduction_float_type !== AbstractFloat
+        return _facial_reduction_float_type(opt.settings)
+    end
+
+    configured_type = _phase1_hypatia_float_type(opt.settings)
+    if _phase1_hypatia_float_type_is_auto(opt.settings) &&
+       configured_type != Float64 &&
+       _phase1_hypatia_prefers_sparse_float64(problem)
+        _log(
+            opt,
+            "Facial reduction oracle: using Float64 sparse linear algebra for this large sparse model",
+        )
+        return Float64
+    end
+    return configured_type
 end
 
 function _facial_reduction_block_directions(
@@ -1154,6 +1420,16 @@ function _facial_reduction_round(
     candidate::Vector{F},
     ::Type{F},
 ) where {F<:AbstractFloat}
+    return _facial_reduction_round(opt, problem, candidate, nothing, F)
+end
+
+function _facial_reduction_round(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
     keep_bases = Dict{Int,Matrix{ExactRational}}()
 
@@ -1169,14 +1445,27 @@ function _facial_reduction_round(
     end
 
     isempty(keep_bases) || return Int[], keep_bases
+    if phase1_dual_slack !== nothing
+        _log(
+            opt,
+            "Facial reduction: candidate kernel search found no exact face directions; trying Phase I cone dual slack",
+        )
+        reduction = _facial_reduction_phase1_dual_round(
+            opt,
+            problem,
+            phase1_dual_slack,
+            F,
+        )
+        reduction === nothing || return reduction
+    end
     _log(
         opt,
-        "Facial reduction: candidate kernel search found no exact face directions; trying exposing-vector oracle",
+        "Facial reduction: trying exposing-vector oracle",
     )
     return _facial_reduction_oracle_round(
         opt,
         problem,
-        _facial_reduction_float_type(opt.settings),
+        _facial_reduction_oracle_float_type(opt, problem),
     )
 end
 
@@ -1186,9 +1475,35 @@ function _facially_reduce_problem(
     candidate::Vector{F},
     ::Type{F},
 ) where {F<:AbstractFloat}
+    return _facially_reduce_problem(opt, problem, candidate, nothing, F)
+end
+
+function _facially_reduce_problem(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
     opt.settings.facial_reduction || return problem
-    reduction = _facial_reduction_round(opt, problem, candidate, F)
-    reduction === nothing && return problem
+    reduction = try
+        _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
+    catch err
+        if _is_inexact_facial_reduction_error(err)
+            _log(
+                opt,
+                "Facial reduction: exact face recovery failed for a non-coordinate face; trying tentative rationalized kernel direction",
+            )
+            nothing
+        else
+            rethrow()
+        end
+    end
+    if reduction === nothing
+        tentative_problem = _tentative_facial_reduction_problem(opt, problem, candidate, F)
+        tentative_problem === nothing && return problem
+        return tentative_problem
+    end
     exposed_scalars, keep_bases = reduction
     removed_psd_directions = sum(
         (problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases));

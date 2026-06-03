@@ -158,4 +158,53 @@ end
         @test termination_status(model) == MOI.OPTIMAL
         @test primal_status(model) == MOI.FEASIBLE_POINT
     end
+
+    @testset "SIS log-domain full Volterra SOS feasibility with facial reduction" begin
+        model = rational_model(Rational{BigInt})
+
+        @polyvar i n l m
+
+        gamma = 1 // 10
+        mu = 1 // 10
+        beta = 1 // 1
+        delta = 0 // 1
+        Lambda = mu
+
+        R0 = Lambda * beta / (mu * (mu + delta + gamma))
+        S1 = Lambda / (mu * R0)
+        I1 = mu * (delta + gamma + mu) * (R0 - 1) / (beta * (delta + mu))
+
+        s = -i - n
+        S = s + S1
+        I = i + I1
+
+        dSdt = Lambda + gamma * I - beta * S * I - mu * S
+        dIdt = beta * S * I - (delta + gamma + mu) * I
+        dndt = -dSdt - dIdt
+
+        basisV = monomials([i, n, l, m], 0:2)
+        @variable(model, coeffsV[1:length(basisV)])
+        V = dot(basisV, coeffsV)
+
+        SIdVdt =
+            S * I * differentiate(V, i) * dIdt +
+            S * I * differentiate(V, n) * dndt +
+            I * differentiate(V, l) * (s * dSdt) +
+            S * differentiate(V, m) * (i * dIdt)
+
+        D = @set S >= 0 &&
+                 I >= 0 &&
+                 n >= 0 &&
+                 l >= 0 &&
+                 m >= 0
+
+        @constraint(model, V(i => 0, n => 0, l => 0, m => 0) == 0)
+        @constraint(model, V >= l + m, SOSCone(), domain = D)
+        @constraint(model, -S * I * (s^2 + i^2) - SIdVdt >= 0, SOSCone(), domain = D)
+
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+    end
 end

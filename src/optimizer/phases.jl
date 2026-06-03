@@ -761,6 +761,36 @@ function _build_hypatia_phase1_model(
     return Hypatia.Models.Model{F}(c, A_reduced, b_reduced, G, h, cones)
 end
 
+function _phase1_dual_slack_from_cone_dual(
+    problem::ProblemData,
+    cone_dual::AbstractVector{F},
+) where {F<:AbstractFloat}
+    expected_length =
+        length(problem.positive_scalars) +
+        2 +
+        sum((length(block.local_positions) for block in problem.blocks); init = 0)
+    length(cone_dual) == expected_length || return nothing
+
+    slack = zeros(F, length(problem.objective_vector_raw))
+    row = 1
+    for position in problem.positive_scalars
+        slack[position] = cone_dual[row]
+        row += 1
+    end
+
+    row += 2
+    rt2 = sqrt(F(2))
+    for block in problem.blocks
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            scale = i == j ? one(F) : rt2
+            slack[block.global_positions[local_index]] = scale * cone_dual[row]
+            row += 1
+        end
+    end
+
+    return slack
+end
+
 function _phase1_hypatia_margin_caps(problem::ProblemData, settings::Settings)
     max_cap = settings.phase1_hypatia_margin_upper
     min_cap = settings.phase1_hypatia_min_margin_upper
@@ -887,6 +917,16 @@ function _phase1_hypatia_anchor_once(
         catch
             nothing
         end
+        raw_cone_dual = try
+            copy(Hypatia.Solvers.get_z(solver))
+        catch
+            nothing
+        end
+        dual_slack = if raw_cone_dual === nothing || !all(isfinite, raw_cone_dual)
+            nothing
+        else
+            _phase1_dual_slack_from_cone_dual(problem, raw_cone_dual)
+        end
 
         if raw_solution === nothing || length(raw_solution) != solution_length
             solver = nothing
@@ -895,6 +935,7 @@ function _phase1_hypatia_anchor_once(
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 nothing,
+                dual_slack,
                 string(status),
                 iterations,
                 nothing,
@@ -910,6 +951,7 @@ function _phase1_hypatia_anchor_once(
         margin = raw_solution[end]
         raw_solution_finite = all(isfinite, raw_solution)
         raw_solution = nothing
+        raw_cone_dual = nothing
         solver = nothing
         model = nothing
         _gc_checkpoint!(opt, "after Hypatia solve")
@@ -931,6 +973,7 @@ function _phase1_hypatia_anchor_once(
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 candidate,
+                dual_slack,
                 string(status),
                 iterations,
                 margin,
@@ -949,6 +992,7 @@ function _phase1_hypatia_anchor_once(
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 candidate,
+                dual_slack,
                 string(status),
                 iterations,
                 margin,
@@ -975,6 +1019,7 @@ function _phase1_hypatia_anchor_once(
             attempt = Phase1HypatiaAttempt{HF}(
                 anchor,
                 candidate,
+                dual_slack,
                 string(status),
                 iterations,
                 margin,
@@ -989,6 +1034,7 @@ function _phase1_hypatia_anchor_once(
             attempt = Phase1HypatiaAttempt{HF}(
                 nothing,
                 candidate,
+                dual_slack,
                 string(status),
                 iterations,
                 margin,
@@ -1022,6 +1068,7 @@ function _phase1_hypatia_anchor_once(
         attempt = Phase1HypatiaAttempt{HF}(
             anchor,
             candidate,
+            dual_slack,
             string(status),
             iterations,
             margin,
@@ -1106,6 +1153,7 @@ function _phase1_anchor_attempt(
     phase1_margin = nothing
     phase1_residual = nothing
     phase1_status = nothing
+    phase1_dual_slack = nothing
 
     if _phase1_backend(opt.settings) == :hypatia
         _log(opt, "Phase I via Hypatia")
@@ -1120,6 +1168,9 @@ function _phase1_anchor_attempt(
             phase1_margin = attempt.margin
             phase1_residual = attempt.residual
             phase1_status = attempt.status
+            if attempt.dual_slack !== nothing
+                phase1_dual_slack = _to_working_array(F, attempt.dual_slack)
+            end
             if attempt.candidate !== nothing
                 phase1_candidate = _to_working_array(F, attempt.candidate)
                 phase2_initial_point = _to_working_array(F, attempt.candidate)
@@ -1220,6 +1271,7 @@ function _phase1_anchor_attempt(
         phase1_margin = phase1_margin,
         phase1_residual = phase1_residual,
         phase1_status = phase1_status,
+        phase1_dual_slack = phase1_dual_slack,
     )
 end
 

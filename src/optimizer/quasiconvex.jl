@@ -824,13 +824,20 @@ function _quasiconvex_feasible_point(
     phase1_result = _phase1_anchor_attempt(opt, problem, F)
     anchor = phase1_result.anchor
     phase1_candidate = phase1_result.phase1_candidate
+    phase1_dual_slack = phase1_result.phase1_dual_slack
 
     facial_reduction_round = 0
     while anchor === nothing &&
           facial_reduction &&
           phase1_candidate !== nothing &&
           facial_reduction_round < opt.settings.facial_reduction_max_rounds
-        reduced_problem = _facially_reduce_problem(opt, problem, phase1_candidate, F)
+        reduced_problem = _facially_reduce_problem(
+            opt,
+            problem,
+            phase1_candidate,
+            phase1_dual_slack,
+            F,
+        )
         problem_changed =
             length(reduced_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
             size(reduced_problem.A) != size(problem.A) ||
@@ -841,6 +848,7 @@ function _quasiconvex_feasible_point(
         phase1_result = _phase1_anchor_attempt(opt, problem, F)
         anchor = phase1_result.anchor
         phase1_candidate = phase1_result.phase1_candidate
+        phase1_dual_slack = phase1_result.phase1_dual_slack
     end
 
     return (anchor = anchor, facial_reduction_rounds = facial_reduction_round)

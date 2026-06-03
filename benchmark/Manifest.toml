@@ -1,6 +1,6 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.6"
 manifest_format = "2.0"
 project_hash = "e7469ba74f4af4ed907ee472066d73c81962a894"
 
@@ -489,7 +489,7 @@ uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
 
 [[deps.RationalSDP]]
-deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "MathOptInterface", "Printf", "SparseArrays"]
+deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "Printf", "SparseArrays"]
 path = ".."
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"

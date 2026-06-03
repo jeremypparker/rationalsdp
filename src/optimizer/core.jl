@@ -41,7 +41,7 @@ Base.@kwdef mutable struct Settings
     phase1_exact_recovery_pivot_log_frequency::Int = 10
     working_float_type::DataType = Double64
     facial_reduction::Bool = true
-    facial_reduction_max_rounds::Int = 8
+    facial_reduction_max_rounds::Int = 24
     facial_reduction_float_type::DataType = AbstractFloat
     facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"
@@ -130,6 +130,7 @@ end
 struct Phase1HypatiaAttempt{F<:AbstractFloat}
     anchor::Union{Nothing,Vector{ExactRational}}
     candidate::Union{Nothing,Vector{F}}
+    dual_slack::Union{Nothing,Vector{F}}
     status::String
     iterations::Int
     margin::Union{Nothing,F}
@@ -238,10 +239,12 @@ struct _HypatiaCenteringWarningFilter <: Logging.AbstractLogger
     logger::Logging.AbstractLogger
 end
 
-function _is_hypatia_centering_warning(level, message, _module)
-    return level == Logging.Warn &&
-           startswith(string(_module), "Hypatia") &&
-           occursin("cannot step in centering direction", string(message))
+function _is_filtered_hypatia_warning(level, message, _module)
+    level == Logging.Warn || return false
+    startswith(string(_module), "Hypatia") || return false
+    message_text = string(message)
+    return occursin("cannot step in centering direction", message_text) ||
+           occursin("some dual equalities appear to be dependent", message_text)
 end
 
 Logging.min_enabled_level(logger::_HypatiaCenteringWarningFilter) =
@@ -269,7 +272,7 @@ function Logging.handle_message(
     line;
     kwargs...,
 )
-    if _is_hypatia_centering_warning(level, message, _module)
+    if _is_filtered_hypatia_warning(level, message, _module)
         return
     end
     return Logging.handle_message(

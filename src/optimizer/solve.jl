@@ -167,6 +167,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         anchor = phase1_result.anchor
         phase2_initial_point = phase1_result.phase2_initial_point
         phase1_candidate = phase1_result.phase1_candidate
+        phase1_dual_slack = phase1_result.phase1_dual_slack
 
         facial_reduction_round = 0
         while anchor === nothing &&
@@ -174,7 +175,13 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
               phase1_candidate !== nothing &&
               facial_reduction_round < opt.settings.facial_reduction_max_rounds
             _log(opt, "Attempting facial reduction")
-            reduced_problem = _facially_reduce_problem(opt, problem, phase1_candidate, F)
+            reduced_problem = _facially_reduce_problem(
+                opt,
+                problem,
+                phase1_candidate,
+                phase1_dual_slack,
+                F,
+            )
             problem_changed =
                 length(reduced_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
                 size(reduced_problem.A) != size(problem.A) ||
@@ -188,6 +195,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             anchor = phase1_result.anchor
             phase2_initial_point = phase1_result.phase2_initial_point
             phase1_candidate = phase1_result.phase1_candidate
+            phase1_dual_slack = phase1_result.phase1_dual_slack
         end
 
         if problem.affine === nothing

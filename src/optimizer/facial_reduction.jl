@@ -701,7 +701,9 @@ function _build_facial_reduction_oracle(
 ) where {F<:AbstractFloat}
     row_count = size(problem.A, 1)
     cone_positions = _phase1_active_positions(problem)
-    equality_matrix, equality_rhs = _facial_reduction_oracle_equalities(problem)
+    oracle_equalities = _facial_reduction_oracle_equalities(problem)
+    oracle_equalities === nothing && return nothing
+    equality_matrix, equality_rhs = oracle_equalities
     A_eq = _to_working_sparse_matrix(F, equality_matrix)
     b_eq = _to_working_array(F, equality_rhs)
 
@@ -760,6 +762,10 @@ function _facial_reduction_oracle_attempt(
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         model = _build_facial_reduction_oracle(problem, HF)
+        if model === nothing
+            _log(opt, "Facial reduction oracle unavailable: exact normalization equalities are inconsistent")
+            return nothing
+        end
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
         tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
@@ -859,7 +865,8 @@ function _facial_reduction_oracle_equalities(problem::ProblemData)
     push!(equality_rows, _facial_reduction_trace_row(problem))
     push!(equality_rhs, 1 // 1)
 
-    return transpose(hcat(equality_rows...)), equality_rhs
+    equality_matrix = Matrix(transpose(hcat(equality_rows...)))
+    return _independent_affine_equalities(equality_matrix, equality_rhs)
 end
 
 function _slack_has_exposure(
@@ -951,7 +958,9 @@ function _exact_facial_reduction_oracle_slack(
 ) where {F<:AbstractFloat}
     free_positions = _facial_reduction_free_positions(problem)
     trace_row = _facial_reduction_trace_row(problem)
-    equality_matrix, equality_rhs = _facial_reduction_oracle_equalities(problem)
+    oracle_equalities = _facial_reduction_oracle_equalities(problem)
+    oracle_equalities === nothing && return nothing
+    equality_matrix, equality_rhs = oracle_equalities
     oracle_affine = _solve_affine_system(Matrix(equality_matrix), equality_rhs)
     oracle_affine === nothing && return nothing
     particular, nullspace = oracle_affine

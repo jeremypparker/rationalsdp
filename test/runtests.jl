@@ -300,6 +300,20 @@ include("slowtest_helpers.jl")
         ]
         inconsistent_b = Rational{BigInt}[1//1, 3//1]
         @test RationalSDP._solve_affine_system(inconsistent_A, inconsistent_b) === nothing
+
+        redundant_A = Rational{BigInt}[
+            1//1 0//1
+            2//1 0//1
+            0//1 1//1
+            0//1 0//1
+        ]
+        redundant_b = Rational{BigInt}[1//1, 2//1, 3//1, 0//1]
+        independent = RationalSDP._independent_affine_equalities(redundant_A, redundant_b)
+        @test independent !== nothing
+        independent_A, independent_b = independent
+        @test independent_A == Rational{BigInt}[1//1 0//1; 0//1 1//1]
+        @test independent_b == Rational{BigInt}[1//1, 3//1]
+        @test RationalSDP._independent_affine_equalities(inconsistent_A, inconsistent_b) === nothing
     end
 
     @testset "Exact recovery tolerance controls" begin
@@ -968,14 +982,14 @@ include("slowtest_helpers.jl")
             MOI.VariableIndex[],
             [block],
             [1],
-            Rational{BigInt}[0//1, 0//1],
+            Rational{BigInt}[0//1, 0//1, 0//1],
             0//1,
-            Rational{BigInt}[0//1, 0//1],
-            Rational{BigInt}[1//1 0//1; 0//1 1//1],
+            Rational{BigInt}[0//1, 0//1, 0//1],
+            Rational{BigInt}[1//1 0//1 0//1; 0//1 1//1 0//1],
             Rational{BigInt}[0//1, 1//1],
             (
-                Rational{BigInt}[0//1, 1//1],
-                zeros(Rational{BigInt}, 2, 0),
+                Rational{BigInt}[0//1, 1//1, 0//1],
+                reshape(Rational{BigInt}[0//1, 0//1, 1//1], 3, 1),
             ),
         )
         opt = RationalSDP.Optimizer{Rational{BigInt}}(
@@ -985,7 +999,12 @@ include("slowtest_helpers.jl")
             phase1_hypatia_tol_rel_opt = big"1e-8",
         )
         @test !isempty(RationalSDP._phase1_hypatia_tolerance_kwargs(opt.settings, Float64))
-        candidate = Float64[0.0, 1.0]
+        candidate = Float64[0.0, 1.0, 0.0]
+        oracle_equalities = RationalSDP._facial_reduction_oracle_equalities(problem)
+        @test oracle_equalities !== nothing
+        equality_matrix, equality_rhs = oracle_equalities
+        @test size(equality_matrix, 1) == 2
+        @test equality_rhs == Rational{BigInt}[1//1, 0//1]
 
         @test isempty(
             RationalSDP._candidate_kernel_directions(

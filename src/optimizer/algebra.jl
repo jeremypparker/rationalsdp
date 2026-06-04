@@ -264,6 +264,37 @@ function _solve_affine_system(
     return affine
 end
 
+function _independent_affine_equalities(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+)
+    size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
+    isempty(b) && return A, b
+
+    reduced, _ = _rref(hcat(A, b))
+    rhs_column = size(A, 2) + 1
+    rows = Vector{Vector{ExactRational}}()
+    rhs = ExactRational[]
+    for row_index in axes(reduced, 1)
+        row = collect(view(reduced, row_index, 1:size(A, 2)))
+        if all(iszero, row)
+            iszero(reduced[row_index, rhs_column]) || return nothing
+            continue
+        end
+        push!(rows, row)
+        push!(rhs, reduced[row_index, rhs_column])
+    end
+
+    if isempty(rows)
+        return zeros(ExactRational, 0, size(A, 2)), ExactRational[]
+    end
+    reduced_A = zeros(ExactRational, length(rows), size(A, 2))
+    for (row_index, row) in enumerate(rows)
+        reduced_A[row_index, :] = row
+    end
+    return reduced_A, rhs
+end
+
 function _restrict_affine_system(
     affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
     rows::Matrix{ExactRational},

@@ -135,6 +135,19 @@ include("slowtest_helpers.jl")
 
         settings = RationalSDP.Settings(phase1_hypatia_tol_slow = big"-1")
         @test isempty(RationalSDP._phase1_hypatia_tolerance_kwargs(settings, Float64))
+
+        @test RationalSDP._facial_reduction_oracle_allows_candidate_status(
+            RationalSDP.Hypatia.Solvers.Optimal,
+        )
+        @test RationalSDP._facial_reduction_oracle_allows_candidate_status(
+            RationalSDP.Hypatia.Solvers.NearOptimal,
+        )
+        @test RationalSDP._facial_reduction_oracle_allows_candidate_status(
+            RationalSDP.Hypatia.Solvers.SlowProgress,
+        )
+        @test !RationalSDP._facial_reduction_oracle_allows_candidate_status(
+            RationalSDP.Hypatia.Solvers.PrimalInfeasible,
+        )
     end
 
     @testset "Hypatia centering warning filter" begin

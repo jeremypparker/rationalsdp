@@ -755,6 +755,14 @@ function _build_facial_reduction_oracle(
     return Hypatia.Models.Model{F}(c, A_eq, b_eq, G, h, cones)
 end
 
+function _facial_reduction_oracle_allows_candidate_status(status)
+    return status in (
+        Hypatia.Solvers.Optimal,
+        Hypatia.Solvers.NearOptimal,
+        Hypatia.Solvers.SlowProgress,
+    )
+end
+
 function _facial_reduction_oracle_attempt(
     opt::Optimizer,
     problem::ProblemData,
@@ -793,7 +801,7 @@ function _facial_reduction_oracle_attempt(
         end
         elapsed_sec = (time_ns() - start_time) / 1.0e9
         status = Hypatia.Solvers.get_status(solver)
-        if status ∉ (Hypatia.Solvers.Optimal, Hypatia.Solvers.NearOptimal)
+        if !_facial_reduction_oracle_allows_candidate_status(status)
             _log(
                 opt,
                 "Facial reduction oracle: status=$(status), time=$(@sprintf("%.2f", elapsed_sec))s",
@@ -807,9 +815,11 @@ function _facial_reduction_oracle_attempt(
         end
         candidate === nothing && return nothing
         all(isfinite, candidate) || return nothing
+        slow_progress_note =
+            status == Hypatia.Solvers.SlowProgress ? "; trying current iterate" : ""
         _log(
             opt,
-            "Facial reduction oracle: status=$(status), iter=$(Hypatia.Solvers.get_num_iters(solver)), time=$(@sprintf("%.2f", elapsed_sec))s",
+            "Facial reduction oracle: status=$(status), iter=$(Hypatia.Solvers.get_num_iters(solver)), time=$(@sprintf("%.2f", elapsed_sec))s$(slow_progress_note)",
         )
         return candidate
     end)

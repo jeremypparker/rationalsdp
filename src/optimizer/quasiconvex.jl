@@ -28,6 +28,9 @@ struct QuasiconvexRhsQuadraticPatch
 end
 
 struct QuasiconvexProblemTemplate
+    parameter::MOI.VariableIndex
+    parameter_lower::ExactRational
+    parameter_upper::ExactRational
     original_variables::Vector{MOI.VariableIndex}
     blocks::Vector{BlockStructure}
     positive_scalars::Vector{Int}
@@ -36,7 +39,7 @@ struct QuasiconvexProblemTemplate
     b_base::Vector{ExactRational}
     scalar_constraint_rows::Dict{Any,Vector{Int}}
     psd_constraint_blocks::Dict{Any,Int}
-    fixed_parameter_row::Int
+    rhs_linear_patches::Vector{FixedVariableRhsPatch}
     coefficient_patches::Vector{QuasiconvexCoefficientPatch}
     rhs_quadratic_patches::Vector{QuasiconvexRhsQuadraticPatch}
 end
@@ -157,6 +160,10 @@ function _fixed_parameter_feasible(
     fixed_value::T,
     facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {T<:Real}
+    fixed_exact = _exact_rational(fixed_value)
+    if fixed_exact < template.parameter_lower || fixed_exact > template.parameter_upper
+        return (false, nothing, nothing, false)
+    end
     problem = _instantiate_fixed_parameter_problem(opt, template, fixed_value)
     return _with_working_precision(opt.settings, function (F)
         result = _quasiconvex_feasible_point(opt, problem, F; facial_reduction)
@@ -207,6 +214,7 @@ function _append_parameterized_scalar_quadratic_row(
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
     positive_scalars::Vector{Int},
+    rhs_linear_patches::Vector{FixedVariableRhsPatch},
     coefficient_patches::Vector{QuasiconvexCoefficientPatch},
     rhs_quadratic_patches::Vector{QuasiconvexRhsQuadraticPatch},
     func::MOI.ScalarQuadraticFunction,
@@ -219,8 +227,14 @@ function _append_parameterized_scalar_quadratic_row(
         A = _append_zero_column(A)
     end
     row = zeros(ExactRational, size(A, 2))
+    row_index = size(A, 1) + 1
     for term in func.affine_terms
-        row[var_to_pos[term.variable]] += _exact_rational(term.coefficient)
+        coefficient = _exact_rational(term.coefficient)
+        if term.variable == parameter
+            push!(rhs_linear_patches, FixedVariableRhsPatch(row_index, parameter, coefficient))
+        else
+            row[var_to_pos[term.variable]] += coefficient
+        end
     end
     if slack_sign != 0
         slack_position = size(A, 2)
@@ -228,7 +242,6 @@ function _append_parameterized_scalar_quadratic_row(
         push!(positive_scalars, slack_position)
     end
 
-    row_index = size(A, 1) + 1
     for term in func.quadratic_terms
         coefficient = _exact_rational(term.coefficient)
         if term.variable_1 == parameter && term.variable_2 == parameter
@@ -258,6 +271,7 @@ function _add_parameterized_scalar_quadratic_constraints(
     b::Vector{ExactRational},
     positive_scalars::Vector{Int},
     scalar_constraint_rows::Dict{Any,Vector{Int}},
+    rhs_linear_patches::Vector{FixedVariableRhsPatch},
     coefficient_patches::Vector{QuasiconvexCoefficientPatch},
     rhs_quadratic_patches::Vector{QuasiconvexRhsQuadraticPatch},
     var_to_pos::Dict{MOI.VariableIndex,Int},
@@ -272,6 +286,7 @@ function _add_parameterized_scalar_quadratic_constraints(
                 A,
                 b,
                 positive_scalars,
+                rhs_linear_patches,
                 coefficient_patches,
                 rhs_quadratic_patches,
                 func,
@@ -287,6 +302,7 @@ function _add_parameterized_scalar_quadratic_constraints(
                 A,
                 b,
                 positive_scalars,
+                rhs_linear_patches,
                 coefficient_patches,
                 rhs_quadratic_patches,
                 func,
@@ -302,6 +318,7 @@ function _add_parameterized_scalar_quadratic_constraints(
                 A,
                 b,
                 positive_scalars,
+                rhs_linear_patches,
                 coefficient_patches,
                 rhs_quadratic_patches,
                 func,
@@ -317,6 +334,7 @@ function _add_parameterized_scalar_quadratic_constraints(
                 A,
                 b,
                 positive_scalars,
+                rhs_linear_patches,
                 coefficient_patches,
                 rhs_quadratic_patches,
                 func,
@@ -330,6 +348,7 @@ function _add_parameterized_scalar_quadratic_constraints(
                 A,
                 b,
                 positive_scalars,
+                rhs_linear_patches,
                 coefficient_patches,
                 rhs_quadratic_patches,
                 func,
@@ -343,7 +362,15 @@ function _add_parameterized_scalar_quadratic_constraints(
             throw(_unsupported_quadratic_error(opt))
         end
     end
-    return A, b, positive_scalars, scalar_constraint_rows, coefficient_patches, rhs_quadratic_patches
+    return (
+        A,
+        b,
+        positive_scalars,
+        scalar_constraint_rows,
+        rhs_linear_patches,
+        coefficient_patches,
+        rhs_quadratic_patches,
+    )
 end
 
 function _add_parameterized_psd_blocks(
@@ -355,10 +382,9 @@ function _add_parameterized_psd_blocks(
     b::Vector{ExactRational},
     original_dimension::Int,
     affine_psd_auxiliary_count::Int,
+    rhs_linear_patches::Vector{FixedVariableRhsPatch},
+    var_to_pos::Dict{MOI.VariableIndex,Int},
 ) where {T<:Real}
-    storage = opt.storage
-    original_variables = MOI.get(storage, MOI.ListOfVariableIndices())
-    var_to_pos = Dict{MOI.VariableIndex,Int}(vi => i for (i, vi) in enumerate(original_variables))
     next_auxiliary_position = original_dimension + affine_psd_auxiliary_count + 1
     coefficient_patches = QuasiconvexCoefficientPatch[]
     rhs_quadratic_patches = QuasiconvexRhsQuadraticPatch[]
@@ -388,13 +414,21 @@ function _add_parameterized_psd_blocks(
         row_indices = [Int[] for _ in positions]
         row_values = [ExactRational[] for _ in positions]
         offsets = ExactRational[_exact_rational(value) for value in func.constants]
+        first_row = size(A, 1) + 1
 
         for term in func.affine_terms
-            push!(row_indices[term.output_index], var_to_pos[term.scalar_term.variable])
-            push!(row_values[term.output_index], _exact_rational(term.scalar_term.coefficient))
+            output_index = term.output_index
+            variable = term.scalar_term.variable
+            coefficient = _exact_rational(term.scalar_term.coefficient)
+            if variable == data.parameter
+                row = first_row + output_index - 1
+                push!(rhs_linear_patches, FixedVariableRhsPatch(row, data.parameter, coefficient))
+            else
+                push!(row_indices[output_index], var_to_pos[variable])
+                push!(row_values[output_index], coefficient)
+            end
         end
 
-        first_row = size(A, 1) + 1
         for term in func.quadratic_terms
             scalar = term.scalar_term
             coefficient = _exact_rational(scalar.coefficient)
@@ -436,9 +470,13 @@ function _fixed_parameter_template(
     data::QuasiconvexParameterData{T},
 ) where {T<:Real}
     storage = opt.storage
-    original_variables = MOI.get(storage, MOI.ListOfVariableIndices())
+    all_variables = MOI.get(storage, MOI.ListOfVariableIndices())
+    original_variables = MOI.VariableIndex[
+        variable for variable in all_variables if variable != data.parameter
+    ]
     original_dimension = length(original_variables)
     var_to_pos = Dict{MOI.VariableIndex,Int}(vi => i for (i, vi) in enumerate(original_variables))
+    fixed_variables = Set([data.parameter])
 
     psd_variable_indices = MOI.get(
         storage,
@@ -447,6 +485,16 @@ function _fixed_parameter_template(
             MOI.PositiveSemidefiniteConeTriangle,
         }(),
     )
+    direct_psd_variable_indices = eltype(psd_variable_indices)[]
+    psd_variable_affine_indices = eltype(psd_variable_indices)[]
+    for ci in psd_variable_indices
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        if any(variable -> variable == data.parameter, func.variables)
+            push!(psd_variable_affine_indices, ci)
+        else
+            push!(direct_psd_variable_indices, ci)
+        end
+    end
     psd_affine_indices = MOI.get(
         storage,
         MOI.ListOfConstraintIndices{
@@ -456,6 +504,9 @@ function _fixed_parameter_template(
     )
     affine_psd_auxiliary_count = sum(
         (MOI.output_dimension(MOI.get(storage, MOI.ConstraintFunction(), ci)) for ci in psd_affine_indices);
+        init = 0,
+    ) + sum(
+        (length(MOI.get(storage, MOI.ConstraintFunction(), ci).variables) for ci in psd_variable_affine_indices);
         init = 0,
     )
     quadratic_psd_auxiliary_count = sum(
@@ -467,7 +518,7 @@ function _fixed_parameter_template(
     blocks = BlockStructure[]
     psd_constraint_blocks = Dict{Any,Int}()
     seen_psd_variables = Dict{MOI.VariableIndex,Int}()
-    for ci in psd_variable_indices
+    for ci in direct_psd_variable_indices
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
         positions = _triangle_positions(set.side_dimension)
@@ -497,6 +548,7 @@ function _fixed_parameter_template(
         psd_constraint_blocks[ci] = length(blocks)
     end
 
+    rhs_linear_patches = FixedVariableRhsPatch[]
     A, b, positive_scalars, _, _, _, scalar_constraint_rows =
         _extract_constraint_system(
             opt,
@@ -507,6 +559,11 @@ function _fixed_parameter_template(
             psd_affine_indices,
             blocks,
             psd_constraint_blocks,
+            psd_variable_affine_indices = psd_variable_affine_indices,
+            fixed_variables = fixed_variables,
+            skip_variable_bounds = fixed_variables,
+            rhs_patches = rhs_linear_patches,
+            objective_mode = :zero,
         )
 
     blocks,
@@ -523,12 +580,15 @@ function _fixed_parameter_template(
         b,
         original_dimension,
         affine_psd_auxiliary_count,
+        rhs_linear_patches,
+        var_to_pos,
     )
 
     A,
     b,
     positive_scalars,
     scalar_constraint_rows,
+    rhs_linear_patches,
     coefficient_patches,
     rhs_quadratic_patches = _add_parameterized_scalar_quadratic_constraints(
         opt,
@@ -537,18 +597,18 @@ function _fixed_parameter_template(
         b,
         positive_scalars,
         scalar_constraint_rows,
+        rhs_linear_patches,
         coefficient_patches,
         rhs_quadratic_patches,
         var_to_pos,
     )
 
-    fixed_row = zeros(ExactRational, size(A, 2))
-    fixed_row[var_to_pos[data.parameter]] = 1 // 1
-    A, b = _append_exact_row(A, b, fixed_row, 0 // 1)
-    fixed_parameter_row = length(b)
     objective = zeros(ExactRational, size(A, 2))
 
     return QuasiconvexProblemTemplate(
+        data.parameter,
+        _exact_rational(data.lower),
+        _exact_rational(data.upper),
         original_variables,
         blocks,
         positive_scalars,
@@ -557,7 +617,7 @@ function _fixed_parameter_template(
         b,
         scalar_constraint_rows,
         psd_constraint_blocks,
-        fixed_parameter_row,
+        rhs_linear_patches,
         coefficient_patches,
         rhs_quadratic_patches,
     )
@@ -571,19 +631,26 @@ function _instantiate_fixed_parameter_problem(
     fixed_exact = _exact_rational(fixed_value)
     A = copy(template.A_base)
     b = copy(template.b_base)
+    for patch in template.rhs_linear_patches
+        patch.variable == template.parameter ||
+            error("Unexpected fixed-variable RHS patch in quasi-convex template.")
+        b[patch.row] -= patch.coefficient * fixed_exact
+    end
     for patch in template.coefficient_patches
         A[patch.row, patch.column] += patch.coefficient * fixed_exact
     end
     for patch in template.rhs_quadratic_patches
         b[patch.row] -= patch.coefficient * fixed_exact * fixed_exact
     end
-    b[template.fixed_parameter_row] = fixed_exact
 
+    blocks, A, b, early_pruned_directions =
+        _early_prune_psd_coordinate_faces(copy(template.blocks), A, b)
     affine = _solve_affine_system(A, b; checkpoint = label -> _gc_checkpoint!(opt, label))
     positive_scalars, pruned_scalar_faces =
         _prune_positive_scalar_faces(template.positive_scalars, affine)
     blocks, A, b, affine, pruned_directions =
-        _prune_psd_faces(copy(template.blocks), A, b, affine)
+        _prune_psd_faces(blocks, A, b, affine)
+    pruned_directions += early_pruned_directions
     if pruned_scalar_faces > 0 || pruned_directions > 0
         _log(
             opt,
@@ -604,208 +671,6 @@ function _instantiate_fixed_parameter_problem(
         nothing,
         template.scalar_constraint_rows,
         template.psd_constraint_blocks,
-    )
-end
-
-function _add_fixed_parameter_psd_blocks(
-    opt::Optimizer{T},
-    data::QuasiconvexParameterData{T},
-    fixed_value::T,
-    blocks::Vector{BlockStructure},
-    psd_constraint_blocks::Dict{Any,Int},
-    A::Matrix{ExactRational},
-    b::Vector{ExactRational},
-    original_dimension::Int,
-    affine_psd_auxiliary_count::Int,
-) where {T<:Real}
-    storage = opt.storage
-    original_variables = MOI.get(storage, MOI.ListOfVariableIndices())
-    var_to_pos = Dict{MOI.VariableIndex,Int}(vi => i for (i, vi) in enumerate(original_variables))
-    next_auxiliary_position = original_dimension + affine_psd_auxiliary_count + 1
-    fixed_exact = _exact_rational(fixed_value)
-
-    for ci in data.quadratic_psd_constraints
-        func = opt.quadratic_psd_functions[ci]
-        set = opt.quadratic_psd_sets[ci]
-        positions = _triangle_positions(set.side_dimension)
-        length(positions) == MOI.output_dimension(func) || error("Malformed quadratic PSD block.")
-        global_positions = collect(next_auxiliary_position:(next_auxiliary_position + length(positions) - 1))
-        diagonal_positions = Int[]
-        for (local_index, (i, j)) in enumerate(positions)
-            i == j && push!(diagonal_positions, global_positions[local_index])
-        end
-        push!(
-            blocks,
-            BlockStructure(
-                set.side_dimension,
-                fill(nothing, length(positions)),
-                global_positions,
-                positions,
-                diagonal_positions,
-            ),
-        )
-        psd_constraint_blocks[ci] = length(blocks)
-
-        row_indices = [Int[] for _ in positions]
-        row_values = [ExactRational[] for _ in positions]
-        offsets = ExactRational[_exact_rational(value) for value in func.constants]
-
-        for term in func.affine_terms
-            push!(row_indices[term.output_index], var_to_pos[term.scalar_term.variable])
-            push!(row_values[term.output_index], _exact_rational(term.scalar_term.coefficient))
-        end
-
-        for term in func.quadratic_terms
-            scalar = term.scalar_term
-            coefficient = _exact_rational(scalar.coefficient)
-            if scalar.variable_1 == data.parameter && scalar.variable_2 == data.parameter
-                offsets[term.output_index] += coefficient * fixed_exact * fixed_exact
-            elseif scalar.variable_1 == data.parameter
-                push!(row_indices[term.output_index], var_to_pos[scalar.variable_2])
-                push!(row_values[term.output_index], coefficient * fixed_exact)
-            elseif scalar.variable_2 == data.parameter
-                push!(row_indices[term.output_index], var_to_pos[scalar.variable_1])
-                push!(row_values[term.output_index], coefficient * fixed_exact)
-            else
-                throw(_unsupported_quadratic_psd_error(opt))
-            end
-        end
-
-        for local_index in eachindex(positions)
-            row = zeros(ExactRational, size(A, 2))
-            for (index, value) in zip(row_indices[local_index], row_values[local_index])
-                row[index] += value
-            end
-            row[global_positions[local_index]] -= 1 // 1
-            A, b = _append_exact_row(A, b, row, -offsets[local_index])
-        end
-
-        next_auxiliary_position += length(positions)
-    end
-
-    return blocks, psd_constraint_blocks, A, b
-end
-
-function _fixed_parameter_problem(
-    opt::Optimizer{T},
-    data::QuasiconvexParameterData{T},
-    fixed_value::T,
-) where {T<:Real}
-    storage = opt.storage
-    original_variables = MOI.get(storage, MOI.ListOfVariableIndices())
-    original_dimension = length(original_variables)
-    var_to_pos = Dict{MOI.VariableIndex,Int}(vi => i for (i, vi) in enumerate(original_variables))
-
-    psd_variable_indices = MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.VectorOfVariables,
-            MOI.PositiveSemidefiniteConeTriangle,
-        }(),
-    )
-    psd_affine_indices = MOI.get(
-        storage,
-        MOI.ListOfConstraintIndices{
-            MOI.VectorAffineFunction{T},
-            MOI.PositiveSemidefiniteConeTriangle,
-        }(),
-    )
-    affine_psd_auxiliary_count = sum(
-        (MOI.output_dimension(MOI.get(storage, MOI.ConstraintFunction(), ci)) for ci in psd_affine_indices);
-        init = 0,
-    )
-    quadratic_psd_auxiliary_count = sum(
-        (MOI.output_dimension(opt.quadratic_psd_functions[ci]) for ci in data.quadratic_psd_constraints);
-        init = 0,
-    )
-    base_dimension = original_dimension + affine_psd_auxiliary_count + quadratic_psd_auxiliary_count
-
-    blocks = BlockStructure[]
-    psd_constraint_blocks = Dict{Any,Int}()
-    seen_psd_variables = Dict{MOI.VariableIndex,Int}()
-    for ci in psd_variable_indices
-        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
-        set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        positions = _triangle_positions(set.side_dimension)
-        length(func.variables) == length(positions) || error("Malformed PSD block.")
-        global_positions = Int[]
-        diagonal_positions = Int[]
-        for (local_index, variable) in enumerate(func.variables)
-            haskey(var_to_pos, variable) || error("Unknown variable in PSD block.")
-            global_index = var_to_pos[variable]
-            push!(global_positions, global_index)
-            haskey(seen_psd_variables, variable) &&
-                error("Each variable may belong to at most one PSD block.")
-            seen_psd_variables[variable] = length(blocks) + 1
-            positions[local_index][1] == positions[local_index][2] &&
-                push!(diagonal_positions, global_index)
-        end
-        push!(
-            blocks,
-            BlockStructure(
-                set.side_dimension,
-                Union{Nothing,MOI.VariableIndex}[func.variables...],
-                global_positions,
-                positions,
-                diagonal_positions,
-            ),
-        )
-        psd_constraint_blocks[ci] = length(blocks)
-    end
-
-    A, b, positive_scalars, _, _, _, scalar_constraint_rows =
-        _extract_constraint_system(
-            opt,
-            storage,
-            original_variables,
-            var_to_pos,
-            base_dimension,
-            psd_affine_indices,
-            blocks,
-            psd_constraint_blocks,
-        )
-
-    blocks, psd_constraint_blocks, A, b = _add_fixed_parameter_psd_blocks(
-        opt,
-        data,
-        fixed_value,
-        blocks,
-        psd_constraint_blocks,
-        A,
-        b,
-        original_dimension,
-        affine_psd_auxiliary_count,
-    )
-
-    fixed_row = zeros(ExactRational, size(A, 2))
-    fixed_row[var_to_pos[data.parameter]] = 1 // 1
-    A, b = _append_exact_row(A, b, fixed_row, _exact_rational(fixed_value))
-
-    dimension = size(A, 2)
-    objective = zeros(ExactRational, dimension)
-    affine = _solve_affine_system(A, b; checkpoint = label -> _gc_checkpoint!(opt, label))
-    positive_scalars, pruned_scalar_faces = _prune_positive_scalar_faces(positive_scalars, affine)
-    blocks, A, b, affine, pruned_directions = _prune_psd_faces(blocks, A, b, affine)
-    if pruned_scalar_faces > 0 || pruned_directions > 0
-        _log(
-            opt,
-            "quasi-convex fixed-parameter problem pruned $(pruned_scalar_faces) scalar and $(pruned_directions) PSD direction(s)",
-        )
-    end
-
-    return ProblemData(
-        original_variables,
-        blocks,
-        positive_scalars,
-        objective,
-        0 // 1,
-        copy(objective),
-        A,
-        b,
-        affine,
-        nothing,
-        scalar_constraint_rows,
-        psd_constraint_blocks,
     )
 end
 

@@ -1,17 +1,89 @@
 # JuMP/MOI model extraction into the solver's internal SDP form.
 
+struct FixedVariableRhsPatch
+    row::Int
+    variable::MOI.VariableIndex
+    coefficient::ExactRational
+end
+
+function _push_fixed_variable_term!(
+    fixed_terms::Vector{Pair{MOI.VariableIndex,ExactRational}},
+    variable::MOI.VariableIndex,
+    coefficient::ExactRational,
+    fixed_variables::Set{MOI.VariableIndex},
+)
+    variable in fixed_variables || error("Unknown variable in constraint row.")
+    push!(fixed_terms, variable => coefficient)
+    return
+end
+
+function _push_fixed_variable_rhs_patches!(
+    rhs_patches::Union{Nothing,Vector{FixedVariableRhsPatch}},
+    row::Int,
+    fixed_terms::Vector{Pair{MOI.VariableIndex,ExactRational}},
+)
+    rhs_patches === nothing && return
+    for term in fixed_terms
+        push!(rhs_patches, FixedVariableRhsPatch(row, term.first, term.second))
+    end
+    return
+end
+
+function _zero_objective_data(vars)
+    c = zeros(ExactRational, length(vars))
+    return c, zero(ExactRational), copy(c)
+end
+
+function _extract_objective_data(storage, vars, var_to_pos, objective_mode::Symbol)
+    objective_mode == :storage && return _objective_data(storage, vars, var_to_pos)
+    objective_mode == :zero && return _zero_objective_data(vars)
+    error("objective_mode must be :storage or :zero.")
+end
+
+function _extract_affine_row_terms(
+    func::MOI.ScalarAffineFunction,
+    var_to_pos::Dict{MOI.VariableIndex,Int},
+    p::Int,
+    fixed_variables::Set{MOI.VariableIndex},
+)
+    indices = Int[]
+    values = ExactRational[]
+    fixed_terms = Pair{MOI.VariableIndex,ExactRational}[]
+    for term in func.terms
+        coefficient = _exact_rational(term.coefficient)
+        if haskey(var_to_pos, term.variable)
+            push!(indices, var_to_pos[term.variable])
+            push!(values, coefficient)
+        else
+            _push_fixed_variable_term!(fixed_terms, term.variable, coefficient, fixed_variables)
+        end
+    end
+    return indices, values, _exact_rational(func.constant), fixed_terms
+end
+
 function _extract_affine_row(
     func::MOI.ScalarAffineFunction,
     var_to_pos::Dict{MOI.VariableIndex,Int},
     p::Int,
 )
-    indices = Int[]
-    values = ExactRational[]
-    for term in func.terms
-        push!(indices, var_to_pos[term.variable])
-        push!(values, _exact_rational(term.coefficient))
+    indices, values, offset, _ =
+        _extract_affine_row_terms(func, var_to_pos, p, Set{MOI.VariableIndex}())
+    return indices, values, offset
+end
+
+function _single_variable_row_terms(
+    variable::MOI.VariableIndex,
+    var_to_pos::Dict{MOI.VariableIndex,Int},
+    p::Int,
+    fixed_variables::Set{MOI.VariableIndex},
+)
+    if haskey(var_to_pos, variable)
+        fixed_terms = Pair{MOI.VariableIndex,ExactRational}[]
+        return Int[var_to_pos[variable]], ExactRational[1 // 1], fixed_terms
     end
-    return indices, values, _exact_rational(func.constant)
+    fixed_terms = Pair{MOI.VariableIndex,ExactRational}[]
+    _push_fixed_variable_term!(fixed_terms, variable, 1 // 1, fixed_variables)
+    return Int[], ExactRational[], fixed_terms
 end
 
 function _single_variable_row(
@@ -19,7 +91,39 @@ function _single_variable_row(
     var_to_pos::Dict{MOI.VariableIndex,Int},
     p::Int,
 )
-    return Int[var_to_pos[variable]], ExactRational[1 // 1]
+    indices, values, _ =
+        _single_variable_row_terms(variable, var_to_pos, p, Set{MOI.VariableIndex}())
+    return indices, values
+end
+
+function _extract_vector_affine_rows_terms(
+    func::MOI.VectorAffineFunction,
+    var_to_pos::Dict{MOI.VariableIndex,Int},
+    p::Int,
+    fixed_variables::Set{MOI.VariableIndex},
+)
+    dimension = MOI.output_dimension(func)
+    row_indices = [Int[] for _ in 1:dimension]
+    row_values = [ExactRational[] for _ in 1:dimension]
+    row_fixed_terms = [Pair{MOI.VariableIndex,ExactRational}[] for _ in 1:dimension]
+    offsets = ExactRational[_exact_rational(value) for value in func.constants]
+    for term in func.terms
+        output_index = term.output_index
+        variable = term.scalar_term.variable
+        coefficient = _exact_rational(term.scalar_term.coefficient)
+        if haskey(var_to_pos, variable)
+            push!(row_indices[output_index], var_to_pos[variable])
+            push!(row_values[output_index], coefficient)
+        else
+            _push_fixed_variable_term!(
+                row_fixed_terms[output_index],
+                variable,
+                coefficient,
+                fixed_variables,
+            )
+        end
+    end
+    return row_indices, row_values, offsets, row_fixed_terms
 end
 
 function _extract_vector_affine_rows(
@@ -27,14 +131,8 @@ function _extract_vector_affine_rows(
     var_to_pos::Dict{MOI.VariableIndex,Int},
     p::Int,
 )
-    dimension = MOI.output_dimension(func)
-    row_indices = [Int[] for _ in 1:dimension]
-    row_values = [ExactRational[] for _ in 1:dimension]
-    offsets = ExactRational[_exact_rational(value) for value in func.constants]
-    for term in func.terms
-        push!(row_indices[term.output_index], var_to_pos[term.scalar_term.variable])
-        push!(row_values[term.output_index], _exact_rational(term.scalar_term.coefficient))
-    end
+    row_indices, row_values, offsets, _ =
+        _extract_vector_affine_rows_terms(func, var_to_pos, p, Set{MOI.VariableIndex}())
     return row_indices, row_values, offsets
 end
 
@@ -130,23 +228,31 @@ function _extract_constraint_system(
     psd_affine_indices,
     blocks::Vector{BlockStructure},
     psd_constraint_blocks::Dict{Any,Int},
+    ;
+    psd_variable_affine_indices = Any[],
+    fixed_variables::Set{MOI.VariableIndex} = Set{MOI.VariableIndex}(),
+    skip_variable_bounds::Set{MOI.VariableIndex} = Set{MOI.VariableIndex}(),
+    rhs_patches::Union{Nothing,Vector{FixedVariableRhsPatch}} = nothing,
+    objective_mode::Symbol = :storage,
 ) where {T}
     templates = EquationTemplate[]
     next_auxiliary_position = length(original_variables) + 1
-    for ci in psd_affine_indices
+    for ci in psd_variable_affine_indices
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
         positions = _triangle_positions(set.side_dimension)
-        length(positions) == MOI.output_dimension(func) || error("Malformed affine PSD block.")
-        row_indices, row_values, offsets = _extract_vector_affine_rows(func, var_to_pos, base_dimension)
+        length(func.variables) == length(positions) || error("Malformed PSD block.")
         global_positions = collect(next_auxiliary_position:(next_auxiliary_position + length(positions) - 1))
         diagonal_positions = Int[]
         for local_index in eachindex(positions)
-            indices = row_indices[local_index]
-            values = row_values[local_index]
+            variable = func.variables[local_index]
+            indices, values, fixed_terms =
+                _single_variable_row_terms(variable, var_to_pos, base_dimension, fixed_variables)
             push!(indices, global_positions[local_index])
             push!(values, -(1 // 1))
-            _push_equality!(templates, indices, values, -offsets[local_index])
+            row_index = length(templates) + 1
+            _push_equality!(templates, indices, values, 0 // 1)
+            _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
             if positions[local_index][1] == positions[local_index][2]
                 push!(diagonal_positions, global_positions[local_index])
             end
@@ -165,7 +271,47 @@ function _extract_constraint_system(
         next_auxiliary_position += length(positions)
     end
 
-    c_original_raw, constant_raw, c_original_min = _objective_data(storage, original_variables, var_to_pos)
+    for ci in psd_affine_indices
+        func = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        positions = _triangle_positions(set.side_dimension)
+        length(positions) == MOI.output_dimension(func) || error("Malformed affine PSD block.")
+        row_indices, row_values, offsets, row_fixed_terms =
+            _extract_vector_affine_rows_terms(func, var_to_pos, base_dimension, fixed_variables)
+        global_positions = collect(next_auxiliary_position:(next_auxiliary_position + length(positions) - 1))
+        diagonal_positions = Int[]
+        for local_index in eachindex(positions)
+            indices = row_indices[local_index]
+            values = row_values[local_index]
+            push!(indices, global_positions[local_index])
+            push!(values, -(1 // 1))
+            row_index = length(templates) + 1
+            _push_equality!(templates, indices, values, -offsets[local_index])
+            _push_fixed_variable_rhs_patches!(
+                rhs_patches,
+                row_index,
+                row_fixed_terms[local_index],
+            )
+            if positions[local_index][1] == positions[local_index][2]
+                push!(diagonal_positions, global_positions[local_index])
+            end
+        end
+        push!(
+            blocks,
+            BlockStructure(
+                set.side_dimension,
+                fill(nothing, length(positions)),
+                global_positions,
+                positions,
+                diagonal_positions,
+            ),
+        )
+        psd_constraint_blocks[ci] = length(blocks)
+        next_auxiliary_position += length(positions)
+    end
+
+    c_original_raw, constant_raw, c_original_min =
+        _extract_objective_data(storage, original_variables, var_to_pos, objective_mode)
     scalar_constraint_rows = Dict{Any,Vector{Int}}()
 
     for ci in MOI.get(
@@ -178,8 +324,10 @@ function _extract_constraint_system(
         row_index = length(templates) + 1
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        indices, values, offset, fixed_terms =
+            _extract_affine_row_terms(func, var_to_pos, base_dimension, fixed_variables)
         _push_equality!(templates, indices, values, _exact_rational(set.value) - offset)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -193,8 +341,10 @@ function _extract_constraint_system(
         row_index = length(templates) + 1
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        indices, values, offset, fixed_terms =
+            _extract_affine_row_terms(func, var_to_pos, base_dimension, fixed_variables)
         _push_greater_than!(templates, indices, values, _exact_rational(set.lower) - offset)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -208,8 +358,10 @@ function _extract_constraint_system(
         row_index = length(templates) + 1
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        indices, values, offset, fixed_terms =
+            _extract_affine_row_terms(func, var_to_pos, base_dimension, fixed_variables)
         _push_less_than!(templates, indices, values, _exact_rational(set.upper) - offset)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -223,9 +375,12 @@ function _extract_constraint_system(
         row_index = length(templates) + 1
         func = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        indices, values, offset = _extract_affine_row(func, var_to_pos, base_dimension)
+        indices, values, offset, fixed_terms =
+            _extract_affine_row_terms(func, var_to_pos, base_dimension, fixed_variables)
         _push_greater_than!(templates, copy(indices), copy(values), _exact_rational(set.lower) - offset)
         _push_less_than!(templates, indices, values, _exact_rational(set.upper) - offset)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index + 1, fixed_terms)
         scalar_constraint_rows[ci] = [row_index, row_index + 1]
     end
 
@@ -236,11 +391,15 @@ function _extract_constraint_system(
         row_index = length(templates) + 1
         variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, fixed_terms =
+            _single_variable_row_terms(variable, var_to_pos, base_dimension, fixed_variables)
         _push_equality!(
             templates,
-            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            indices,
+            values,
             _exact_rational(set.value),
         )
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -250,12 +409,17 @@ function _extract_constraint_system(
     )
         row_index = length(templates) + 1
         variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        variable in skip_variable_bounds && continue
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, fixed_terms =
+            _single_variable_row_terms(variable, var_to_pos, base_dimension, fixed_variables)
         _push_greater_than!(
             templates,
-            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            indices,
+            values,
             _exact_rational(set.lower),
         )
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -265,12 +429,17 @@ function _extract_constraint_system(
     )
         row_index = length(templates) + 1
         variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        variable in skip_variable_bounds && continue
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
+        indices, values, fixed_terms =
+            _single_variable_row_terms(variable, var_to_pos, base_dimension, fixed_variables)
         _push_less_than!(
             templates,
-            _single_variable_row(variable, var_to_pos, base_dimension)...,
+            indices,
+            values,
             _exact_rational(set.upper),
         )
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
         scalar_constraint_rows[ci] = [row_index]
     end
 
@@ -280,10 +449,14 @@ function _extract_constraint_system(
     )
         row_index = length(templates) + 1
         variable = MOI.get(storage, MOI.ConstraintFunction(), ci)
+        variable in skip_variable_bounds && continue
         set = MOI.get(storage, MOI.ConstraintSet(), ci)
-        indices, values = _single_variable_row(variable, var_to_pos, base_dimension)
+        indices, values, fixed_terms =
+            _single_variable_row_terms(variable, var_to_pos, base_dimension, fixed_variables)
         _push_greater_than!(templates, copy(indices), copy(values), _exact_rational(set.lower))
         _push_less_than!(templates, indices, values, _exact_rational(set.upper))
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index, fixed_terms)
+        _push_fixed_variable_rhs_patches!(rhs_patches, row_index + 1, fixed_terms)
         scalar_constraint_rows[ci] = [row_index, row_index + 1]
     end
 

@@ -25,6 +25,92 @@
           "Solved by quasi-convex parameter search"
 end
 
+@testset "Quasiconvex fixed probes match substituted feasibility extraction" begin
+    BR = Rational{BigInt}
+
+    block_signature(problem) = [
+        (
+            block.size,
+            block.global_positions,
+            block.local_positions,
+            block.diagonal_positions,
+        ) for block in problem.blocks
+    ]
+
+    affine_row_signature(problem) = sort([
+        Tuple(vcat(collect(problem.A[row, :]), problem.b[row])) for row in axes(problem.A, 1)
+    ])
+
+    function concrete_optimizer(model)
+        MOI.Utilities.attach_optimizer(backend(model))
+        opt = backend(model)
+        while !(opt isa RationalSDP.Optimizer)
+            if hasfield(typeof(opt), :optimizer)
+                opt = getfield(opt, :optimizer)
+            elseif hasfield(typeof(opt), :model)
+                opt = getfield(opt, :model)
+            else
+                error("Could not unwrap RationalSDP optimizer from JuMP backend.")
+            end
+        end
+        return opt
+    end
+
+    function fixed_child_problem(model, fixed_value)
+        opt = concrete_optimizer(model)
+        data = RationalSDP._detect_quasiconvex_parameter(opt)
+        @test data !== nothing
+        template = RationalSDP._fixed_parameter_template(opt, data)
+        return RationalSDP._instantiate_fixed_parameter_problem(
+            opt,
+            template,
+            convert(typeof(data.lower), fixed_value),
+        )
+    end
+
+    function assert_same_numeric_problem(actual, expected)
+        @test affine_row_signature(actual) == affine_row_signature(expected)
+        @test actual.positive_scalars == expected.positive_scalars
+        @test block_signature(actual) == block_signature(expected)
+        @test actual.objective_vector_raw == expected.objective_vector_raw
+        @test actual.objective_vector_min == expected.objective_vector_min
+        @test actual.objective_constant_raw == expected.objective_constant_raw
+        @test actual.affine == expected.affine
+    end
+
+    qc_scalar = rational_model(BR)
+    @variable(qc_scalar, 0//1 <= gamma <= 2//1)
+    @variable(qc_scalar, 0//1 <= x <= 1//1)
+    @constraint(qc_scalar, gamma * x + gamma == 3//1)
+    @objective(qc_scalar, Min, gamma)
+
+    fixed_scalar = rational_model(BR)
+    @variable(fixed_scalar, 0//1 <= x_fixed <= 1//1)
+    @constraint(fixed_scalar, 2//1 * x_fixed + 2//1 == 3//1)
+    @objective(fixed_scalar, Min, 0//1)
+
+    assert_same_numeric_problem(
+        fixed_child_problem(qc_scalar, 2//1),
+        RationalSDP._extract_problem(concrete_optimizer(fixed_scalar)),
+    )
+
+    qc_psd = rational_model(BR)
+    @variable(qc_psd, 0//1 <= gamma <= 2//1)
+    @variable(qc_psd, 0//1 <= x <= 1//1)
+    @constraint(qc_psd, Symmetric([gamma * x 1//1; 1//1 x]) in PSDCone())
+    @objective(qc_psd, Min, gamma)
+
+    fixed_psd = rational_model(BR)
+    @variable(fixed_psd, 0//1 <= x_fixed <= 1//1)
+    @constraint(fixed_psd, Symmetric([2//1 * x_fixed 1//1; 1//1 x_fixed]) in PSDCone())
+    @objective(fixed_psd, Min, 0//1)
+
+    assert_same_numeric_problem(
+        fixed_child_problem(qc_psd, 2//1),
+        RationalSDP._extract_problem(concrete_optimizer(fixed_psd)),
+    )
+end
+
 @testset "Quasiconvex scalar quadratic equality via JuMP" begin
     model = rational_model(Rational{BigInt})
     set_optimizer_attribute(model, "phase1_backend", :native)

@@ -4,6 +4,20 @@ julia_version = "1.12.6"
 manifest_format = "2.0"
 project_hash = "e7469ba74f4af4ed907ee472066d73c81962a894"
 
+[[deps.AbstractAlgebra]]
+deps = ["LinearAlgebra", "MacroTools", "PrecompileTools", "Preferences", "Random", "RandomExtensions", "SparseArrays"]
+git-tree-sha1 = "2623cbda15ba22aaeeaf8904b73d12a6e21f5047"
+uuid = "c3fe647b-3220-5bb0-a1ea-a7954cac585d"
+version = "0.50.1"
+
+    [deps.AbstractAlgebra.extensions]
+    IJuliaExt = "IJulia"
+    TestExt = "Test"
+
+    [deps.AbstractAlgebra.weakdeps]
+    IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
+    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
 version = "1.1.2"
@@ -116,6 +130,12 @@ git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
 uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
 version = "0.1.10"
 
+[[deps.FLINT_jll]]
+deps = ["Artifacts", "GMP_jll", "JLLWrappers", "Libdl", "MPFR_jll", "OpenBLAS32_jll"]
+git-tree-sha1 = "ac92f67c147978f4530136fc85d0b7e39b5632e2"
+uuid = "e134572f-a0d5-539d-bddf-3cad8db41a82"
+version = "301.500.0+0"
+
 [[deps.FastClosures]]
 git-tree-sha1 = "acebe244d53ee1b461970f8910c235b259e772ef"
 uuid = "9aa1b823-49e4-5ca5-8b0f-3971ec8bab6a"
@@ -159,6 +179,11 @@ version = "1.3.3"
 deps = ["Random"]
 uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 version = "1.11.0"
+
+[[deps.GMP_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "781609d7-10c4-51f6-84f2-b8444358ff6d"
+version = "6.3.0+2"
 
 [[deps.GenericLinearAlgebra]]
 deps = ["LinearAlgebra", "Printf", "Random", "libblastrampoline_jll"]
@@ -341,6 +366,11 @@ git-tree-sha1 = "a142aaf27b67fc1e0b6cbd06821eb5af6853611a"
 uuid = "607ca3ad-272e-43c8-bcbe-fc71b56c935c"
 version = "0.2.1"
 
+[[deps.MPFR_jll]]
+deps = ["Artifacts", "GMP_jll", "Libdl"]
+uuid = "3a97d323-0669-5f0c-9066-3539efd106a3"
+version = "4.2.2+0"
+
 [[deps.MacroTools]]
 git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
 uuid = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
@@ -397,9 +427,21 @@ git-tree-sha1 = "9b8215b1ee9e78a293f99797cd31375471b2bcae"
 uuid = "77ba4419-2d1f-58cd-9bb1-8ffee604a2e3"
 version = "1.1.3"
 
+[[deps.Nemo]]
+deps = ["AbstractAlgebra", "FLINT_jll", "LinearAlgebra", "Random", "RandomExtensions", "SHA"]
+git-tree-sha1 = "dcc4bb6c9f9db9f922ee0569f67c21d0332bb916"
+uuid = "2edaba10-b0f1-5616-af89-8c11ac63239a"
+version = "0.56.0"
+
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 version = "1.3.0"
+
+[[deps.OpenBLAS32_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl", "libblastrampoline_jll"]
+git-tree-sha1 = "565175ce692c065e50ad32efbb61ba69b1586593"
+uuid = "656ef2d0-ae68-5445-9ca0-591084a874a2"
+version = "0.3.33+1"
 
 [[deps.OpenBLAS_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
@@ -488,8 +530,14 @@ deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
 
+[[deps.RandomExtensions]]
+deps = ["Random", "SparseArrays"]
+git-tree-sha1 = "b8a399e95663485820000f26b6a43c794e166a49"
+uuid = "fb686558-2515-59ef-acaa-46db3789a887"
+version = "0.4.4"
+
 [[deps.RationalSDP]]
-deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "Printf", "SparseArrays"]
+deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "Nemo", "Printf", "SparseArrays"]
 path = ".."
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"

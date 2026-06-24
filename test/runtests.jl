@@ -294,7 +294,7 @@ include("slowtest_helpers.jl")
         @test recovered[2] == 0//1
     end
 
-    @testset "Exact sparse affine elimination" begin
+    @testset "Nemo-backed exact affine elimination" begin
         A = Rational{BigInt}[
             0//1 0//1 1//1
             1//1 0//1 1//1
@@ -327,6 +327,34 @@ include("slowtest_helpers.jl")
         @test independent_A == Rational{BigInt}[1//1 0//1; 0//1 1//1]
         @test independent_b == Rational{BigInt}[1//1, 3//1]
         @test RationalSDP._independent_affine_equalities(inconsistent_A, inconsistent_b) === nothing
+
+        augmented = Rational{BigInt}[
+            1//2 1//3 5//6
+            1//1 2//3 5//3
+        ]
+        reduced, pivots = RationalSDP._rref(augmented)
+        @test reduced == Rational{BigInt}[1//1 2//3 5//3; 0//1 0//1 0//1]
+        @test pivots == [1]
+
+        nullspace_matrix = Rational{BigInt}[
+            1//2 1//3 1//4
+            0//1 2//3 1//5
+        ]
+        exact_nullspace = RationalSDP._nullspace_basis_exact(nullspace_matrix)
+        @test size(exact_nullspace) == (3, 1)
+        @test nullspace_matrix * exact_nullspace == zeros(Rational{BigInt}, 2, 1)
+
+        empty_A = zeros(Rational{BigInt}, 0, 3)
+        empty_affine = RationalSDP._solve_affine_system(empty_A, Rational{BigInt}[])
+        @test empty_affine !== nothing
+        @test empty_affine[1] == zeros(Rational{BigInt}, 3)
+        @test empty_affine[2] == Matrix{Rational{BigInt}}(I, 3, 3)
+        @test RationalSDP._nullspace_basis_exact(empty_A) ==
+              Matrix{Rational{BigInt}}(I, 3, 3)
+
+        no_variables = zeros(Rational{BigInt}, 1, 0)
+        @test RationalSDP._solve_affine_system(no_variables, Rational{BigInt}[0//1]) !== nothing
+        @test RationalSDP._solve_affine_system(no_variables, Rational{BigInt}[1//1]) === nothing
     end
 
     @testset "Exact recovery tolerance controls" begin

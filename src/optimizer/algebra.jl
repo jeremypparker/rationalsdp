@@ -109,143 +109,42 @@ function _strictly_pd(matrix::AbstractMatrix{F}) where {F<:AbstractFloat}
     end
 end
 
-function _rref(aug::Matrix{ExactRational})
-    rows, cols = size(aug)
+# Keep Rational{BigInt} at the MOI and solver-state boundaries, and use Nemo
+# only for the exact matrix kernels where FLINT provides the performance gain.
+_to_nemo_matrix(values::AbstractMatrix{ExactRational}) = Nemo.matrix(Nemo.QQ, values)
+
+function _from_nemo_rational(value)
+    return ExactRational(BigInt(numerator(value)), BigInt(denominator(value)))
+end
+
+function _from_nemo_matrix(values)
+    converted = Matrix{ExactRational}(undef, size(values)...)
+    for column in axes(converted, 2), row in axes(converted, 1)
+        converted[row, column] = _from_nemo_rational(values[row, column])
+    end
+    return converted
+end
+
+function _rref_pivots(reduced, variable_count::Int)
+    pivot_rows = Int[]
     pivot_columns = Int[]
-    pivot_row = 1
-    for col in 1:(cols - 1)
-        pivot_index = 0
-        for row in pivot_row:rows
-            if !iszero(aug[row, col])
-                pivot_index = row
-                break
-            end
-        end
-        pivot_index == 0 && continue
-        if pivot_index != pivot_row
-            for swap_col in 1:cols
-                aug[pivot_row, swap_col], aug[pivot_index, swap_col] =
-                    aug[pivot_index, swap_col], aug[pivot_row, swap_col]
-            end
-        end
-        pivot_value = aug[pivot_row, col]
-        for scale_col in 1:cols
-            aug[pivot_row, scale_col] /= pivot_value
-        end
-        for row in 1:rows
-            row == pivot_row && continue
-            factor = aug[row, col]
-            iszero(factor) && continue
-            for update_col in 1:cols
-                aug[row, update_col] -= factor * aug[pivot_row, update_col]
-            end
-        end
-        push!(pivot_columns, col)
-        pivot_row += 1
-        pivot_row > rows && break
-    end
-    return aug, pivot_columns
-end
-
-function _sparse_augmented_row(
-    A::Matrix{ExactRational},
-    b::Vector{ExactRational},
-    row_index::Int,
-    rhs_column::Int,
-)
-    row = Dict{Int,ExactRational}()
-    for column in 1:(rhs_column - 1)
-        value = A[row_index, column]
-        iszero(value) || (row[column] = value)
-    end
-    rhs = b[row_index]
-    iszero(rhs) || (row[rhs_column] = rhs)
-    return row
-end
-
-function _sparse_row_scale!(row::Dict{Int,ExactRational}, scale::ExactRational)
-    for column in collect(keys(row))
-        row[column] /= scale
-    end
-    return row
-end
-
-function _sparse_row_subtract_scaled!(
-    row::Dict{Int,ExactRational},
-    other::Dict{Int,ExactRational},
-    scale::ExactRational,
-)
-    for (column, value) in other
-        updated = get(row, column, zero(ExactRational)) - scale * value
-        if iszero(updated)
-            delete!(row, column)
-        else
-            row[column] = updated
-        end
-    end
-    return row
-end
-
-function _sparse_row_pivot_column(row::Dict{Int,ExactRational}, variable_count::Int)
-    pivot_column = 0
-    for column in keys(row)
-        if column <= variable_count && (pivot_column == 0 || column < pivot_column)
-            pivot_column = column
-        end
-    end
-    return pivot_column
-end
-
-function _solve_affine_system_sparse(
-    A::Matrix{ExactRational},
-    b::Vector{ExactRational},
-)
-    variable_count = size(A, 2)
-    rhs_column = variable_count + 1
-    pivot_rows = Dict{Int,Dict{Int,ExactRational}}()
-    pivot_columns = Int[]
-
-    for row_index in axes(A, 1)
-        row = _sparse_augmented_row(A, b, row_index, rhs_column)
-        for pivot_column in pivot_columns
-            factor = get(row, pivot_column, zero(ExactRational))
-            iszero(factor) || _sparse_row_subtract_scaled!(row, pivot_rows[pivot_column], factor)
-        end
-
-        pivot_column = _sparse_row_pivot_column(row, variable_count)
-        if pivot_column == 0
-            iszero(get(row, rhs_column, zero(ExactRational))) || return nothing
-            continue
-        end
-
-        _sparse_row_scale!(row, row[pivot_column])
-        row[pivot_column] = one(ExactRational)
-        for existing_pivot in pivot_columns
-            factor = get(pivot_rows[existing_pivot], pivot_column, zero(ExactRational))
-            iszero(factor) ||
-                _sparse_row_subtract_scaled!(pivot_rows[existing_pivot], row, factor)
-        end
-        pivot_rows[pivot_column] = row
+    for row in axes(reduced, 1)
+        pivot_column = findfirst(
+            column -> !iszero(reduced[row, column]),
+            1:variable_count,
+        )
+        pivot_column === nothing && continue
+        push!(pivot_rows, row)
         push!(pivot_columns, pivot_column)
-        sort!(pivot_columns)
     end
+    return pivot_rows, pivot_columns
+end
 
-    particular = zeros(ExactRational, variable_count)
-    for pivot_column in pivot_columns
-        particular[pivot_column] = get(pivot_rows[pivot_column], rhs_column, zero(ExactRational))
-    end
-
-    pivot_set = Set(pivot_columns)
-    free_columns = [column for column in 1:variable_count if !(column in pivot_set)]
-    nullspace = zeros(ExactRational, variable_count, length(free_columns))
-    for (basis_index, free_column) in enumerate(free_columns)
-        nullspace[free_column, basis_index] = 1 // 1
-        for pivot_column in pivot_columns
-            coefficient = get(pivot_rows[pivot_column], free_column, zero(ExactRational))
-            iszero(coefficient) || (nullspace[pivot_column, basis_index] = -coefficient)
-        end
-    end
-    return particular, nullspace
+function _rref(aug::Matrix{ExactRational})
+    _, reduced_nemo = Nemo.rref(_to_nemo_matrix(aug))
+    reduced = _from_nemo_matrix(reduced_nemo)
+    _, pivot_columns = _rref_pivots(reduced, size(aug, 2) - 1)
+    return reduced, pivot_columns
 end
 
 function _solve_affine_system(
@@ -258,10 +157,35 @@ function _solve_affine_system(
     if size(A, 1) == 0
         return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
     end
-    checkpoint !== nothing && checkpoint("affine elimination: before exact sparse rref")
-    affine = _solve_affine_system_sparse(A, b)
-    checkpoint !== nothing && checkpoint("affine elimination: after exact sparse rref")
-    return affine
+    size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
+
+    checkpoint !== nothing && checkpoint("affine elimination: before Nemo exact rref")
+    rhs_column = p + 1
+    _, reduced = Nemo.rref(_to_nemo_matrix(hcat(A, b)))
+    checkpoint !== nothing && checkpoint("affine elimination: after Nemo exact rref")
+    pivot_rows, pivot_columns = _rref_pivots(reduced, p)
+    for row in axes(reduced, 1)
+        any(!iszero(reduced[row, column]) for column in 1:p) && continue
+        iszero(reduced[row, rhs_column]) || return nothing
+    end
+
+    particular = zeros(ExactRational, p)
+    for (row, pivot_column) in zip(pivot_rows, pivot_columns)
+        particular[pivot_column] = _from_nemo_rational(reduced[row, rhs_column])
+    end
+
+    pivot_set = Set(pivot_columns)
+    free_columns = [column for column in 1:p if !(column in pivot_set)]
+    nullspace = zeros(ExactRational, p, length(free_columns))
+    for (basis_index, free_column) in enumerate(free_columns)
+        nullspace[free_column, basis_index] = one(ExactRational)
+        for (row, pivot_column) in zip(pivot_rows, pivot_columns)
+            coefficient = reduced[row, free_column]
+            iszero(coefficient) ||
+                (nullspace[pivot_column, basis_index] = -_from_nemo_rational(coefficient))
+        end
+    end
+    return particular, nullspace
 end
 
 function _independent_affine_equalities(
@@ -749,11 +673,12 @@ function _positive_definite_exact(matrix::Matrix{ExactRational})
 end
 
 function _nullspace_basis_exact(matrix::Matrix{ExactRational})
-    rhs = zeros(ExactRational, size(matrix, 1))
-    affine = _solve_affine_system(matrix, rhs)
-    affine === nothing && return zeros(ExactRational, size(matrix, 2), 0)
-    _, nullspace = affine
-    return nullspace
+    column_count = size(matrix, 2)
+    size(matrix, 1) == 0 &&
+        return Matrix{ExactRational}(I, column_count, column_count)
+    column_count == 0 && return zeros(ExactRational, 0, 0)
+    _, nullspace = Nemo.nullspace(_to_nemo_matrix(matrix))
+    return _from_nemo_matrix(nullspace)
 end
 
 function _strictly_positive_exact(x::Vector{ExactRational}, positive_scalars::Vector{Int})

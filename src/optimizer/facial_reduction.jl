@@ -4,6 +4,73 @@
 # current affine slice, then convert the exposed nullspace directions back into
 # exact rational linear constraints on the original primal variables.
 
+mutable struct _FacialReductionExactCache
+    problem::ProblemData
+    block_affine_slices::Vector{Union{Nothing,Vector{Nemo.QQMatrix}}}
+    block_exact_directions::Vector{Union{Nothing,Vector{Vector{ExactRational}}}}
+    A_transpose::Union{Nothing,Nemo.QQMatrix}
+end
+
+function _FacialReductionExactCache(problem::ProblemData)
+    return _FacialReductionExactCache(
+        problem,
+        Union{Nothing,Vector{Nemo.QQMatrix}}[nothing for _ in problem.blocks],
+        Union{Nothing,Vector{Vector{ExactRational}}}[nothing for _ in problem.blocks],
+        nothing,
+    )
+end
+
+function _facial_reduction_block_affine_slice!(
+    cache::_FacialReductionExactCache,
+    problem::ProblemData,
+    block_index::Int,
+)
+    cache.problem === problem || error("Facial-reduction exact cache belongs to another problem.")
+    cached = cache.block_affine_slices[block_index]
+    cached === nothing || return cached
+    problem.affine === nothing && return Nemo.QQMatrix[]
+
+    block = problem.blocks[block_index]
+    particular, nullspace = problem.affine
+    matrices = Nemo.QQMatrix[
+        _to_nemo_matrix(_vector_to_matrix(particular, block)),
+    ]
+    for column in axes(nullspace, 2)
+        push!(
+            matrices,
+            _to_nemo_matrix(_vector_to_matrix(view(nullspace, :, column), block)),
+        )
+    end
+    cache.block_affine_slices[block_index] = matrices
+    return matrices
+end
+
+function _facial_reduction_A_transpose!(
+    cache::_FacialReductionExactCache,
+    problem::ProblemData,
+)
+    cache.problem === problem || error("Facial-reduction exact cache belongs to another problem.")
+    if cache.A_transpose === nothing
+        cache.A_transpose = transpose(_to_nemo_matrix(problem.A))
+    end
+    return cache.A_transpose
+end
+
+_nemo_direction_column(direction::Vector{ExactRational}) =
+    _to_nemo_matrix(reshape(direction, :, 1))
+
+function _nemo_product_nonzero(product)
+    for row in axes(product, 1)
+        value = product[row, 1]
+        iszero(value) || return row, value
+    end
+    return nothing
+end
+
+function _nemo_quadratic_value(matrix, direction_column)
+    return (transpose(direction_column) * matrix * direction_column)[1, 1]
+end
+
 function _normalize_rational_direction(direction::Vector{ExactRational})
     nonzero_entries = [entry for entry in direction if !iszero(entry)]
     isempty(nonzero_entries) && return direction
@@ -44,24 +111,6 @@ function _block_row_linear_form(
     return form
 end
 
-function _block_quadratic_linear_form(
-    block::BlockStructure,
-    direction::Vector{ExactRational},
-    dimension::Int,
-)
-    form = zeros(ExactRational, dimension)
-    for (local_index, (i, j)) in enumerate(block.local_positions)
-        coefficient = if i == j
-            direction[i] * direction[i]
-        else
-            2 * direction[i] * direction[j]
-        end
-        iszero(coefficient) && continue
-        form[block.global_positions[local_index]] += coefficient
-    end
-    return form
-end
-
 function _format_exact_direction(
     direction::Vector{ExactRational};
     max_entries::Int = 64,
@@ -85,22 +134,19 @@ function _block_annihilation_violation(
     problem::ProblemData,
     block::BlockStructure,
     direction::Vector{ExactRational},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
     problem.affine === nothing && return "no exact affine parametrization is available"
-    particular, nullspace = problem.affine
-    dimension = length(problem.objective_vector_raw)
-    for row_index in 1:block.size
-        form = _block_row_linear_form(block, row_index, direction, dimension)
-        particular_value = dot(form, particular)
-        if !iszero(particular_value)
-            return "row=$(row_index), affine=particular, value=$(_format_exact_rational_compact(particular_value))"
-        end
-        for basis_index in axes(nullspace, 2)
-            basis_value = dot(form, view(nullspace, :, basis_index))
-            if !iszero(basis_value)
-                return "row=$(row_index), affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
-            end
-        end
+    direction_column = _nemo_direction_column(direction)
+    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+    for (matrix_index, matrix) in enumerate(matrices)
+        violation = _nemo_product_nonzero(matrix * direction_column)
+        violation === nothing && continue
+        row_index, value = violation
+        location = matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+        return "row=$(row_index), affine=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
     end
     return nothing
 end
@@ -109,19 +155,19 @@ function _block_quadratic_vanish_violation(
     problem::ProblemData,
     block::BlockStructure,
     direction::Vector{ExactRational},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
     problem.affine === nothing && return "no exact affine parametrization is available"
-    particular, nullspace = problem.affine
-    dimension = length(problem.objective_vector_raw)
-    form = _block_quadratic_linear_form(block, direction, dimension)
-    particular_value = dot(form, particular)
-    if !iszero(particular_value)
-        return "quadratic=particular, value=$(_format_exact_rational_compact(particular_value))"
-    end
-    for basis_index in axes(nullspace, 2)
-        basis_value = dot(form, view(nullspace, :, basis_index))
-        if !iszero(basis_value)
-            return "quadratic=affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
+    direction_column = _nemo_direction_column(direction)
+    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+    for (matrix_index, matrix) in enumerate(matrices)
+        value = _nemo_quadratic_value(matrix, direction_column)
+        if !iszero(value)
+            location =
+                matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+            return "quadratic=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
         end
     end
     return nothing
@@ -131,23 +177,24 @@ function _block_trace_vanish_violation(
     problem::ProblemData,
     block::BlockStructure,
     directions::Vector{Vector{ExactRational}},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
     isempty(directions) && return "no directions"
     problem.affine === nothing && return "no exact affine parametrization is available"
-    particular, nullspace = problem.affine
-    dimension = length(problem.objective_vector_raw)
-    form = zeros(ExactRational, dimension)
-    for direction in directions
-        form .+= _block_quadratic_linear_form(block, direction, dimension)
-    end
-    particular_value = dot(form, particular)
-    if !iszero(particular_value)
-        return "trace=particular, value=$(_format_exact_rational_compact(particular_value))"
-    end
-    for basis_index in axes(nullspace, 2)
-        basis_value = dot(form, view(nullspace, :, basis_index))
-        if !iszero(basis_value)
-            return "trace=affine_basis=$(basis_index), value=$(_format_exact_rational_compact(basis_value))"
+    direction_columns = [_nemo_direction_column(direction) for direction in directions]
+    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+    for (matrix_index, matrix) in enumerate(matrices)
+        value = sum(
+            (_nemo_quadratic_value(matrix, direction_column) for
+             direction_column in direction_columns);
+            init = zero(Nemo.QQ),
+        )
+        if !iszero(value)
+            location =
+                matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+            return "trace=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
         end
     end
     return nothing
@@ -157,11 +204,26 @@ function _block_face_direction_certificate(
     problem::ProblemData,
     block::BlockStructure,
     direction::Vector{ExactRational},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
-    row_violation = _block_annihilation_violation(problem, block, direction)
+    row_violation = _block_annihilation_violation(
+        problem,
+        block,
+        direction;
+        cache,
+        block_index,
+    )
     row_violation === nothing && return (kind = :affine_rows, violation = nothing)
 
-    diagonal_violation = _block_quadratic_vanish_violation(problem, block, direction)
+    diagonal_violation = _block_quadratic_vanish_violation(
+        problem,
+        block,
+        direction;
+        cache,
+        block_index,
+    )
     diagonal_violation === nothing && return (kind = :psd_diagonal, violation = nothing)
 
     return (
@@ -177,6 +239,9 @@ function _exact_face_direction(
     candidate::Vector{F},
     settings::Settings,
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 ) where {F<:AbstractFloat}
     for tolerance in _recovery_tolerances(settings, F)
         direction = ExactRational[
@@ -184,7 +249,13 @@ function _exact_face_direction(
         ]
         direction = _normalize_rational_direction(direction)
         any(!iszero, direction) || continue
-        if _block_face_direction_certificate(problem, block, direction).kind != :none
+        if _block_face_direction_certificate(
+            problem,
+            block,
+            direction;
+            cache,
+            block_index,
+        ).kind != :none
             return direction
         end
     end
@@ -314,6 +385,8 @@ function _certified_pivoted_subspace_directions(
     subspace::AbstractMatrix{F},
     ::Type{F},
     description::AbstractString,
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     candidates = _pivoted_rational_subspace_directions(subspace, opt.settings, F)
     isempty(candidates) && return Vector{ExactRational}[]
@@ -322,7 +395,13 @@ function _certified_pivoted_subspace_directions(
     rejected = 0
     last_violation = nothing
     for direction in candidates
-        violation = _block_annihilation_violation(problem, block, direction)
+        violation = _block_annihilation_violation(
+            problem,
+            block,
+            direction;
+            cache,
+            block_index,
+        )
         if violation === nothing
             push!(accepted, direction)
         else
@@ -358,22 +437,30 @@ end
 function _exact_block_nullspace_directions(
     problem::ProblemData,
     block::BlockStructure,
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
     problem.affine === nothing && return Vector{ExactRational}[]
-    particular, nullspace = problem.affine
-    basis = Matrix{ExactRational}(I, block.size, block.size)
+    cached = cache.block_exact_directions[block_index]
+    cached === nothing || return cached
 
-    basis = basis * _nullspace_basis_exact(_vector_to_matrix(particular, block) * basis)
-    for column in axes(nullspace, 2)
+    basis = Nemo.identity_matrix(Nemo.QQ, block.size)
+    for matrix in _facial_reduction_block_affine_slice!(cache, problem, block_index)
+        _, kernel = Nemo.nullspace(matrix * basis)
+        basis = basis * kernel
         size(basis, 2) == 0 && break
-        basis = basis * _nullspace_basis_exact(_vector_to_matrix(view(nullspace, :, column), block) * basis)
     end
 
+    basis_exact = _from_nemo_matrix(basis)
     directions = [
-        _normalize_rational_direction(collect(view(basis, :, column))) for column in axes(basis, 2)
+        _normalize_rational_direction(collect(view(basis_exact, :, column))) for
+        column in axes(basis_exact, 2)
     ]
     filter!(direction -> any(!iszero, direction), directions)
-    return _linearly_independent_directions(directions)
+    directions = _linearly_independent_directions(directions)
+    cache.block_exact_directions[block_index] = directions
+    return directions
 end
 
 function _candidate_kernel_directions(
@@ -382,6 +469,8 @@ function _candidate_kernel_directions(
     block_index::Int,
     block_matrix::Matrix{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
@@ -404,10 +493,17 @@ function _candidate_kernel_directions(
         kernel_subspace,
         F,
         "boundary kernel",
+        ;
+        cache,
     )
     isempty(pivoted_directions) || return pivoted_directions
 
-    exact_directions = _exact_block_nullspace_directions(problem, block)
+    exact_directions = _exact_block_nullspace_directions(
+        problem,
+        block;
+        cache,
+        block_index,
+    )
 
     if isempty(exact_directions)
         heuristic_directions = Vector{Vector{ExactRational}}()
@@ -423,7 +519,13 @@ function _candidate_kernel_directions(
             heuristic === nothing && continue
 
             direction = heuristic.direction
-            certificate = _block_face_direction_certificate(problem, block, direction)
+            certificate = _block_face_direction_certificate(
+                problem,
+                block,
+                direction;
+                cache,
+                block_index,
+            )
             direction_summary = _format_exact_direction(direction)
             if certificate.kind != :none
                 certificate_label =
@@ -445,7 +547,13 @@ function _candidate_kernel_directions(
         end
         heuristic_directions = _linearly_independent_directions(heuristic_directions)
         if length(heuristic_directions) > 1
-            violation = _block_trace_vanish_violation(problem, block, heuristic_directions)
+            violation = _block_trace_vanish_violation(
+                problem,
+                block,
+                heuristic_directions;
+                cache,
+                block_index,
+            )
             if violation === nothing
                 _log(
                     opt,
@@ -838,8 +946,13 @@ function _facial_reduction_slack(problem::ProblemData, y::Vector{F}) where {F<:A
     return scalar_slack, block_slack
 end
 
-function _facial_reduction_slack(problem::ProblemData, y::Vector{ExactRational})
-    s = transpose(problem.A) * y
+function _facial_reduction_slack(
+    problem::ProblemData,
+    y::Vector{ExactRational};
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+)
+    y_nemo = _to_nemo_matrix(reshape(y, :, 1))
+    s = vec(_from_nemo_matrix(_facial_reduction_A_transpose!(cache, problem) * y_nemo))
     scalar_slack = Dict{Int,ExactRational}()
     for index in problem.positive_scalars
         scalar_slack[index] = s[index]
@@ -965,6 +1078,8 @@ function _exact_facial_reduction_oracle_slack(
     problem::ProblemData,
     oracle_point::Vector{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     free_positions = _facial_reduction_free_positions(problem)
     trace_row = _facial_reduction_trace_row(problem)
@@ -991,7 +1106,7 @@ function _exact_facial_reduction_oracle_slack(
             ]
             particular + nullspace * rational_coordinates
         end
-        s, scalar_slack, block_slack = _facial_reduction_slack(problem, y)
+        s, scalar_slack, block_slack = _facial_reduction_slack(problem, y; cache)
 
         all(index -> iszero(s[index]), free_positions) || continue
         iszero(dot(problem.b, y)) || continue
@@ -1083,6 +1198,8 @@ function _certify_dual_slack_evidence(
     problem::ProblemData,
     evidence::_FacialReductionEvidence{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     exact_slack = _exact_exposing_slack_from_numeric_slack(
         opt,
@@ -1128,12 +1245,21 @@ function _certify_boundary_primal_evidence(
     problem::ProblemData,
     evidence::_FacialReductionEvidence{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     keep_bases = Dict{Int,Matrix{ExactRational}}()
 
     for (block_index, block) in enumerate(problem.blocks)
         matrix = _vector_to_matrix(evidence.vector, block)
-        directions = _candidate_kernel_directions(opt, problem, block_index, matrix, F)
+        directions = _candidate_kernel_directions(
+            opt,
+            problem,
+            block_index,
+            matrix,
+            F;
+            cache,
+        )
         isempty(directions) && continue
         keep_basis = _orthogonal_complement_basis(directions, block.size)
         if size(keep_basis, 2) == problem.blocks[block_index].size
@@ -1152,6 +1278,8 @@ function _facial_reduction_block_directions(
     block_index::Int,
     block_matrix::Matrix{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
@@ -1186,6 +1314,8 @@ function _facial_reduction_block_directions(
             range_subspace,
             F,
             "exposing-vector",
+            ;
+            cache,
         )
         isempty(pivoted_directions) || return pivoted_directions
     end
@@ -1200,6 +1330,9 @@ function _facial_reduction_block_directions(
             collect(view(block_matrix, :, column_index)),
             opt.settings,
             F,
+            ;
+            cache,
+            block_index,
         )
         direction === nothing && continue
         push!(exact_directions, direction)
@@ -1225,12 +1358,16 @@ function _certify_oracle_point_evidence(
     problem::ProblemData,
     evidence::_FacialReductionEvidence{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     exact_oracle_slack = _exact_facial_reduction_oracle_slack(
         opt,
         problem,
         evidence.vector,
         F,
+        ;
+        cache,
     )
     if exact_oracle_slack !== nothing
         scalar_slack_exact, block_slack_exact = exact_oracle_slack
@@ -1253,6 +1390,8 @@ function _certify_oracle_point_evidence(
             block_index,
             block_slack[block_index],
             F,
+            ;
+            cache,
         )
         isempty(directions) && continue
         keep_basis = _orthogonal_complement_basis(directions, problem.blocks[block_index].size)
@@ -1275,13 +1414,15 @@ function _certify_facial_reduction_evidence(
     problem::ProblemData,
     evidence::_FacialReductionEvidence{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     evidence.kind == :dual_slack &&
-        return _certify_dual_slack_evidence(opt, problem, evidence, F)
+        return _certify_dual_slack_evidence(opt, problem, evidence, F; cache)
     evidence.kind == :boundary_primal &&
-        return _certify_boundary_primal_evidence(opt, problem, evidence, F)
+        return _certify_boundary_primal_evidence(opt, problem, evidence, F; cache)
     evidence.kind == :oracle_point &&
-        return _certify_oracle_point_evidence(opt, problem, evidence, F)
+        return _certify_oracle_point_evidence(opt, problem, evidence, F; cache)
     error("Unhandled facial reduction evidence kind $(evidence.kind).")
 end
 
@@ -1290,9 +1431,17 @@ function _first_certified_facial_reduction(
     problem::ProblemData,
     evidence_list::Vector{_FacialReductionEvidence{F}},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     for evidence in evidence_list
-        reduction = _certify_facial_reduction_evidence(opt, problem, evidence, F)
+        reduction = _certify_facial_reduction_evidence(
+            opt,
+            problem,
+            evidence,
+            F;
+            cache,
+        )
         reduction === nothing && continue
         return reduction
     end
@@ -1340,12 +1489,20 @@ function _facial_reduction_oracle_round(
     opt::Optimizer,
     problem::ProblemData,
     ::Type{HF},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {HF<:AbstractFloat}
     oracle_point = _facial_reduction_oracle_attempt(opt, problem, HF)
     oracle_point === nothing && return nothing
 
     evidence = _FacialReductionEvidence(:oracle_point, "oracle", oracle_point)
-    reduction = _certify_facial_reduction_evidence(opt, problem, evidence, HF)
+    reduction = _certify_facial_reduction_evidence(
+        opt,
+        problem,
+        evidence,
+        HF;
+        cache,
+    )
     reduction === nothing && return nothing
     return _facial_reduction_tuple(reduction)
 end
@@ -1372,12 +1529,16 @@ function _certified_facial_reduction_from_initial_evidence(
     candidate::Vector{F},
     phase1_dual_slack::Union{Nothing,Vector{F}},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     reduction = _first_certified_facial_reduction(
         opt,
         problem,
         _cheap_facial_reduction_evidence(candidate, phase1_dual_slack, F),
         F,
+        ;
+        cache,
     )
     reduction === nothing && return nothing
     return _facial_reduction_tuple(reduction)
@@ -1536,6 +1697,8 @@ function _facial_reduction_round(
     candidate::Vector{F},
     phase1_dual_slack::Union{Nothing,Vector{F}},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
     reduction = _certified_facial_reduction_from_initial_evidence(
@@ -1544,6 +1707,8 @@ function _facial_reduction_round(
         candidate,
         phase1_dual_slack,
         F,
+        ;
+        cache,
     )
     reduction === nothing || return reduction
     _log(
@@ -1554,6 +1719,8 @@ function _facial_reduction_round(
         opt,
         problem,
         _facial_reduction_oracle_float_type(opt, problem),
+        ;
+        cache,
     )
 end
 

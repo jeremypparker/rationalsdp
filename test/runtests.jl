@@ -854,6 +854,33 @@ include("slowtest_helpers.jl")
             )
         @test directions == [Rational{BigInt}[1//1, 1//1]]
 
+        exact_cache = RationalSDP._FacialReductionExactCache(exact_boundary_problem)
+        @test exact_cache.block_affine_slices[1] === nothing
+        @test exact_cache.block_exact_directions[1] === nothing
+        cached_directions = RationalSDP._exact_block_nullspace_directions(
+            exact_boundary_problem,
+            block;
+            cache = exact_cache,
+            block_index = 1,
+        )
+        @test cached_directions == [Rational{BigInt}[1//1, 1//1]]
+        @test exact_cache.block_affine_slices[1] !== nothing
+        @test exact_cache.block_exact_directions[1] === cached_directions
+        @test RationalSDP._exact_block_nullspace_directions(
+            exact_boundary_problem,
+            block;
+            cache = exact_cache,
+            block_index = 1,
+        ) === cached_directions
+
+        exact_slack, _, _ = RationalSDP._facial_reduction_slack(
+            exact_boundary_problem,
+            Rational{BigInt}[];
+            cache = exact_cache,
+        )
+        @test exact_slack == zeros(Rational{BigInt}, 3)
+        @test exact_cache.A_transpose !== nothing
+
         psd_certified_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
             [block],

@@ -28,7 +28,7 @@ Base.@kwdef mutable struct Settings
     phase1_hypatia_margin_upper::BigFloat = big"1.0"
     phase1_hypatia_min_margin_upper::BigFloat = big"1e-8"
     phase1_hypatia_margin_shrink::BigFloat = big"0.1"
-    phase1_hypatia_objective_bias::BigFloat = big"1e-12"
+    phase1_hypatia_boundary_margin_fraction::BigFloat = big"0.01"
     phase1_hypatia_tol_rel_opt::BigFloat = big"-1"
     phase1_hypatia_tol_abs_opt::BigFloat = big"-1"
     phase1_hypatia_tol_feas::BigFloat = big"-1"
@@ -620,6 +620,13 @@ function _phase1_hypatia_target_margin(settings::Settings)
     target = settings.phase1_hypatia_target_margin
     target >= 0 || error("phase1_hypatia_target_margin must be nonnegative.")
     return target
+end
+
+function _phase1_hypatia_boundary_margin_fraction(settings::Settings)
+    fraction = settings.phase1_hypatia_boundary_margin_fraction
+    zero(fraction) <= fraction <= one(fraction) ||
+        error("phase1_hypatia_boundary_margin_fraction must lie between 0 and 1.")
+    return fraction
 end
 
 function _facial_reduction_float_type(settings::Settings)

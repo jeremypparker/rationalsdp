@@ -193,7 +193,7 @@ The full set of optimizer attributes is:
 - `phase1_hypatia_margin_upper`
 - `phase1_hypatia_min_margin_upper`
 - `phase1_hypatia_margin_shrink`
-- `phase1_hypatia_objective_bias`
+- `phase1_hypatia_boundary_margin_fraction`
 - `phase1_hypatia_tol_rel_opt`
 - `phase1_hypatia_tol_abs_opt`
 - `phase1_hypatia_tol_feas`
@@ -251,6 +251,13 @@ model reaches a numerical boundary point but exact recovery fails. The
 separate facial-reduction oracle reuses the Phase I Hypatia settings by
 default. The `recovery_tolerance_shrink` setting controls how aggressively
 exact recovery tightens rationalization tolerances between attempts.
+
+An optimal or near-optimal Hypatia Phase I margin at most
+`phase1_hypatia_boundary_margin_fraction` times the requested target margin is
+treated as a numerical boundary point. The default fraction is `0.01`. Set it
+to zero to disable this positive-margin test; nonpositive margins are always
+treated as boundary points. Exact recovery is skipped and, when enabled, facial
+reduction is attempted directly.
 
 ## Exactness Model
 

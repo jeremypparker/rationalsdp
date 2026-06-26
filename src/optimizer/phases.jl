@@ -688,11 +688,6 @@ function _build_hypatia_phase1_model(
     b_reduced = F[]
     particular_numeric = _to_working_array(F, particular)
     nullspace_numeric = _to_working_array(F, phase1_nullspace)
-    objective_bias = _to_working_float(F, settings.phase1_hypatia_objective_bias)
-    if objective_bias > zero(F)
-        reduced_objective = transpose(nullspace_numeric) * _to_working_array(F, problem.objective_vector_min)
-        c[1:reduced_dimension] .+= objective_bias .* reduced_objective
-    end
 
     row_indices = Int[]
     column_indices = Int[]
@@ -837,15 +832,26 @@ function _phase1_hypatia_reason(attempt::Phase1HypatiaAttempt)
         return "no usable primal point"
     elseif attempt.reason == :nonfinite_point
         return "non-finite primal point"
+    elseif attempt.reason == :boundary_margin
+        return "numerical point is on or near the cone boundary"
     elseif attempt.reason == :large_residual
         return "affine residual too large for exact recovery"
     elseif attempt.reason == :exact_recovery_failed
-        if attempt.margin !== nothing && attempt.margin <= zero(attempt.margin)
-            return "numerical point is on or near the cone boundary"
-        end
         return "numerical point could not be recovered as an exact strict interior point"
     end
     return "no exact anchor"
+end
+
+function _phase1_hypatia_margin_is_boundary(
+    margin::F,
+    status,
+    margin_goal::F,
+    boundary_fraction::F,
+) where {F<:AbstractFloat}
+    margin <= zero(F) && return true
+    margin_goal > zero(F) && boundary_fraction > zero(F) || return false
+    status in (Hypatia.Solvers.Optimal, Hypatia.Solvers.NearOptimal) || return false
+    return margin <= margin_goal * boundary_fraction
 end
 
 function _log_phase1_hypatia_attempt(
@@ -880,6 +886,13 @@ function _phase1_hypatia_anchor_once(
         particular, _ = problem.affine
         phase1_nullspace = _phase1_nullspace(problem)
         numeric_margin_upper = _to_working_float(HF, margin_upper)
+        target_margin = _to_working_float(HF, _phase1_hypatia_target_margin(opt.settings))
+        margin_goal =
+            target_margin > zero(HF) ? min(numeric_margin_upper, target_margin) : zero(HF)
+        boundary_margin_fraction = _to_working_float(
+            HF,
+            _phase1_hypatia_boundary_margin_fraction(opt.settings),
+        )
         model = _build_hypatia_phase1_model(
             problem,
             opt.settings,
@@ -984,6 +997,26 @@ function _phase1_hypatia_anchor_once(
             _log_phase1_hypatia_attempt(opt, attempt)
             return attempt
         end
+        if _phase1_hypatia_margin_is_boundary(
+            margin,
+            status,
+            margin_goal,
+            boundary_margin_fraction,
+        )
+            attempt = Phase1HypatiaAttempt{HF}(
+                nothing,
+                candidate,
+                dual_slack,
+                string(status),
+                iterations,
+                margin,
+                residual,
+                total_time_sec,
+                :boundary_margin,
+            )
+            _log_phase1_hypatia_attempt(opt, attempt)
+            return attempt
+        end
         if opt.settings.phase1_stop_after_candidate_diagnostics
             _log(
                 opt,
@@ -1005,17 +1038,14 @@ function _phase1_hypatia_anchor_once(
         end
         recovery_threshold = max(HF(1.0e-6), sqrt(eps(HF)))
         if residual > recovery_threshold
-            anchor = nothing
-            if margin > zero(HF)
-                anchor = _phase1_exact_feasible_point_from_coordinates(
-                    opt,
-                    coordinates,
-                    particular,
-                    phase1_nullspace,
-                    problem,
-                    opt.settings,
-                )
-            end
+            anchor = _phase1_exact_feasible_point_from_coordinates(
+                opt,
+                coordinates,
+                particular,
+                phase1_nullspace,
+                problem,
+                opt.settings,
+            )
             attempt = Phase1HypatiaAttempt{HF}(
                 anchor,
                 candidate,
@@ -1026,21 +1056,6 @@ function _phase1_hypatia_anchor_once(
                 residual,
                 total_time_sec,
                 anchor === nothing ? :large_residual : :exact_anchor,
-            )
-            _log_phase1_hypatia_attempt(opt, attempt)
-            return attempt
-        end
-        if margin <= zero(HF)
-            attempt = Phase1HypatiaAttempt{HF}(
-                nothing,
-                candidate,
-                dual_slack,
-                string(status),
-                iterations,
-                margin,
-                residual,
-                total_time_sec,
-                :exact_recovery_failed,
             )
             _log_phase1_hypatia_attempt(opt, attempt)
             return attempt
@@ -1091,9 +1106,7 @@ function _phase1_hypatia_anchor(
         attempt = _phase1_hypatia_anchor_once(opt, problem, primary_float_type, margin_cap)
         attempt.anchor !== nothing && return attempt
         if attempt.candidate !== nothing &&
-           attempt.reason == :exact_recovery_failed &&
-           attempt.margin !== nothing &&
-           attempt.margin <= zero(attempt.margin)
+           attempt.reason == :boundary_margin
             _log(opt, "Hypatia Phase I: boundary candidate detected; trying facial reduction")
             return attempt
         end

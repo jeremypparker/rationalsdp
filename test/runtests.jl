@@ -17,7 +17,7 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "phase1_hypatia_margin_upper", "1e-4")
         set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
         set_optimizer_attribute(model, "phase1_hypatia_margin_shrink", "0.2")
-        set_optimizer_attribute(model, "phase1_hypatia_objective_bias", "1e-12")
+        set_optimizer_attribute(model, "phase1_hypatia_boundary_margin_fraction", "0.005")
         set_optimizer_attribute(model, "phase1_hypatia_tol_rel_opt", "1e-8")
         set_optimizer_attribute(model, "phase1_hypatia_tol_abs_opt", "1e-9")
         set_optimizer_attribute(model, "phase1_hypatia_tol_feas", "1e-10")
@@ -39,7 +39,8 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_upper") == big"1e-4"
         @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_shrink") == big"0.2"
-        @test get_optimizer_attribute(model, "phase1_hypatia_objective_bias") == big"1e-12"
+        @test get_optimizer_attribute(model, "phase1_hypatia_boundary_margin_fraction") ==
+              big"0.005"
         @test get_optimizer_attribute(model, "phase1_hypatia_tol_rel_opt") == big"1e-8"
         @test get_optimizer_attribute(model, "phase1_hypatia_tol_abs_opt") == big"1e-9"
         @test get_optimizer_attribute(model, "phase1_hypatia_tol_feas") == big"1e-10"
@@ -84,6 +85,48 @@ include("slowtest_helpers.jl")
     end
 
     @testset "Hypatia Phase I system solver selection" begin
+        margin_goal = 1.0e-8
+        boundary_fraction = 0.01
+        @test RationalSDP._phase1_hypatia_margin_is_boundary(
+            -1.0e-14,
+            RationalSDP.Hypatia.Solvers.SlowProgress,
+            margin_goal,
+            boundary_fraction,
+        )
+        @test RationalSDP._phase1_hypatia_margin_is_boundary(
+            5.358e-13,
+            RationalSDP.Hypatia.Solvers.Optimal,
+            margin_goal,
+            boundary_fraction,
+        )
+        @test !RationalSDP._phase1_hypatia_margin_is_boundary(
+            2.0e-10,
+            RationalSDP.Hypatia.Solvers.Optimal,
+            margin_goal,
+            boundary_fraction,
+        )
+        @test !RationalSDP._phase1_hypatia_margin_is_boundary(
+            5.358e-13,
+            RationalSDP.Hypatia.Solvers.SlowProgress,
+            margin_goal,
+            boundary_fraction,
+        )
+        @test !RationalSDP._phase1_hypatia_margin_is_boundary(
+            5.358e-13,
+            RationalSDP.Hypatia.Solvers.Optimal,
+            margin_goal,
+            0.0,
+        )
+        @test RationalSDP._phase1_hypatia_boundary_margin_fraction(
+            RationalSDP.Settings(phase1_hypatia_boundary_margin_fraction = big"0.5"),
+        ) == big"0.5"
+        @test_throws ErrorException RationalSDP._phase1_hypatia_boundary_margin_fraction(
+            RationalSDP.Settings(phase1_hypatia_boundary_margin_fraction = big"-0.1"),
+        )
+        @test_throws ErrorException RationalSDP._phase1_hypatia_boundary_margin_fraction(
+            RationalSDP.Settings(phase1_hypatia_boundary_margin_fraction = big"1.1"),
+        )
+
         syssolver, use_dense_model, preprocess =
             RationalSDP._hypatia_phase1_syssolver(RationalSDP.Settings(), Float64)
         @test syssolver isa RationalSDP.Hypatia.Solvers.SymIndefSparseSystemSolver{Float64}

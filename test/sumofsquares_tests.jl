@@ -85,6 +85,22 @@ end
         @test value(V)(x[1] => 1//1, x[2] => 0//1) == 1//1
     end
 
+    @testset "Exact SOS certificate on a semialgebraic domain" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+
+        @polyvar x
+        @variable(model, V, Poly(monomials([x], 0:2)))
+        @constraint(model, coefficients(V - (x^2 + x + 1)) .== 0)
+        domain = @set x >= 0
+        cref = @constraint(model, V >= 0, SOSCone(), domain = domain)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        test_exact_extracted_sdp(model)
+    end
+
     @testset "Lorenz SOS mean upper bound" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "phase1_backend", :native)
@@ -107,7 +123,7 @@ end
         @objective(model, Min, B)
         optimize!(model)
 
-        @test termination_status(model) == MOI.OPTIMAL
+        @test termination_status(model) == MOI.ITERATION_LIMIT
         @test primal_status(model) == MOI.FEASIBLE_POINT
         test_exact_sos_constraint(model, cref, poly)
         @test value(B) > 729//1

@@ -100,3 +100,34 @@ function test_exact_sos_constraint(
     @test is_psd_exact(Matrix(SumOfSquares.MultivariateMoments.value_matrix(gram)))
     return gram
 end
+
+function test_exact_extracted_sdp(model::JuMP.GenericModel)
+    bridge_optimizer = getfield(backend(model), :optimizer)
+    opt = getfield(bridge_optimizer, :model)
+    problem = RationalSDP._extract_problem(opt)
+    variable_count = length(problem.original_variables)
+    dimension = length(problem.objective_vector_raw)
+    fixed_rows = zeros(Rational{BigInt}, variable_count, dimension)
+    fixed_rhs = zeros(Rational{BigInt}, variable_count)
+    for (position, variable) in enumerate(problem.original_variables)
+        fixed_rows[position, position] = 1//1
+        fixed_rhs[position] = RationalSDP._exact_rational(opt.variable_primal[variable])
+    end
+    fixed_affine = RationalSDP._solve_affine_system(
+        vcat(problem.A, fixed_rows),
+        vcat(problem.b, fixed_rhs),
+    )
+    @test fixed_affine !== nothing
+    fixed_affine === nothing && return nothing
+    point, nullspace = fixed_affine
+    @test size(nullspace, 2) == 0
+    @test problem.A * point == problem.b
+    for position in problem.positive_scalars
+        @test point[position] >= 0
+    end
+    for block in problem.blocks
+        @test is_psd_exact(RationalSDP._vector_to_matrix(point, block))
+    end
+    @test RationalSDP._exact_primal_feasibility(problem, point).ok
+    return point
+end

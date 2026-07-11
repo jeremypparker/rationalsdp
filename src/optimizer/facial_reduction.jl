@@ -89,28 +89,6 @@ function _normalize_rational_direction(direction::Vector{ExactRational})
     return ExactRational[entry // 1 for entry in integer_entries]
 end
 
-function _block_row_linear_form(
-    block::BlockStructure,
-    row_index::Int,
-    direction::Vector{ExactRational},
-    dimension::Int,
-)
-    form = zeros(ExactRational, dimension)
-    for (local_index, (i, j)) in enumerate(block.local_positions)
-        coefficient = zero(ExactRational)
-        if i == row_index && j == row_index
-            coefficient = direction[row_index]
-        elseif i == row_index
-            coefficient = direction[j]
-        elseif j == row_index
-            coefficient = direction[i]
-        end
-        iszero(coefficient) && continue
-        form[block.global_positions[local_index]] += coefficient
-    end
-    return form
-end
-
 function _format_exact_direction(
     direction::Vector{ExactRational};
     max_entries::Int = 64,
@@ -570,7 +548,6 @@ function _candidate_kernel_directions(
         individually_certified_directions =
             _linearly_independent_directions(individually_certified_directions)
         if !isempty(individually_certified_directions)
-            individually_certified_directions = individually_certified_directions[1:1]
             _log(
                 opt,
                 "Facial reduction: using certified rationalized boundary kernel directions for PSD block $(block_index)",
@@ -581,7 +558,7 @@ function _candidate_kernel_directions(
         if rejected_heuristics > 0
             _log(
                 opt,
-                "Facial reduction: rejected $(rejected_heuristics) rationalized boundary kernel direction(s) for PSD block $(block_index); deferring uncertified directions to tentative fallback",
+                "Facial reduction: rejected $(rejected_heuristics) uncertified rationalized boundary kernel direction(s) for PSD block $(block_index)",
             )
             return Vector{ExactRational}[]
         end
@@ -606,7 +583,6 @@ function _heuristic_kernel_direction_candidates(
     block_matrix::Matrix{F},
     ::Type{F},
 ) where {F<:AbstractFloat}
-    block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
     eigen_factor = eigen(symmetric_matrix)
     exposure_tolerance = max(
@@ -614,10 +590,9 @@ function _heuristic_kernel_direction_candidates(
         F(100) * eps(F),
     )
     kernel_indices = [
-        index for (index, value) in enumerate(eigen_factor.values) if abs(value) <= exposure_tolerance
+        index for (index, value) in enumerate(eigen_factor.values) if
+        abs(value) <= exposure_tolerance
     ]
-    isempty(kernel_indices) && return NamedTuple[]
-
     candidates = NamedTuple[]
     for kernel_index in sort(kernel_indices; by = index -> abs(eigen_factor.values[index]))
         heuristic = _heuristic_kernel_direction(
@@ -632,7 +607,6 @@ function _heuristic_kernel_direction_candidates(
             (
                 residual = heuristic.residual,
                 eigenvalue = eigen_factor.values[kernel_index],
-                tolerance = heuristic.tolerance,
                 block_index = block_index,
                 direction = heuristic.direction,
             ),
@@ -641,7 +615,13 @@ function _heuristic_kernel_direction_candidates(
     return candidates
 end
 
-function _tentative_facial_reduction_problem(
+"""
+Construct a heuristic face used only to search for a feasible point. This is not
+a facial-reduction certificate: callers must validate any recovered point
+exactly against the unreduced problem and must not infer infeasibility or an
+objective bound from this restriction.
+"""
+function _tentative_feasibility_search_problem(
     opt::Optimizer,
     problem::ProblemData,
     candidate::Vector{F},
@@ -649,10 +629,15 @@ function _tentative_facial_reduction_problem(
 ) where {F<:AbstractFloat}
     candidates = NamedTuple[]
     for (block_index, block) in enumerate(problem.blocks)
-        matrix = _vector_to_matrix(candidate, block)
         append!(
             candidates,
-            _heuristic_kernel_direction_candidates(opt, problem, block_index, matrix, F),
+            _heuristic_kernel_direction_candidates(
+                opt,
+                problem,
+                block_index,
+                _vector_to_matrix(candidate, block),
+                F,
+            ),
         )
     end
     sort!(candidates; by = item -> (abs(item.residual), abs(item.eigenvalue), item.block_index))
@@ -662,37 +647,24 @@ function _tentative_facial_reduction_problem(
             [item.direction],
             problem.blocks[item.block_index].size,
         )
-        reduced_problem = _apply_facial_reduction(
-            problem,
-            Int[],
-            Dict(item.block_index => keep_basis),
-        )
-        if reduced_problem.affine === nothing
-            _log(
-                opt,
-                "Facial reduction: rejected tentative rationalized boundary kernel direction for PSD block $(item.block_index); exact reduced affine system is inconsistent",
-            )
-            continue
-        end
+        reduced_problem =
+            _apply_facial_reduction(problem, Int[], Dict(item.block_index => keep_basis))
+        reduced_problem.affine === nothing && continue
         _log(
             opt,
-            "Facial reduction: using tentative rationalized boundary kernel direction for PSD block $(item.block_index) (eig=$(_format_metric(item.eigenvalue)), residual=$(_format_metric(item.residual)), rationalize_tol=$(_format_metric(item.tolerance))); exact reduced affine system is consistent",
+            "Feasibility search: tentatively removed one PSD direction from block $(item.block_index); any recovered point will be checked exactly against the unreduced SDP",
         )
-        _log(opt, "facial reduction: fixed 0 scalar cone direction(s) and removed 1 PSD direction(s)")
         return reduced_problem
     end
-
-    isempty(candidates) || _log(
-        opt,
-        "Facial reduction: rejected $(length(candidates)) tentative rationalized boundary kernel direction(s)",
-    )
     return nothing
 end
 
 function _is_inexact_facial_reduction_error(err)
     err isa ErrorException || return false
-    message = err.msg
-    return occursin("could not be represented exactly over the rational coefficient field", message)
+    return occursin(
+        "could not be represented exactly over the rational coefficient field",
+        err.msg,
+    )
 end
 
 const _PHASE1_DIAGNOSTIC_THRESHOLDS = BigFloat[
@@ -1145,9 +1117,6 @@ struct _CertifiedFacialReduction
     keep_bases::Dict{Int,Matrix{ExactRational}}
 end
 
-_facial_reduction_tuple(reduction::_CertifiedFacialReduction) =
-    reduction.exposed_scalars, reduction.keep_bases
-
 const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
 const _FACIAL_REDUCTION_CACHE_VERSION = 1
 
@@ -1192,8 +1161,15 @@ function _write_facial_reduction_cache(path::AbstractString, records::Vector{Any
         version = _FACIAL_REDUCTION_CACHE_VERSION,
         records = copy(records),
     )
-    open(full_path, "w") do io
+    temporary_path, io = mktemp(dirname(full_path); cleanup = false)
+    try
         Serialization.serialize(io, payload)
+        close(io)
+        mv(temporary_path, full_path; force = true)
+    catch
+        isopen(io) && close(io)
+        rm(temporary_path; force = true)
+        rethrow()
     end
     return full_path
 end
@@ -1843,7 +1819,7 @@ function _facial_reduction_oracle_round(
         cache,
     )
     reduction === nothing && return nothing
-    return _facial_reduction_tuple(reduction)
+    return reduction
 end
 
 function _cheap_facial_reduction_evidence(
@@ -1880,23 +1856,7 @@ function _certified_facial_reduction_from_initial_evidence(
         cache,
     )
     reduction === nothing && return nothing
-    return _facial_reduction_tuple(reduction)
-end
-
-function _face_membership_rows(
-    block::BlockStructure,
-    keep_basis::Matrix{ExactRational},
-    dimension::Int,
-)
-    removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
-    rows = Vector{Vector{ExactRational}}()
-    for column in axes(removed_directions, 2)
-        direction = collect(view(removed_directions, :, column))
-        for row_index in 1:block.size
-            push!(rows, _block_row_linear_form(block, row_index, direction, dimension))
-        end
-    end
-    return rows
+    return reduction
 end
 
 function _apply_facial_reduction(
@@ -1947,7 +1907,6 @@ function _apply_facial_reduction(
     b = copy(problem.b)
     extra_rows = Vector{Vector{ExactRational}}()
     extra_rhs = ExactRational[]
-    face_rows_old = Vector{Vector{ExactRational}}()
 
     for position in unique(sort(exposed_scalars))
         row = zeros(ExactRational, total_dimension)
@@ -1955,9 +1914,6 @@ function _apply_facial_reduction(
         push!(extra_rows, row)
         push!(extra_rhs, 0 // 1)
 
-        face_row = zeros(ExactRational, old_dimension)
-        face_row[position] = 1 // 1
-        push!(face_rows_old, face_row)
     end
 
     for (block_index, block) in enumerate(problem.blocks)
@@ -1971,7 +1927,6 @@ function _apply_facial_reduction(
         )
         append!(extra_rows, rows)
         append!(extra_rhs, rhs)
-        append!(face_rows_old, _face_membership_rows(block, keep_basis, old_dimension))
     end
 
     if !isempty(extra_rows)
@@ -2012,13 +1967,6 @@ function _apply_facial_reduction(
         problem.scalar_constraint_rows,
         problem.psd_constraint_blocks,
     )
-end
-
-function _facial_reduction_round(
-    opt::Optimizer,
-    problem::ProblemData,
-) 
-    return nothing
 end
 
 function _facial_reduction_round(
@@ -2080,30 +2028,10 @@ function _facially_reduce_problem(
     ::Type{F},
 ) where {F<:AbstractFloat}
     opt.settings.facial_reduction || return problem
-    reduction = try
-        _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
-    catch err
-        if _is_inexact_facial_reduction_error(err)
-            _log(
-                opt,
-                "Facial reduction: exact face recovery failed for a non-coordinate face; trying tentative rationalized kernel direction",
-            )
-            nothing
-        else
-            rethrow()
-        end
-    end
-    if reduction === nothing
-        tentative_problem = _tentative_facial_reduction_problem(opt, problem, candidate, F)
-        tentative_problem === nothing && return problem
-        return tentative_problem
-    end
-    exposed_scalars, keep_bases = reduction
-    certified_reduction = _CertifiedFacialReduction(
-        "certified solver reduction",
-        exposed_scalars,
-        keep_bases,
-    )
+    reduction = _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
+    reduction === nothing && return problem
+    exposed_scalars = reduction.exposed_scalars
+    keep_bases = reduction.keep_bases
     removed_psd_directions = sum(
         (problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases));
         init = 0,
@@ -2119,10 +2047,50 @@ function _facially_reduce_problem(
         end
         throw(ErrorException(message))
     end
-    _record_successful_facial_reduction!(opt, problem, certified_reduction)
+    _record_successful_facial_reduction!(opt, problem, reduction)
     _log(
         opt,
         "facial reduction: fixed $(length(exposed_scalars)) scalar cone direction(s) and removed $(removed_psd_directions) PSD direction(s)",
     )
     return reduced_problem
+end
+
+function _facially_reduce_feasibility_search_problem(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    reduction = try
+        _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
+    catch err
+        _is_inexact_facial_reduction_error(err) || rethrow()
+        _log(opt, "Facial reduction: exact recovery of the candidate face was impossible")
+        nothing
+    end
+    if reduction !== nothing
+        reduced_problem = _apply_facial_reduction(
+            problem,
+            reduction.exposed_scalars,
+            reduction.keep_bases,
+        )
+        if reduced_problem.affine === nothing
+            message =
+                "Facial reduction found a PSD block on the cone boundary, " *
+                "but the exposed nullspace directions could not be represented exactly over the rational coefficient field."
+            if _facial_reduction_irrational_behavior(opt.settings) == :warn
+                _log(opt, message)
+                return (problem = problem, tentative = false)
+            end
+            throw(ErrorException(message))
+        end
+        _record_successful_facial_reduction!(opt, problem, reduction)
+        return (problem = reduced_problem, tentative = false)
+    end
+    tentative_problem = _tentative_feasibility_search_problem(opt, problem, candidate, F)
+    return (
+        problem = tentative_problem === nothing ? problem : tentative_problem,
+        tentative = tentative_problem !== nothing,
+    )
 end

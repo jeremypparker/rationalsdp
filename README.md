@@ -95,7 +95,11 @@ value(t)      # close to 1//4, returned as an exact rational
 For larger SOS models, expect performance and robustness to depend strongly on
 the Gram basis and on whether the feasible set lies on a PSD face. The solver
 can prune some forced zero directions exactly and can run facial reduction when
-the exposed face can be certified from exact problem data.
+the exposed face can be certified from exact problem data. For constant-objective
+feasibility problems, an uncertified numerical face may also be used purely as a
+search aid. Any point found that way is accepted only after exact validation of
+all affine equations and cones in the original, unreduced SDP; the restriction
+is never used to claim infeasibility or an objective bound.
 
 ## Facial Reduction
 
@@ -117,9 +121,9 @@ float type, system solver, iteration limit, and tolerance settings as Phase I;
 Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
 expose a nonzero face, vanish on free coordinates, and have an exact affine-row
 certificate. PSD kernel directions are accepted only when the exact affine rows
-or PSD implications prove the direction is forced to zero. As a final fallback,
-RationalSDP may try a tentative rationalized kernel reduction, but it is kept
-only if the exact reduced affine system remains consistent.
+or PSD implications prove the direction is forced to zero. Uncertified
+rationalized kernel directions are never applied merely because the resulting
+affine system remains consistent.
 
 ## Quasiconvex One-Parameter Problems
 
@@ -164,7 +168,10 @@ MOI.get(backend(model), MOI.RawStatusString())
 
 The solver currently uses a bounded parameter search. It assumes the feasible
 set is monotone in the objective parameter; it does not prove monotonicity from
-the model.
+the model. Reaching the configured bisection count returns `MOI.ITERATION_LIMIT`
+with the best exact feasible primal point found. A fixed-parameter probe that is
+neither feasible nor reported infeasible by the numerical backend returns
+`MOI.NUMERICAL_ERROR` rather than being treated as infeasible.
 
 General quadratic SDP constraints are not supported.
 
@@ -282,6 +289,11 @@ RationalSDP expects rational model data. The numerical solve is used to locate a
 good point, but the returned primal solution is rational and is checked against
 the exact affine system.
 
+For ordinary optimization, `MOI.OPTIMAL` is returned only after Phase II meets
+both its numerical stationarity and gap criteria. Iteration or line-search
+limits can still return an exact feasible primal point with a non-optimal
+termination status.
+
 This does not mean every returned certificate is automatically a complete proof.
 For proof use, you should still independently check the final rational matrices,
 polynomial identities, and PSD conditions relevant to your argument.
@@ -297,8 +309,7 @@ Important current limitations:
 - no general nonconvex quadratic support
 - quasiconvex support is restricted to one bounded objective parameter
 - exact recovery can fail on badly conditioned or nearly infeasible problems
-- facial reduction is partial and only applies faces certified exactly, with a
-  narrow consistency-checked fallback for rationalized boundary kernels
+- facial reduction is partial; uncertified face candidates are only feasibility-search aids
 - large SOS models can be slow
 
 Use established SDP solvers when you need broad conic coverage, dual

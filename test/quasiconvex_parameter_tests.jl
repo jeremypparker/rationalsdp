@@ -1,6 +1,6 @@
 @testset "Quasiconvex parameter optimization via JuMP" begin
     model = rational_model(Rational{BigInt})
-    set_optimizer_attribute(model, "phase1_backend", :native)
+    set_optimizer_attribute(model, "phase1_backend", :hypatia)
     set_optimizer_attribute(model, "working_float_type", Float64)
     set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 3)
     @test get_optimizer_attribute(
@@ -10,19 +10,21 @@
 
     @variable(model, 0//1 <= gamma <= 2//1)
     @variable(model, 0//1 <= x <= 1//1)
-    @constraint(model, Symmetric([gamma * x 1//1; 1//1 x]) in PSDCone())
+    psd_constraint = @constraint(model, Symmetric([gamma * x 1//1; 1//1 x]) in PSDCone())
     @objective(model, Min, gamma)
 
     optimize!(model)
 
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.ITERATION_LIMIT
     @test primal_status(model) == MOI.FEASIBLE_POINT
     @test objective_value(model) == value(gamma)
     @test 1//1 <= value(gamma) <= 5//4
     @test 0//1 <= value(x) <= 1//1
     @test is_psd_exact([value(gamma) * value(x) 1//1; 1//1 value(x)])
+    @test MOI.get(backend(model), MOI.ConstraintPrimal(), index(psd_constraint)) ==
+          Rational{BigInt}[value(gamma) * value(x), 1//1, value(x)]
     @test MOI.get(backend(model), MOI.RawStatusString()) ==
-          "Solved by quasi-convex parameter search"
+          "Quasi-convex parameter search reached its bisection iteration limit"
 end
 
 @testset "Quasiconvex fixed probes match substituted feasibility extraction" begin
@@ -113,25 +115,26 @@ end
 
 @testset "Quasiconvex scalar quadratic equality via JuMP" begin
     model = rational_model(Rational{BigInt})
-    set_optimizer_attribute(model, "phase1_backend", :native)
+    set_optimizer_attribute(model, "phase1_backend", :hypatia)
     set_optimizer_attribute(model, "working_float_type", Float64)
     set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 3)
 
     @variable(model, 0//1 <= gamma <= 2//1)
     @variable(model, 0//1 <= x <= 1//1)
-    @constraint(model, gamma * x == 1//1)
+    quadratic_constraint = @constraint(model, gamma * x == 1//1)
     @objective(model, Min, gamma)
 
     optimize!(model)
 
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.ITERATION_LIMIT
     @test primal_status(model) == MOI.FEASIBLE_POINT
     @test objective_value(model) == value(gamma)
     @test 1//1 <= value(gamma) <= 5//4
     @test 0//1 <= value(x) <= 1//1
     @test value(gamma) * value(x) == 1//1
+    @test value(quadratic_constraint) == 1//1
     @test MOI.get(backend(model), MOI.RawStatusString()) ==
-          "Solved by quasi-convex parameter search"
+          "Quasi-convex parameter search reached its bisection iteration limit"
 end
 
 @testset "Quasiconvex endpoint handling" begin
@@ -175,11 +178,49 @@ end
     @test termination_status(max_lower_infeasible) == MOI.INFEASIBLE
     @test MOI.get(backend(max_lower_infeasible), MOI.RawStatusString()) ==
           "Quasi-convex parameter lower bound is infeasible"
+
+    boundary_block = RationalSDP.BlockStructure(
+        2,
+        Union{Nothing,MOI.VariableIndex}[nothing, nothing, nothing],
+        [1, 2, 3],
+        [(1, 1), (2, 1), (2, 2)],
+        [1, 3],
+    )
+    boundary_problem = RationalSDP.ProblemData(
+        MOI.VariableIndex[],
+        [boundary_block],
+        Int[],
+        zeros(Rational{BigInt}, 3),
+        0//1,
+        zeros(Rational{BigInt}, 3),
+        zeros(Rational{BigInt}, 0, 3),
+        Rational{BigInt}[],
+        (
+            Rational{BigInt}[1//1, 0//1, 0//1],
+            zeros(Rational{BigInt}, 3, 0),
+        ),
+    )
+    boundary_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+        verbose = false,
+        phase1_backend = :native,
+        working_float_type = Float64,
+        max_iterations = 1,
+        phase1_outer_iterations = 1,
+        facial_reduction = false,
+    )
+    boundary_probe = RationalSDP._quasiconvex_feasible_point(
+        boundary_opt,
+        boundary_problem,
+        Float64;
+        facial_reduction = false,
+    )
+    @test boundary_probe.status == :unknown
+    @test boundary_probe.anchor === nothing
 end
 
 @testset "Quasiconvex max scalar quadratic via JuMP" begin
     model = rational_model(Rational{BigInt})
-    set_optimizer_attribute(model, "phase1_backend", :native)
+    set_optimizer_attribute(model, "phase1_backend", :hypatia)
     set_optimizer_attribute(model, "working_float_type", Float64)
     set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 4)
     set_optimizer_attribute(
@@ -200,13 +241,13 @@ end
 
     optimize!(model)
 
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.ITERATION_LIMIT
     @test primal_status(model) == MOI.FEASIBLE_POINT
     @test objective_value(model) == value(gamma)
     @test 1//1 <= value(gamma) <= 9//8
     @test value(gamma) * value(x) <= 1//1
     @test MOI.get(backend(model), MOI.RawStatusString()) ==
-          "Solved by quasi-convex parameter search"
+          "Quasi-convex parameter search reached its bisection iteration limit"
 end
 
 @testset "Unsupported quadratic PSD constraints fail clearly" begin

@@ -107,6 +107,18 @@ include("slowtest_helpers.jl")
     end
 
     @testset "Hypatia Phase I system solver selection" begin
+        @test RationalSDP._hypatia_solution_is_usable(Float64[0.0, 1.0], 2)
+        @test !RationalSDP._hypatia_solution_is_usable(Float64[NaN, 1.0], 2)
+        @test !RationalSDP._hypatia_solution_is_usable(Float64[0.0, Inf], 2)
+        @test !RationalSDP._hypatia_solution_is_usable(Float64[0.0], 2)
+        @test RationalSDP._phase1_status_is_infeasible(
+            string(RationalSDP.Hypatia.Solvers.PrimalInfeasible),
+        )
+        @test RationalSDP._phase1_status_is_infeasible(
+            string(RationalSDP.Hypatia.Solvers.NearPrimalInfeasible),
+        )
+        @test !RationalSDP._phase1_status_is_infeasible(nothing)
+
         margin_goal = 1.0e-8
         boundary_fraction = 0.01
         @test RationalSDP._phase1_hypatia_margin_is_boundary(
@@ -270,6 +282,19 @@ include("slowtest_helpers.jl")
         @test_throws ArgumentError RationalSDP._exact_rational(pi)
     end
 
+    @testset "Invalid numeric settings fail before solving" begin
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(inner_log_frequency = 0),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(line_search_shrink = big"1.0"),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(phase2_outer_iterations = 0),
+        )
+        @test RationalSDP._validate_settings(RationalSDP.Settings()) === nothing
+    end
+
     @testset "Native Phase I backend override" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "phase1_backend", :native)
@@ -321,6 +346,23 @@ include("slowtest_helpers.jl")
         @test refined[1] < anchor[1]
         @test RationalSDP._exact_objective_value(problem, refined) <
               RationalSDP._exact_objective_value(problem, anchor)
+    end
+
+    @testset "Phase II iteration limit is not reported as optimal" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "phase2_outer_iterations", 1)
+        set_optimizer_attribute(model, "optimality_gap_tolerance", "1e-30")
+        @variable(model, x >= 0//1)
+        @objective(model, Min, x)
+
+        optimize!(model)
+
+        @test termination_status(model) == MOI.ITERATION_LIMIT
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test result_count(model) == 1
+        @test value(x) > 0//1
+        @test MOI.get(backend(model), MOI.RawStatusString()) ==
+              "Phase II outer iteration limit reached"
     end
 
     @testset "Phase I exact recovery fallback from candidate point" begin
@@ -1042,6 +1084,81 @@ include("slowtest_helpers.jl")
                 Float64,
             ),
         )
+
+        # A single boundary point does not identify a face of the whole affine
+        # slice.  Here X[1, 1] == 1 admits I as a positive-definite point, so the
+        # singular candidate diag(1, 0) must not remove the second PSD direction.
+        full_face_block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing, nothing, nothing],
+            [1, 2, 3],
+            [(1, 1), (2, 1), (2, 2)],
+            [1, 3],
+        )
+        full_face_A = Rational{BigInt}[1//1 0//1 0//1]
+        full_face_b = Rational{BigInt}[1//1]
+        full_face_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [full_face_block],
+            Int[],
+            zeros(Rational{BigInt}, 3),
+            0//1,
+            zeros(Rational{BigInt}, 3),
+            full_face_A,
+            full_face_b,
+            RationalSDP._solve_affine_system(full_face_A, full_face_b),
+        )
+        full_face_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            working_float_type = Float64,
+            facial_reduction_float_type = Float64,
+            facial_reduction_irrational_behavior = :warn,
+        )
+        unreduced = RationalSDP._facially_reduce_problem(
+            full_face_opt,
+            full_face_problem,
+            Float64[1.0, 0.0, 0.0],
+            Float64,
+        )
+        @test [candidate_block.size for candidate_block in unreduced.blocks] == [2]
+        @test size(unreduced.A) == size(full_face_problem.A)
+
+        @test RationalSDP._exact_primal_feasibility(
+            full_face_problem,
+            Rational{BigInt}[1//1, 0//1, 0//1],
+        ).ok
+        @test RationalSDP._exact_primal_feasibility(
+            full_face_problem,
+            Rational{BigInt}[1//1, 0//1, 1//1],
+        ).ok
+        @test !RationalSDP._exact_primal_feasibility(
+            full_face_problem,
+            Rational{BigInt}[2//1, 0//1, 1//1],
+        ).ok
+        @test !RationalSDP._exact_primal_feasibility(
+            full_face_problem,
+            Rational{BigInt}[1//1, 2//1, 1//1],
+        ).ok
+
+        scalar_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            RationalSDP.BlockStructure[],
+            [1],
+            Rational{BigInt}[0//1],
+            0//1,
+            Rational{BigInt}[0//1],
+            zeros(Rational{BigInt}, 0, 1),
+            Rational{BigInt}[],
+            (Rational{BigInt}[0//1], reshape(Rational{BigInt}[1//1], 1, 1)),
+        )
+        @test RationalSDP._exact_primal_feasibility(
+            scalar_problem,
+            Rational{BigInt}[0//1],
+        ).ok
+        @test !RationalSDP._exact_primal_feasibility(
+            scalar_problem,
+            Rational{BigInt}[-1//1],
+        ).ok
     end
 
     @testset "PSD face pruning from forced nullspace directions" begin
@@ -1231,7 +1348,8 @@ include("slowtest_helpers.jl")
 
         reduction = RationalSDP._facial_reduction_round(opt, problem, candidate, Float64)
         @test reduction !== nothing
-        exposed_scalars, keep_bases = reduction
+        exposed_scalars = reduction.exposed_scalars
+        keep_bases = reduction.keep_bases
         @test exposed_scalars == [1]
         @test isempty(keep_bases)
 
@@ -1301,7 +1419,8 @@ include("slowtest_helpers.jl")
             Float64,
         )
         @test reduction !== nothing
-        exposed_scalars, keep_bases = reduction
+        exposed_scalars = reduction.exposed_scalars
+        keep_bases = reduction.keep_bases
         @test exposed_scalars == [1]
         @test isempty(keep_bases)
     end
@@ -1368,7 +1487,8 @@ include("slowtest_helpers.jl")
         if reduction1 === nothing
             @test reduction1 === nothing
         else
-            exposed_scalars1, keep_bases1 = reduction1
+            exposed_scalars1 = reduction1.exposed_scalars
+            keep_bases1 = reduction1.keep_bases
             @test !isempty(keep_bases1)
 
             reduced_problem = RationalSDP._apply_facial_reduction(problem, exposed_scalars1, keep_bases1)
@@ -1610,7 +1730,7 @@ include("slowtest_helpers.jl")
         @objective(model, Min, B)
         optimize!(model)
 
-        @test termination_status(model) == MOI.OPTIMAL
+        @test termination_status(model) == MOI.ITERATION_LIMIT
         @test value(B) > 729//1
         @test value(B) < 730//1
         @test is_psd_exact(value.(Q))
@@ -1638,7 +1758,7 @@ include("slowtest_helpers.jl")
         @objective(model, Min, B)
         optimize!(model)
 
-        @test termination_status(model) == MOI.OPTIMAL
+        @test termination_status(model) == MOI.ITERATION_LIMIT
         @test value(B) > 728//1
         @test value(B) < 730//1
         @test is_psd_exact(value.(Q))

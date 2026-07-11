@@ -825,6 +825,10 @@ function _hypatia_phase1_point(
     return point
 end
 
+function _hypatia_solution_is_usable(solution, expected_length::Int)
+    return solution !== nothing && length(solution) == expected_length && all(isfinite, solution)
+end
+
 function _phase1_hypatia_reason(attempt::Phase1HypatiaAttempt)
     if attempt.reason == :exact_anchor
         return "exact anchor recovered"
@@ -840,6 +844,14 @@ function _phase1_hypatia_reason(attempt::Phase1HypatiaAttempt)
         return "numerical point could not be recovered as an exact strict interior point"
     end
     return "no exact anchor"
+end
+
+function _phase1_status_is_infeasible(status)
+    status === nothing && return false
+    return status in (
+        string(Hypatia.Solvers.PrimalInfeasible),
+        string(Hypatia.Solvers.NearPrimalInfeasible),
+    )
 end
 
 function _phase1_hypatia_margin_is_boundary(
@@ -960,9 +972,28 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
+        if !_hypatia_solution_is_usable(raw_solution, solution_length)
+            solver = nothing
+            model = nothing
+            raw_solution = nothing
+            _gc_checkpoint!(opt, "after Hypatia solve (non-finite point)")
+            attempt = Phase1HypatiaAttempt{HF}(
+                nothing,
+                nothing,
+                dual_slack,
+                string(status),
+                iterations,
+                nothing,
+                nothing,
+                total_time_sec,
+                :nonfinite_point,
+            )
+            _log_phase1_hypatia_attempt(opt, attempt)
+            return attempt
+        end
+
         coordinates = raw_solution[1:(end - 1)]
         margin = raw_solution[end]
-        raw_solution_finite = all(isfinite, raw_solution)
         raw_solution = nothing
         raw_cone_dual = nothing
         solver = nothing
@@ -982,21 +1013,6 @@ function _phase1_hypatia_anchor_once(
             residual,
             HF,
         )
-        if !raw_solution_finite
-            attempt = Phase1HypatiaAttempt{HF}(
-                nothing,
-                candidate,
-                dual_slack,
-                string(status),
-                iterations,
-                margin,
-                residual,
-                total_time_sec,
-                :nonfinite_point,
-            )
-            _log_phase1_hypatia_attempt(opt, attempt)
-            return attempt
-        end
         if _phase1_hypatia_margin_is_boundary(
             margin,
             status,
@@ -1310,16 +1326,26 @@ function _newton_phase2!(
             settings,
         )
         value = barrier_parameter * dot(c_big, x) + barrier_value
-        grad_x = barrier_parameter * c_big + barrier_grad_x
-        grad_z = Nt_big * grad_x
+        objective_grad_z = Nt_big * (barrier_parameter * c_big)
+        barrier_grad_z = Nt_big * barrier_grad_x
+        grad_z = objective_grad_z + barrier_grad_z
         grad_norm = _max_abs(grad_z)
+        grad_scale = max(one(F), _max_abs(objective_grad_z), _max_abs(barrier_grad_z))
+        relative_grad_norm = grad_norm / grad_scale
         if iteration == 1 || iteration % settings.inner_log_frequency == 0
             _log_newton(
                 opt,
-                "phase II newton $(iteration): grad=$(_format_metric(grad_norm))",
+                "phase II newton $(iteration): relative_grad=$(_format_metric(relative_grad_norm))",
             )
         end
-        grad_norm <= settings.gradient_tolerance && return z
+        if relative_grad_norm <= settings.phase2_gradient_tolerance
+            return (
+                z = z,
+                converged = true,
+                reason = :gradient_tolerance,
+                gradient_norm = relative_grad_norm,
+            )
+        end
         hess_z = Nt_big * barrier_hess_x * N_big
         direction = -_solve_spd_system(hess_z, grad_z)
         direction_x = N_big * direction
@@ -1354,9 +1380,35 @@ function _newton_phase2!(
             end
             step *= settings.line_search_shrink
         end
-        accepted || return z
+        if !accepted
+            return (
+                z = z,
+                converged = false,
+                reason = :line_search_failed,
+                gradient_norm = relative_grad_norm,
+            )
+        end
     end
-    return z
+    x = x0 + N_big * z
+    _, barrier_grad_x, _ = _barrier_value_grad_hess(
+        x,
+        numeric_blocks,
+        positive_scalars,
+        settings,
+    )
+    final_objective_grad = transpose(N_big) * (barrier_parameter * c_big)
+    final_barrier_grad = transpose(N_big) * barrier_grad_x
+    final_gradient_norm = _max_abs(final_objective_grad + final_barrier_grad) / max(
+        one(F),
+        _max_abs(final_objective_grad),
+        _max_abs(final_barrier_grad),
+    )
+    return (
+        z = z,
+        converged = final_gradient_norm <= settings.phase2_gradient_tolerance,
+        reason = :newton_iteration_limit,
+        gradient_norm = final_gradient_norm,
+    )
 end
 
 function _exact_objective_value(problem::ProblemData, x::Vector{ExactRational})
@@ -1395,6 +1447,8 @@ function _phase2_exact_solution(
             x_exact = anchor,
             x_numeric = _to_working_array(F, anchor),
             barrier_parameter = one(F),
+            termination_reason = :optimal,
+            gap_bound = zero(F),
         )
     particular, nullspace = problem.affine
     phase2_nullspace = _phase2_nullspace(problem)
@@ -1406,6 +1460,8 @@ function _phase2_exact_solution(
             x_exact = anchor,
             x_numeric = _to_working_array(F, anchor),
             barrier_parameter = one(F),
+            termination_reason = :optimal,
+            gap_bound = zero(F),
         )
     elseif size(phase2_nullspace, 2) < size(nullspace, 2)
         _log(
@@ -1437,15 +1493,12 @@ function _phase2_exact_solution(
         subtitle = subtitle,
     )
     phase2_start_time = time_ns()
-    previous_objective = nothing
-    previous_z = copy(z)
-    stagnation_tolerance = max(F(1.0e-8), sqrt(eps(F)))
-    stagnation_count = 0
     last_barrier_parameter = barrier_parameter
+    last_gap_bound = _to_working_float(F, barrier_dim) / barrier_parameter
+    termination_reason = :outer_iteration_limit
     for outer_iteration in 1:opt.settings.phase2_outer_iterations
         last_barrier_parameter = barrier_parameter
-        previous_z .= z
-        z = _newton_phase2!(
+        newton_result = _newton_phase2!(
             opt,
             z,
             x0,
@@ -1456,9 +1509,11 @@ function _phase2_exact_solution(
             barrier_parameter,
             numeric_settings,
         )
+        z = newton_result.z
         x_trial = x0 + N_big * z
         approximate_objective = dot(c_big, x_trial) + _to_working_float(F, problem.objective_constant_raw)
         gap_bound = _to_working_float(F, barrier_dim) / barrier_parameter
+        last_gap_bound = gap_bound
         phase2_row = [
             string(outer_iteration),
             _format_metric(barrier_parameter),
@@ -1467,25 +1522,18 @@ function _phase2_exact_solution(
             @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
         ]
         _log_table_row(opt, phase2_row, phase2_widths, phase2_alignments)
-        if gap_bound <= numeric_settings.optimality_gap_tolerance
+        if !newton_result.converged
+            termination_reason = newton_result.reason
+            _log(
+                opt,
+                "Phase II Newton solve did not converge ($(newton_result.reason), gradient=$(_format_metric(newton_result.gradient_norm)))",
+            )
             break
         end
-        if previous_objective !== nothing
-            objective_scale = max(one(F), abs(previous_objective), abs(approximate_objective))
-            objective_change = abs(approximate_objective - previous_objective) / objective_scale
-            z_scale = max(one(F), _max_abs(previous_z), _max_abs(z))
-            z_change = _max_abs(z - previous_z) / z_scale
-            if objective_change <= stagnation_tolerance && z_change <= stagnation_tolerance
-                stagnation_count += 1
-                if stagnation_count >= 2
-                    _log(opt, "Phase II stalled; stopping early")
-                    break
-                end
-            else
-                stagnation_count = 0
-            end
+        if gap_bound <= numeric_settings.optimality_gap_tolerance
+            termination_reason = :optimal
+            break
         end
-        previous_objective = approximate_objective
         barrier_parameter *= numeric_settings.path_parameter_growth
     end
 
@@ -1502,5 +1550,7 @@ function _phase2_exact_solution(
         ),
         x_numeric = x_numeric,
         barrier_parameter = last_barrier_parameter,
+        termination_reason = termination_reason,
+        gap_bound = last_gap_bound,
     )
 end

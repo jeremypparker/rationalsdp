@@ -634,6 +634,26 @@ function _positive_semidefinite_exact(matrix::Matrix{ExactRational})
     return true
 end
 
+function _exact_primal_feasibility(problem::ProblemData, x::Vector{ExactRational})
+    dimension = length(problem.objective_vector_raw)
+    length(x) >= dimension || return (ok = false, reason = "solution vector is too short")
+    original_x = x[1:dimension]
+
+    problem.A * original_x == problem.b ||
+        return (ok = false, reason = "an original affine equation is violated")
+    for position in problem.positive_scalars
+        original_x[position] >= 0 ||
+            return (ok = false, reason = "an original scalar cone constraint is violated")
+    end
+    for (block_index, block) in enumerate(problem.blocks)
+        _positive_semidefinite_exact(_vector_to_matrix(original_x, block)) || return (
+            ok = false,
+            reason = "original PSD block $(block_index) is not positive semidefinite",
+        )
+    end
+    return (ok = true, reason = "exactly feasible for the original SDP")
+end
+
 function _positive_definite_exact(matrix::Matrix{ExactRational})
     size(matrix, 1) == size(matrix, 2) || return false
     n = size(matrix, 1)

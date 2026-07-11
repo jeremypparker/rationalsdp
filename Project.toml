@@ -18,7 +18,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 [compat]
 DoubleFloats = "1.6.2"
 Hypatia = "0.9.1"
-Logging = "1.11.0"
+Logging = "1.10, 1.11"
 MathOptInterface = "1"
 MultiFloats = "3"
 Nemo = "0.45 - 0.56"

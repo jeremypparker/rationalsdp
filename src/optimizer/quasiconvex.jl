@@ -162,18 +162,54 @@ function _fixed_parameter_feasible(
 ) where {T<:Real}
     fixed_exact = _exact_rational(fixed_value)
     if fixed_exact < template.parameter_lower || fixed_exact > template.parameter_upper
-        return (false, nothing, nothing, false)
+        return (status = :infeasible, problem = nothing, anchor = nothing, used_reduction = false)
     end
     problem = _instantiate_fixed_parameter_problem(opt, template, fixed_value)
-    return _with_working_precision(opt.settings, function (F)
-        result = _quasiconvex_feasible_point(opt, problem, F; facial_reduction)
-        return (
-            result.anchor !== nothing,
-            problem,
-            result.anchor,
-            result.facial_reduction_rounds > 0,
+    try
+        return _with_working_precision(opt.settings, function (F)
+            result = _quasiconvex_feasible_point(opt, problem, F; facial_reduction)
+            return (
+                status = result.status,
+                problem = problem,
+                anchor = result.anchor,
+                used_reduction = result.facial_reduction_rounds > 0,
+            )
+        end)
+    catch err
+        if err isa ErrorException && occursin(
+            "could not be represented exactly over the rational coefficient field",
+            err.msg,
         )
-    end)
+            _log(
+                opt,
+                "quasi-convex fixed probe was inconclusive because an exposed face could not be certified over the rational coefficient field",
+            )
+            return (
+                status = :unknown,
+                problem = problem,
+                anchor = nothing,
+                used_reduction = false,
+            )
+        end
+        rethrow()
+    end
+end
+
+function _fixed_parameter_probe_with_retry(
+    opt::Optimizer{T},
+    template::QuasiconvexProblemTemplate,
+    fixed_value::T,
+    facial_reduction::Bool,
+) where {T<:Real}
+    probe = _fixed_parameter_feasible(opt, template, fixed_value, facial_reduction)
+    if probe.status == :unknown && !facial_reduction && opt.settings.facial_reduction
+        _log(
+            opt,
+            "quasi-convex fixed probe was inconclusive without facial reduction; retrying with certified facial reduction",
+        )
+        return _fixed_parameter_feasible(opt, template, fixed_value, true)
+    end
+    return probe
 end
 
 function _populate_from_quasiconvex_child!(
@@ -182,18 +218,42 @@ function _populate_from_quasiconvex_child!(
     problem::ProblemData,
     x_exact::Vector{ExactRational},
     objective_value::T,
+    ;
+    termination_status::MOI.TerminationStatusCode = MOI.OPTIMAL,
+    raw_status::String = "Solved by quasi-convex parameter search",
 ) where {T<:Real}
     for (index, variable) in enumerate(problem.original_variables)
         opt.variable_primal[variable] = _to_output_type(T, x_exact[index])
     end
     opt.variable_primal[data.parameter] = objective_value
+    _populate_constraint_results!(opt, problem, x_exact)
     opt.objective_value = objective_value
-    opt.termination_status = MOI.OPTIMAL
+    opt.termination_status = termination_status
     opt.primal_status = MOI.FEASIBLE_POINT
     opt.dual_status = MOI.NO_SOLUTION
-    opt.raw_status = "Solved by quasi-convex parameter search"
+    opt.raw_status = raw_status
     opt.result_count = 1
     return
+end
+
+function _exact_cone_infeasibility_reason(problem::ProblemData)
+    problem.affine === nothing && return "inconsistent affine equations"
+    particular, nullspace = problem.affine
+    for position in problem.positive_scalars
+        if all(iszero, view(nullspace, position, :)) && particular[position] < 0
+            return "positive scalar at position $(position) is fixed negative"
+        end
+    end
+    for (block_index, block) in enumerate(problem.blocks)
+        all_entries_fixed = all(
+            position -> all(iszero, view(nullspace, position, :)),
+            block.global_positions,
+        )
+        all_entries_fixed || continue
+        _positive_semidefinite_exact(_vector_to_matrix(particular, block)) && continue
+        return "PSD block $(block_index) is fixed to a non-PSD matrix"
+    end
+    return nothing
 end
 
 function _append_exact_row(
@@ -681,17 +741,26 @@ function _quasiconvex_feasible_point(
     ;
     facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {F<:AbstractFloat}
-    problem.affine === nothing && return (anchor = nothing, facial_reduction_rounds = 0)
+    problem.affine === nothing &&
+        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
     problem = _apply_loaded_facial_reductions(opt, problem)
-    problem.affine === nothing && return (anchor = nothing, facial_reduction_rounds = 0)
+    problem.affine === nothing &&
+        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
+    infeasibility_reason = _exact_cone_infeasibility_reason(problem)
+    if infeasibility_reason !== nothing
+        _log(opt, "quasi-convex fixed probe is exactly infeasible: $(infeasibility_reason)")
+        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
+    end
     particular, nullspace = problem.affine
     barrier_dim = _barrier_dimension(problem)
-    barrier_dim == 0 && return (anchor = particular, facial_reduction_rounds = 0)
+    barrier_dim == 0 &&
+        return (status = :feasible, anchor = particular, facial_reduction_rounds = 0)
 
     phase1_result = _phase1_anchor_attempt(opt, problem, F)
     anchor = phase1_result.anchor
     phase1_candidate = phase1_result.phase1_candidate
     phase1_dual_slack = phase1_result.phase1_dual_slack
+    phase1_status = phase1_result.phase1_status
 
     facial_reduction_round = 0
     while anchor === nothing &&
@@ -716,9 +785,17 @@ function _quasiconvex_feasible_point(
         anchor = phase1_result.anchor
         phase1_candidate = phase1_result.phase1_candidate
         phase1_dual_slack = phase1_result.phase1_dual_slack
+        phase1_status = phase1_result.phase1_status
     end
 
-    return (anchor = anchor, facial_reduction_rounds = facial_reduction_round)
+    status = if anchor !== nothing
+        :feasible
+    elseif _phase1_status_is_infeasible(phase1_status)
+        :infeasible
+    else
+        :unknown
+    end
+    return (status = status, anchor = anchor, facial_reduction_rounds = facial_reduction_round)
 end
 
 function _set_quasiconvex_endpoint_infeasible!(opt::Optimizer, endpoint_name::String)
@@ -726,6 +803,14 @@ function _set_quasiconvex_endpoint_infeasible!(opt::Optimizer, endpoint_name::St
     opt.primal_status = MOI.NO_SOLUTION
     opt.dual_status = MOI.NO_SOLUTION
     opt.raw_status = "Quasi-convex parameter $(endpoint_name) bound is infeasible"
+    return true
+end
+
+function _set_quasiconvex_probe_unknown!(opt::Optimizer, description::String)
+    opt.termination_status = MOI.NUMERICAL_ERROR
+    opt.primal_status = MOI.NO_SOLUTION
+    opt.dual_status = MOI.NO_SOLUTION
+    opt.raw_status = "Quasi-convex parameter $(description) probe was inconclusive"
     return true
 end
 
@@ -742,40 +827,77 @@ function _quasiconvex_parameter_search!(
 
     if opt.settings.quasiconvex_skip_facial_reduction_after_clean_endpoint &&
        opt.settings.facial_reduction
-        fallback_feasible, fallback_problem, fallback_point, fallback_used_reduction =
-            _fixed_parameter_feasible(opt, template, fallback_endpoint, true)
-        fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
-        facial_reduction = fallback_used_reduction
+        fallback_probe = _fixed_parameter_feasible(opt, template, fallback_endpoint, true)
+        fallback_probe.status == :infeasible &&
+            return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
+        fallback_probe.status == :unknown &&
+            return _set_quasiconvex_probe_unknown!(opt, fallback_name)
+        fallback_problem = fallback_probe.problem
+        fallback_point = fallback_probe.anchor
+        facial_reduction = fallback_probe.used_reduction
         if !facial_reduction
             _log(
                 opt,
-                "quasi-convex endpoint solved without facial reduction; skipping facial reduction for remaining parameter probes",
+                "quasi-convex endpoint solved without facial reduction; later probes will try without it first and retry on inconclusive results",
             )
         end
 
-        best_feasible, best_endpoint_problem, best_endpoint_point, _ =
-            _fixed_parameter_feasible(opt, template, best_endpoint, facial_reduction)
-        if best_feasible
+        best_probe = _fixed_parameter_probe_with_retry(
+            opt,
+            template,
+            best_endpoint,
+            facial_reduction,
+        )
+        if best_probe.status == :feasible
             _populate_from_quasiconvex_child!(
                 opt,
                 data,
-                best_endpoint_problem,
-                best_endpoint_point,
+                best_probe.problem,
+                best_probe.anchor,
                 best_endpoint,
             )
             return true
+        elseif best_probe.status == :unknown
+            _log(
+                opt,
+                "quasi-convex optimal-bound probe was inconclusive; continuing with the feasible fallback endpoint without claiming optimality",
+            )
         end
     else
-        best_feasible, best_problem, best_point, _ =
-            _fixed_parameter_feasible(opt, template, best_endpoint, facial_reduction)
-        if best_feasible
-            _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_endpoint)
+        best_probe = _fixed_parameter_probe_with_retry(
+            opt,
+            template,
+            best_endpoint,
+            facial_reduction,
+        )
+        if best_probe.status == :feasible
+            _populate_from_quasiconvex_child!(
+                opt,
+                data,
+                best_probe.problem,
+                best_probe.anchor,
+                best_endpoint,
+            )
             return true
+        elseif best_probe.status == :unknown
+            _log(
+                opt,
+                "quasi-convex optimal-bound probe was inconclusive; checking the fallback endpoint before continuing",
+            )
         end
 
-        fallback_feasible, fallback_problem, fallback_point, _ =
-            _fixed_parameter_feasible(opt, template, fallback_endpoint, facial_reduction)
-        fallback_feasible || return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
+        fallback_probe = _fixed_parameter_probe_with_retry(
+            opt,
+            template,
+            fallback_endpoint,
+            facial_reduction,
+        )
+        fallback_probe.status == :infeasible &&
+            return _set_quasiconvex_endpoint_infeasible!(opt, fallback_name)
+        fallback_probe.status == :unknown &&
+            return _set_quasiconvex_probe_unknown!(opt, fallback_name)
+        fallback_problem = fallback_probe.problem
+        fallback_point = fallback_probe.anchor
     end
 
     lower = data.lower
@@ -786,12 +908,27 @@ function _quasiconvex_parameter_search!(
 
     for _ in 1:opt.settings.quasiconvex_bisection_iterations
         midpoint = (lower + upper) / 2
-        feasible, problem, point, _ =
-            _fixed_parameter_feasible(opt, template, midpoint, facial_reduction)
-        if feasible
+        probe = _fixed_parameter_probe_with_retry(
+            opt,
+            template,
+            midpoint,
+            facial_reduction,
+        )
+        if probe.status == :unknown
+            _populate_from_quasiconvex_child!(
+                opt,
+                data,
+                best_problem,
+                best_point,
+                best_value;
+                termination_status = MOI.NUMERICAL_ERROR,
+                raw_status = "Quasi-convex parameter midpoint probe was inconclusive",
+            )
+            return true
+        elseif probe.status == :feasible
             best_value = midpoint
-            best_problem = problem
-            best_point = point
+            best_problem = probe.problem
+            best_point = probe.anchor
             if feasible_side_is_upper
                 upper = midpoint
             else
@@ -804,7 +941,15 @@ function _quasiconvex_parameter_search!(
         end
     end
 
-    _populate_from_quasiconvex_child!(opt, data, best_problem, best_point, best_value)
+    _populate_from_quasiconvex_child!(
+        opt,
+        data,
+        best_problem,
+        best_point,
+        best_value;
+        termination_status = MOI.ITERATION_LIMIT,
+        raw_status = "Quasi-convex parameter search reached its bisection iteration limit",
+    )
     return true
 end
 

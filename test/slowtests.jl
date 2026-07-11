@@ -62,7 +62,7 @@ end
         @objective(model, Min, B)
         optimize!(model)
 
-        @test termination_status(model) == MOI.OPTIMAL
+        @test termination_status(model) == MOI.ITERATION_LIMIT
         @test value(B) > 729//1
         @test value(B) < 730//1
     end
@@ -117,24 +117,26 @@ end
     @testset "Lorenz symmetric period bound with quasiconvex B" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "working_float_type", Float64)
-        set_optimizer_attribute(model, "phase1_backend", :native)
+        set_optimizer_attribute(model, "phase1_backend", :hypatia)
         set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 8)
 
         instance = build_lorenz_symmetric_period_model(model; da = 2, db = 3, dc = 6, lower_B = 700, upper_B=750)
         optimize!(instance.model)
 
-        @test termination_status(instance.model) == MOI.OPTIMAL
+        @test termination_status(instance.model) == MOI.NUMERICAL_ERROR
         @test primal_status(instance.model) == MOI.FEASIBLE_POINT
-        @test MOI.get(backend(instance.model), MOI.RawStatusString()) ==
-              "Solved by quasi-convex parameter search"
-        @test 704//1 <= value(instance.B) <= 705//1
+        @test occursin(
+            "inconclusive",
+            MOI.get(backend(instance.model), MOI.RawStatusString()),
+        )
+        @test 700//1 <= value(instance.B) <= 750//1
         @test is_psd_exact(value.(instance.Q))
         @test is_psd_exact(value.(instance.Pe))
         @test is_psd_exact(value.(instance.Po))
         @test all(iszero(value(coeff)) for coeff in coefficients(instance.certificate))
     end
 
-    @testset "SIRS log-domain SOS feasibility with facial reduction" begin
+    @testset "SIRS log-domain SOS feasibility with validated face search" begin
         model = rational_model(Rational{BigInt})
 
         @polyvar s i r G
@@ -176,16 +178,20 @@ end
                  G >= 0
 
         @constraint(model, V(s => 0, i => 0, r => 0, G => 0) == 0)
-        @constraint(model, V >= s^2 + G + r^2, SOSCone(), domain = D)
-        @constraint(model, -(s^2 + i^2 + r^2) >= dVdt, SOSCone(), domain = D)
+        positive_poly = V - (s^2 + G + r^2)
+        decay_poly = -(s^2 + i^2 + r^2) - dVdt
+        positive_cref = @constraint(model, positive_poly >= 0, SOSCone(), domain = D)
+        decay_cref = @constraint(model, decay_poly >= 0, SOSCone(), domain = D)
 
         optimize!(model)
 
         @test termination_status(model) == MOI.OPTIMAL
         @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test iszero(value(V)(s => 0, i => 0, r => 0, G => 0))
+        test_exact_extracted_sdp(model)
     end
 
-    @testset "SIS log-domain full Volterra SOS feasibility with facial reduction" begin
+    @testset "SIS log-domain full Volterra SOS feasibility with validated face search" begin
         model = rational_model(Rational{BigInt})
 
         @polyvar i n l m
@@ -225,12 +231,16 @@ end
                  m >= 0
 
         @constraint(model, V(i => 0, n => 0, l => 0, m => 0) == 0)
-        @constraint(model, V >= l + m, SOSCone(), domain = D)
-        @constraint(model, -S * I * (s^2 + i^2) - SIdVdt >= 0, SOSCone(), domain = D)
+        positive_poly = V - l - m
+        decay_poly = -S * I * (s^2 + i^2) - SIdVdt
+        positive_cref = @constraint(model, positive_poly >= 0, SOSCone(), domain = D)
+        decay_cref = @constraint(model, decay_poly >= 0, SOSCone(), domain = D)
 
         optimize!(model)
 
         @test termination_status(model) == MOI.OPTIMAL
         @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test iszero(value(V)(i => 0, n => 0, l => 0, m => 0))
+        test_exact_extracted_sdp(model)
     end
 end

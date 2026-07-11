@@ -19,7 +19,7 @@ MOIU.@model(
 Base.@kwdef mutable struct Settings
     max_iterations::Int = 80
     phase1_outer_iterations::Int = 100
-    phase2_outer_iterations::Int = 12
+    phase2_outer_iterations::Int = 24
     phase1_backend::Symbol = :hypatia
     phase1_hypatia_float_type::DataType = AbstractFloat
     phase1_hypatia_syssolver::Symbol = :auto
@@ -664,6 +664,75 @@ function _facial_reduction_irrational_behavior(settings::Settings)
     return behavior
 end
 
+function _validate_settings(settings::Settings)
+    positive_integer_fields = (
+        :max_iterations,
+        :phase1_outer_iterations,
+        :phase2_outer_iterations,
+        :phase1_hypatia_iter_limit,
+        :working_precision,
+        :inner_log_frequency,
+        :threading_min_block_size,
+        :iterative_solver_min_dimension,
+        :quasiconvex_bisection_iterations,
+    )
+    for name in positive_integer_fields
+        getfield(settings, name) > 0 || throw(ArgumentError("$(name) must be positive."))
+    end
+    settings.facial_reduction_max_rounds >= 0 ||
+        throw(ArgumentError("facial_reduction_max_rounds must be nonnegative."))
+    settings.phase1_exact_recovery_pivot_log_frequency >= 0 ||
+        throw(ArgumentError("phase1_exact_recovery_pivot_log_frequency must be nonnegative."))
+    settings.exact_refinement_bisections >= 0 ||
+        throw(ArgumentError("exact_refinement_bisections must be nonnegative."))
+
+    _working_float_type(settings)
+    _phase1_backend(settings)
+    _phase1_hypatia_float_type(settings)
+    _phase1_hypatia_syssolver(settings)
+    _phase1_hypatia_target_margin(settings)
+    _phase1_hypatia_boundary_margin_fraction(settings)
+    _facial_reduction_float_type(settings)
+    _facial_reduction_irrational_behavior(settings)
+
+    settings.phase1_hypatia_margin_upper > 0 ||
+        throw(ArgumentError("phase1_hypatia_margin_upper must be positive."))
+    settings.phase1_hypatia_min_margin_upper > 0 ||
+        throw(ArgumentError("phase1_hypatia_min_margin_upper must be positive."))
+    0 < settings.phase1_hypatia_margin_shrink < 1 ||
+        throw(ArgumentError("phase1_hypatia_margin_shrink must lie strictly between 0 and 1."))
+    settings.facial_reduction_exposure_tolerance >= 0 ||
+        throw(ArgumentError("facial_reduction_exposure_tolerance must be nonnegative."))
+    settings.facial_reduction_rank_tolerance >= 0 ||
+        throw(ArgumentError("facial_reduction_rank_tolerance must be nonnegative."))
+
+    positive_real_fields = (
+        :feasibility_tolerance,
+        :optimality_gap_tolerance,
+        :gradient_tolerance,
+        :min_step,
+        :initial_scale,
+        :initial_penalty,
+        :phase1_center_weight,
+        :rational_tolerance,
+    )
+    for name in positive_real_fields
+        getfield(settings, name) > 0 || throw(ArgumentError("$(name) must be positive."))
+    end
+    0 < settings.line_search_shrink < 1 ||
+        throw(ArgumentError("line_search_shrink must lie strictly between 0 and 1."))
+    0 < settings.armijo_fraction < 1 ||
+        throw(ArgumentError("armijo_fraction must lie strictly between 0 and 1."))
+    0 < settings.boundary_fraction < 1 ||
+        throw(ArgumentError("boundary_fraction must lie strictly between 0 and 1."))
+    0 < settings.recovery_tolerance_shrink < 1 ||
+        throw(ArgumentError("recovery_tolerance_shrink must lie strictly between 0 and 1."))
+    settings.penalty_growth > 1 || throw(ArgumentError("penalty_growth must be greater than 1."))
+    settings.path_parameter_growth > 1 ||
+        throw(ArgumentError("path_parameter_growth must be greater than 1."))
+    return nothing
+end
+
 _to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
@@ -738,14 +807,23 @@ function _numeric_settings(settings::Settings, ::Type{F}) where {F<:AbstractFloa
         _to_working_float(F, settings.gradient_tolerance),
         sqrt(eps(F)),
     )
+    effective_optimality_gap_tolerance = max(
+        _to_working_float(F, settings.optimality_gap_tolerance),
+        F(10) * sqrt(eps(F)),
+    )
+    effective_phase2_gradient_tolerance = max(
+        effective_gradient_tolerance,
+        F(100) * sqrt(eps(F)),
+    )
     return (
         max_iterations = settings.max_iterations,
         phase1_outer_iterations = settings.phase1_outer_iterations,
         phase2_outer_iterations = settings.phase2_outer_iterations,
         working_float_type = F,
         feasibility_tolerance = _to_working_float(F, settings.feasibility_tolerance),
-        optimality_gap_tolerance = _to_working_float(F, settings.optimality_gap_tolerance),
+        optimality_gap_tolerance = effective_optimality_gap_tolerance,
         gradient_tolerance = effective_gradient_tolerance,
+        phase2_gradient_tolerance = effective_phase2_gradient_tolerance,
         line_search_shrink = _to_working_float(F, settings.line_search_shrink),
         armijo_fraction = _to_working_float(F, settings.armijo_fraction),
         min_step = _to_working_float(F, settings.min_step),

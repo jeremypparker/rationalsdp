@@ -29,6 +29,25 @@ function _constraint_primal_value(
 end
 
 function _constraint_primal_value(
+    func::MOI.VectorQuadraticFunction{T},
+    variable_primal::Dict{MOI.VariableIndex,T},
+) where {T}
+    values = copy(func.constants)
+    for term in func.affine_terms
+        values[term.output_index] +=
+            term.scalar_term.coefficient * variable_primal[term.scalar_term.variable]
+    end
+    for term in func.quadratic_terms
+        scalar_term = term.scalar_term
+        values[term.output_index] +=
+            scalar_term.coefficient *
+            variable_primal[scalar_term.variable_1] *
+            variable_primal[scalar_term.variable_2]
+    end
+    return values
+end
+
+function _constraint_primal_value(
     func::MOI.VectorAffineFunction{T},
     variable_primal::Dict{MOI.VariableIndex,T},
 ) where {T}
@@ -92,12 +111,20 @@ function _populate_constraint_results!(
         func = MOI.get(opt.storage, MOI.ConstraintFunction(), ci)
         opt.constraint_primal[ci] = _constraint_primal_value(func, opt.variable_primal)
     end
+
+    for (ci, func) in opt.scalar_quadratic_functions
+        opt.constraint_primal[ci] = _constraint_primal_value(func, opt.variable_primal)
+    end
+    for (ci, func) in opt.quadratic_psd_functions
+        opt.constraint_primal[ci] = _constraint_primal_value(func, opt.variable_primal)
+    end
     return
 end
 
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
+    _validate_settings(opt.settings)
     _prepare_facial_reduction_cache!(opt)
     if _try_quasiconvex_parameter_solve!(opt)
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
@@ -111,6 +138,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         _log(opt, "Extracting problem")
         _gc_checkpoint!(opt, "before extraction")
         problem = _extract_problem(opt)
+        original_problem = problem
         _gc_checkpoint!(opt, "after extraction")
         _log(opt, "Problem extracted")
         _log_banner(opt, problem)
@@ -176,6 +204,8 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         phase2_initial_point = phase1_result.phase2_initial_point
         phase1_candidate = phase1_result.phase1_candidate
         phase1_dual_slack = phase1_result.phase1_dual_slack
+        tentative_feasibility_search_used = false
+        feasibility_objective = all(iszero, original_problem.objective_vector_min)
 
         facial_reduction_round = 0
         while anchor === nothing &&
@@ -183,13 +213,28 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
               phase1_candidate !== nothing &&
               facial_reduction_round < opt.settings.facial_reduction_max_rounds
             _log(opt, "Attempting facial reduction")
-            reduced_problem = _facially_reduce_problem(
-                opt,
-                problem,
-                phase1_candidate,
-                phase1_dual_slack,
-                F,
-            )
+            reduction_result = if feasibility_objective
+                _facially_reduce_feasibility_search_problem(
+                    opt,
+                    problem,
+                    phase1_candidate,
+                    phase1_dual_slack,
+                    F,
+                )
+            else
+                (
+                    problem = _facially_reduce_problem(
+                        opt,
+                        problem,
+                        phase1_candidate,
+                        phase1_dual_slack,
+                        F,
+                    ),
+                    tentative = false,
+                )
+            end
+            reduced_problem = reduction_result.problem
+            tentative_feasibility_search_used |= reduction_result.tentative
             problem_changed =
                 length(reduced_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
                 size(reduced_problem.A) != size(problem.A) ||
@@ -227,6 +272,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         end
 
         x_exact = anchor
+        phase2_termination_reason = :optimal
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
             try
                 phase2_result = _phase2_exact_solution(
@@ -239,6 +285,7 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                     subtitle = "Objective path-following",
                 )
                 x_exact = phase2_result.x_exact
+                phase2_termination_reason = phase2_result.termination_reason
             catch err
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
@@ -249,16 +296,42 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             end
         end
 
+        feasibility = _exact_primal_feasibility(original_problem, x_exact)
+        if !feasibility.ok
+            opt.termination_status = MOI.NUMERICAL_ERROR
+            opt.primal_status = MOI.NO_SOLUTION
+            opt.raw_status = "Exact validation against the original SDP failed: $(feasibility.reason)"
+            opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+            _log(opt, opt.raw_status)
+            return
+        end
+
         objective_value = _exact_objective_value(problem, x_exact)
         for (index, variable) in enumerate(problem.original_variables)
             opt.variable_primal[variable] = _to_output_type(T, x_exact[index])
         end
         _populate_constraint_results!(opt, problem, x_exact)
         opt.objective_value = _to_output_type(T, objective_value)
-        opt.termination_status = MOI.OPTIMAL
         opt.primal_status = MOI.FEASIBLE_POINT
         opt.dual_status = MOI.NO_SOLUTION
-        opt.raw_status = "Solved"
+        if phase2_termination_reason == :optimal
+            opt.termination_status = MOI.OPTIMAL
+            opt.raw_status = tentative_feasibility_search_used ?
+                             "Feasible point found by tentative face search and validated exactly against the original SDP" :
+                             "Solved"
+        elseif phase2_termination_reason == :outer_iteration_limit
+            opt.termination_status = MOI.ITERATION_LIMIT
+            opt.raw_status = "Phase II outer iteration limit reached"
+        elseif phase2_termination_reason == :newton_iteration_limit
+            opt.termination_status = MOI.ITERATION_LIMIT
+            opt.raw_status = "Phase II Newton iteration limit reached"
+        elseif phase2_termination_reason == :line_search_failed
+            opt.termination_status = MOI.SLOW_PROGRESS
+            opt.raw_status = "Phase II line search failed"
+        else
+            opt.termination_status = MOI.OTHER_ERROR
+            opt.raw_status = "Phase II stopped for an unknown reason"
+        end
         opt.result_count = 1
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
         _log_raw(opt)

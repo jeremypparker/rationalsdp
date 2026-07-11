@@ -98,6 +98,7 @@ end
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
+    _prepare_facial_reduction_cache!(opt)
     if _try_quasiconvex_parameter_solve!(opt)
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
         return
@@ -120,6 +121,13 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
             return
         end
+        cached_problem = _apply_loaded_facial_reductions(opt, problem)
+        cached_problem_changed =
+            length(cached_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
+            size(cached_problem.A) != size(problem.A) ||
+            _barrier_dimension(cached_problem) != _barrier_dimension(problem)
+        problem = cached_problem
+        cached_problem_changed && _log_banner(opt, problem)
 
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)

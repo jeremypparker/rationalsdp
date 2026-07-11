@@ -46,6 +46,8 @@ Base.@kwdef mutable struct Settings
     facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"
     facial_reduction_irrational_behavior::Symbol = :error
+    facial_reduction_save_file::String = ""
+    facial_reduction_load_file::String = ""
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
     gradient_tolerance::BigFloat = big"1e-24"
@@ -172,6 +174,8 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     scalar_quadratic_functions::Dict{Any,MOI.ScalarQuadraticFunction{T}}
     scalar_quadratic_sets::Dict{Any,Any}
     next_scalar_quadratic_index::Int
+    facial_reduction_save_records::Vector{Any}
+    facial_reduction_loaded_records::Union{Nothing,Vector{Any}}
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -206,6 +210,8 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
         Dict{Any,MOI.ScalarQuadraticFunction{T}}(),
         Dict{Any,Any}(),
         1,
+        Any[],
+        nothing,
     )
 end
 
@@ -535,24 +541,36 @@ end
 function _convert_setting_value(::Type{DataType}, value)
     parsed = if value isa AbstractString
         lowercase(value) == "auto" && return AbstractFloat
-        symbol = Symbol(value)
-        if isdefined(@__MODULE__, symbol)
-            getfield(@__MODULE__, symbol)
-        elseif isdefined(Base, symbol)
-            getfield(Base, symbol)
+        parts = split(value, '.')
+        if length(parts) == 2 && parts[1] == "MultiFloats"
+            symbol = Symbol(parts[2])
+            isdefined(MultiFloats, symbol) || error("Unknown working float type: $(value)")
+            getfield(MultiFloats, symbol)
         else
-            error("Unknown working float type: $(value)")
+            symbol = Symbol(value)
+            if isdefined(@__MODULE__, symbol)
+                getfield(@__MODULE__, symbol)
+            elseif isdefined(Base, symbol)
+                getfield(Base, symbol)
+            else
+                error("Unknown working float type: $(value)")
+            end
         end
     else
         value
     end
-    parsed isa Type || error("Float-type settings must be assigned a floating-point type.")
+    parsed isa DataType || error("Float-type settings must be assigned a floating-point data type.")
     parsed <: AbstractFloat || error("Float-type settings must be subtypes of AbstractFloat.")
     return parsed
 end
 
 function _convert_setting_value(::Type{Symbol}, value)
     return value isa AbstractString ? Symbol(value) : convert(Symbol, value)
+end
+
+function _convert_setting_value(::Type{String}, value)
+    value === nothing && return ""
+    return String(value)
 end
 
 function _convert_setting_value(::Type{Bool}, value)
@@ -650,6 +668,23 @@ _to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(nume
 _to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
 _to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
 _to_working_float(::Type{F}, x::AbstractFloat) where {F<:AbstractFloat} = F(x)
+
+function _rationalize_float(value::F, tolerance::F) where {F<:AbstractFloat}
+    return rationalize(BigInt, value; tol = tolerance)
+end
+
+function _rationalize_multifloat(value::MultiFloat, tolerance::AbstractFloat)
+    precision_bits = max(precision(typeof(value)), precision(typeof(tolerance)))
+    return setprecision(BigFloat, precision_bits) do
+        rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance))
+    end
+end
+
+_rationalize_float(value::MultiFloat, tolerance::AbstractFloat) =
+    _rationalize_multifloat(value, tolerance)
+
+_rationalize_float(value::F, tolerance::F) where {F<:MultiFloat} =
+    _rationalize_multifloat(value, tolerance)
 
 function _to_working_array(::Type{F}, values::AbstractVector) where {F<:AbstractFloat}
     converted = Vector{F}(undef, length(values))

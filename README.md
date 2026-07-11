@@ -211,6 +211,8 @@ The full set of optimizer attributes is:
 - `facial_reduction_exposure_tolerance`
 - `facial_reduction_rank_tolerance`
 - `facial_reduction_irrational_behavior`
+- `facial_reduction_save_file`
+- `facial_reduction_load_file`
 - `feasibility_tolerance`
 - `optimality_gap_tolerance`
 - `gradient_tolerance`
@@ -241,8 +243,23 @@ The full set of optimizer attributes is:
 - `quasiconvex_bisection_iterations`
 - `quasiconvex_skip_facial_reduction_after_clean_endpoint`
 
+Facial-reduction caches can be used to reuse exact faces across related
+instances:
+
+```julia
+set_optimizer_attribute(model, "facial_reduction_save_file", "faces.rsdpcache")
+set_optimizer_attribute(next_model, "facial_reduction_load_file", "faces.rsdpcache")
+```
+
+The cache stores exact certified reductions. Loading validates that the current
+affine slice is contained in the saved face before applying it, so objective
+coefficient changes are fine and incompatible constraint changes fall back to
+the normal facial-reduction search.
+
 The default working type is `Double64`. `Float64` is faster but less robust;
-`BigFloat` is slower but can help on ill-conditioned models.
+`BigFloat` is slower but can help on ill-conditioned models. MultiFloats.jl v3
+scalar types are also accepted, for example `Float64x2`, `Float64x3`, and
+`Float64x4` via type values or optimizer-attribute strings.
 
 Hypatia Phase I tolerance attributes use negative values to leave Hypatia's
 own defaults unchanged. The diagnostic attributes are off by default; enable

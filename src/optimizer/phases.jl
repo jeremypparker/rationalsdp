@@ -136,7 +136,7 @@ function _project_exact_solution(
         return particular
     end
     rational_coefficients = [
-        rationalize(BigInt, value; tol = tolerance) for value in coefficients
+        _rationalize_float(value, tolerance) for value in coefficients
     ]
     return particular + nullspace * rational_coefficients
 end
@@ -236,14 +236,14 @@ function _phase1_exact_recovery_rationalize_coordinates(
     context::AbstractString,
 ) where {F<:AbstractFloat}
     if !opt.settings.phase1_exact_recovery_diagnostics
-        return [rationalize(BigInt, value; tol = tolerance) for value in coordinates]
+        return [_rationalize_float(value, tolerance) for value in coordinates]
     end
 
     start_time = time_ns()
     rational_coordinates = Vector{ExactRational}(undef, length(coordinates))
     log_frequency = max(1, div(length(coordinates), 8))
     for index in eachindex(coordinates)
-        rational_coordinates[index] = rationalize(BigInt, coordinates[index]; tol = tolerance)
+        rational_coordinates[index] = _rationalize_float(coordinates[index], tolerance)
         if index == 1 || index == length(coordinates) || index % log_frequency == 0
             _phase1_exact_recovery_log(
                 opt,

@@ -600,6 +600,22 @@ version = "0.4.4"
 uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
 version = "2025.11.4"
 
+[[deps.MultiFloats]]
+deps = ["LinearAlgebra", "MPFR_jll", "Printf", "Random", "SIMD"]
+git-tree-sha1 = "dcedb9f6e1c4cab2d7bb6a5d03090961c2905c4e"
+uuid = "bdf0d083-296b-4888-a5b6-7498122e68a5"
+version = "3.2.6"
+
+    [deps.MultiFloats.extensions]
+    MultiFloatsAMDGPUExt = "AMDGPU"
+    MultiFloatsCUDAExt = "CUDA"
+    MultiFloatsoneAPIExt = "oneAPI"
+
+    [deps.MultiFloats.weakdeps]
+    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
+
 [[deps.MultivariateBases]]
 deps = ["LinearAlgebra", "MultivariatePolynomials", "MutableArithmetics", "StarAlgebras"]
 git-tree-sha1 = "830ca63f94b7111b0bcd6f9c3d8de215c5cdfc1a"
@@ -798,7 +814,7 @@ uuid = "fb686558-2515-59ef-acaa-46db3789a887"
 version = "0.4.4"
 
 [[deps.RationalSDP]]
-deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "Nemo", "Printf", "SparseArrays"]
+deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "MultiFloats", "Nemo", "Printf", "Serialization", "SparseArrays"]
 path = ".."
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"
@@ -828,6 +844,12 @@ version = "0.2.1"
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
+
+[[deps.SIMD]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "e24dc23107d426a096d3eae6c165b921e74c18e4"
+uuid = "fdea26ae-647d-5447-a871-4b548cad5224"
+version = "3.7.2"
 
 [[deps.SemialgebraicSets]]
 deps = ["CommonSolve", "LinearAlgebra", "MultivariatePolynomials", "MutableArithmetics", "Random", "StarAlgebras"]

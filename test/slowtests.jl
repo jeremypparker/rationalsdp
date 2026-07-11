@@ -68,24 +68,50 @@ end
     end
 
     @testset "KSE time average bound with split even basis" begin
-        model = rational_model(Rational{BigInt})
-        instance = build_explicit_kse_model(
-            3//4,
-            model;
-            basis_even_no_s_builder = explicit_basis_even_no_s_singular,
-        )
-        optimize!(instance.model)
+        function test_kse_certificate(instance)
+            @test termination_status(instance.model) == MOI.OPTIMAL
+            @test all(
+                iszero(value(coeff)) for
+                expr in instance.certificate.expressions for
+                coeff in coefficients(expr)
+            )
+            @test is_psd_exact(value.(instance.certificate.Q_even))
+            @test is_psd_exact(value.(instance.certificate.Q_odd))
+            @test value(instance.B) > 280//100
+            @test value(instance.B) < 281//100
+        end
 
-        @test termination_status(instance.model) == MOI.OPTIMAL
-        @test all(
-            iszero(value(coeff)) for
-            expr in instance.certificate.expressions for
-            coeff in coefficients(expr)
-        )
-        @test is_psd_exact(value.(instance.certificate.Q_even))
-        @test is_psd_exact(value.(instance.certificate.Q_odd))
-        @test value(instance.B) > 280//100
-        @test value(instance.B) < 281//100
+        cache_file = tempname()
+        try
+            model = rational_model(Rational{BigInt})
+            set_optimizer_attribute(model, "working_float_type", Float64)
+            set_optimizer_attribute(model, "facial_reduction_float_type", Float64)
+            set_optimizer_attribute(model, "facial_reduction_save_file", cache_file)
+            instance = build_explicit_kse_model(
+                3//4,
+                model;
+                basis_even_no_s_builder = explicit_basis_even_no_s_singular,
+            )
+            optimize!(instance.model)
+            test_kse_certificate(instance)
+            @test isfile(cache_file)
+            @test !isempty(RationalSDP._read_facial_reduction_cache(cache_file))
+
+            cached_model = rational_model(Rational{BigInt})
+            set_optimizer_attribute(cached_model, "working_float_type", Float64)
+            set_optimizer_attribute(cached_model, "facial_reduction_float_type", Float64)
+            set_optimizer_attribute(cached_model, "facial_reduction_load_file", cache_file)
+            set_optimizer_attribute(cached_model, "facial_reduction", false)
+            cached_instance = build_explicit_kse_model(
+                3//4,
+                cached_model;
+                basis_even_no_s_builder = explicit_basis_even_no_s_singular,
+            )
+            optimize!(cached_instance.model)
+            test_kse_certificate(cached_instance)
+        finally
+            rm(cache_file; force = true)
+        end
     end
 
     @testset "Lorenz symmetric period bound with quasiconvex B" begin

@@ -682,6 +682,8 @@ function _quasiconvex_feasible_point(
     facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {F<:AbstractFloat}
     problem.affine === nothing && return (anchor = nothing, facial_reduction_rounds = 0)
+    problem = _apply_loaded_facial_reductions(opt, problem)
+    problem.affine === nothing && return (anchor = nothing, facial_reduction_rounds = 0)
     particular, nullspace = problem.affine
     barrier_dim = _barrier_dimension(problem)
     barrier_dim == 0 && return (anchor = particular, facial_reduction_rounds = 0)

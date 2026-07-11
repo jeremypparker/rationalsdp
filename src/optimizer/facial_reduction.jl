@@ -1148,6 +1148,345 @@ end
 _facial_reduction_tuple(reduction::_CertifiedFacialReduction) =
     reduction.exposed_scalars, reduction.keep_bases
 
+const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
+const _FACIAL_REDUCTION_CACHE_VERSION = 1
+
+function _facial_reduction_cache_path(path::AbstractString)
+    stripped = strip(path)
+    return isempty(stripped) ? nothing : stripped
+end
+
+function _facial_reduction_cache_records(payload)
+    payload isa NamedTuple ||
+        throw(ArgumentError("Facial reduction cache is not a RationalSDP cache payload."))
+    (:magic in keys(payload) && payload.magic == _FACIAL_REDUCTION_CACHE_MAGIC) ||
+        throw(ArgumentError("Facial reduction cache has an unrecognized file header."))
+    (:version in keys(payload) && payload.version == _FACIAL_REDUCTION_CACHE_VERSION) ||
+        throw(ArgumentError("Unsupported facial reduction cache version."))
+    (:records in keys(payload) && payload.records isa AbstractVector) ||
+        throw(ArgumentError("Facial reduction cache is missing its record list."))
+    return Any[record for record in payload.records]
+end
+
+function _read_facial_reduction_cache(path::AbstractString; missing_ok::Bool = false)
+    full_path = abspath(path)
+    if !isfile(full_path)
+        missing_ok && return Any[]
+        throw(ArgumentError("Facial reduction cache file does not exist: $(full_path)"))
+    end
+    payload = try
+        open(full_path, "r") do io
+            Serialization.deserialize(io)
+        end
+    catch err
+        throw(ArgumentError("Could not read facial reduction cache $(full_path): $(err)"))
+    end
+    return _facial_reduction_cache_records(payload)
+end
+
+function _write_facial_reduction_cache(path::AbstractString, records::Vector{Any})
+    full_path = abspath(path)
+    mkpath(dirname(full_path))
+    payload = (
+        magic = _FACIAL_REDUCTION_CACHE_MAGIC,
+        version = _FACIAL_REDUCTION_CACHE_VERSION,
+        records = copy(records),
+    )
+    open(full_path, "w") do io
+        Serialization.serialize(io, payload)
+    end
+    return full_path
+end
+
+function _prepare_facial_reduction_cache!(opt::Optimizer)
+    empty!(opt.facial_reduction_save_records)
+    opt.facial_reduction_loaded_records = nothing
+
+    save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
+    load_path = _facial_reduction_cache_path(opt.settings.facial_reduction_load_file)
+    if save_path !== nothing &&
+       load_path !== nothing &&
+       abspath(save_path) == abspath(load_path)
+        records = _read_facial_reduction_cache(load_path; missing_ok = true)
+        opt.facial_reduction_loaded_records = records
+        append!(opt.facial_reduction_save_records, records)
+    end
+    return
+end
+
+function _loaded_facial_reduction_records!(opt::Optimizer)
+    opt.facial_reduction_loaded_records !== nothing &&
+        return opt.facial_reduction_loaded_records
+
+    load_path = _facial_reduction_cache_path(opt.settings.facial_reduction_load_file)
+    if load_path === nothing
+        opt.facial_reduction_loaded_records = Any[]
+    else
+        records = _read_facial_reduction_cache(load_path)
+        opt.facial_reduction_loaded_records = records
+        _log(
+            opt,
+            "Facial reduction: loaded $(length(records)) cached reduction record(s) from $(abspath(load_path))",
+        )
+    end
+    return opt.facial_reduction_loaded_records
+end
+
+function _facial_reduction_block_signature(block::BlockStructure)
+    return (
+        size = block.size,
+        global_positions = copy(block.global_positions),
+        local_positions = copy(block.local_positions),
+        diagonal_positions = copy(block.diagonal_positions),
+    )
+end
+
+function _facial_reduction_problem_signature(problem::ProblemData)
+    return (
+        dimension = length(problem.objective_vector_raw),
+        equation_count = size(problem.A, 1),
+        positive_scalars = copy(problem.positive_scalars),
+        blocks = [_facial_reduction_block_signature(block) for block in problem.blocks],
+    )
+end
+
+function _facial_reduction_signature_matches(problem::ProblemData, signature)
+    signature isa NamedTuple || return false
+    required = (:dimension, :equation_count, :positive_scalars, :blocks)
+    all(name -> name in keys(signature), required) || return false
+    signature.dimension == length(problem.objective_vector_raw) || return false
+    signature.equation_count == size(problem.A, 1) || return false
+    collect(signature.positive_scalars) == problem.positive_scalars || return false
+    length(signature.blocks) == length(problem.blocks) || return false
+    for (block, block_signature) in zip(problem.blocks, signature.blocks)
+        block_signature isa NamedTuple || return false
+        block_required = (:size, :global_positions, :local_positions, :diagonal_positions)
+        all(name -> name in keys(block_signature), block_required) || return false
+        block_signature.size == block.size || return false
+        collect(block_signature.global_positions) == block.global_positions || return false
+        collect(block_signature.local_positions) == block.local_positions || return false
+        collect(block_signature.diagonal_positions) == block.diagonal_positions || return false
+    end
+    return true
+end
+
+function _facial_reduction_record(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    keep_bases = [
+        (block_index = block_index, basis = copy(reduction.keep_bases[block_index])) for
+        block_index in sort(collect(keys(reduction.keep_bases)))
+    ]
+    return (
+        signature = _facial_reduction_problem_signature(problem),
+        source = reduction.source,
+        exposed_scalars = copy(reduction.exposed_scalars),
+        keep_bases = keep_bases,
+    )
+end
+
+function _record_successful_facial_reduction!(
+    opt::Optimizer,
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
+    save_path === nothing && return
+    push!(opt.facial_reduction_save_records, _facial_reduction_record(problem, reduction))
+    full_path = _write_facial_reduction_cache(
+        save_path,
+        opt.facial_reduction_save_records,
+    )
+    _log(
+        opt,
+        "Facial reduction: saved $(length(opt.facial_reduction_save_records)) reduction record(s) to $(full_path)",
+    )
+    return
+end
+
+function _exact_matrix_from_cache(value)
+    value isa AbstractMatrix ||
+        throw(ArgumentError("Cached facial reduction basis is not a matrix."))
+    return ExactRational[
+        _exact_rational(value[row, column]) for
+        row in axes(value, 1), column in axes(value, 2)
+    ]
+end
+
+function _cached_facial_reduction(record)
+    record isa NamedTuple || return nothing
+    (:source in keys(record)) || return nothing
+    (:exposed_scalars in keys(record)) || return nothing
+    (:keep_bases in keys(record)) || return nothing
+
+    exposed_scalars = unique(sort(Int[Int(index) for index in record.exposed_scalars]))
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for item in record.keep_bases
+        item isa NamedTuple || return nothing
+        (:block_index in keys(item) && :basis in keys(item)) || return nothing
+        block_index = Int(item.block_index)
+        haskey(keep_bases, block_index) && return nothing
+        keep_bases[block_index] = _exact_matrix_from_cache(item.basis)
+    end
+    return _CertifiedFacialReduction(String(record.source), exposed_scalars, keep_bases)
+end
+
+function _exact_column_rank(matrix::Matrix{ExactRational})
+    size(matrix, 2) == 0 && return 0
+    _, pivots = _rref(hcat(matrix, zeros(ExactRational, size(matrix, 1))))
+    return length(pivots)
+end
+
+function _cached_scalar_face_violation(problem::ProblemData, position::Int)
+    position in problem.positive_scalars ||
+        return "scalar position $(position) is not an active positive scalar"
+    problem.affine === nothing && return "no exact affine parametrization is available"
+    particular, nullspace = problem.affine
+    1 <= position <= length(particular) ||
+        return "scalar position $(position) is outside the problem dimension"
+    iszero(particular[position]) ||
+        return "scalar position $(position) has affine particular value $(particular[position])"
+    if any(!iszero, view(nullspace, position, :))
+        return "scalar position $(position) is not fixed by the affine nullspace"
+    end
+    return nothing
+end
+
+function _cached_keep_basis_violation(
+    problem::ProblemData,
+    block_index::Int,
+    keep_basis::Matrix{ExactRational},
+)
+    1 <= block_index <= length(problem.blocks) ||
+        return "PSD block $(block_index) does not exist"
+    block = problem.blocks[block_index]
+    size(keep_basis, 1) == block.size ||
+        return "PSD block $(block_index) cache basis has $(size(keep_basis, 1)) row(s), expected $(block.size)"
+    0 <= size(keep_basis, 2) < block.size ||
+        return "PSD block $(block_index) cache basis does not reduce the block"
+    _exact_column_rank(keep_basis) == size(keep_basis, 2) ||
+        return "PSD block $(block_index) cache basis columns are linearly dependent"
+
+    removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
+    directions = [
+        collect(view(removed_directions, :, column)) for
+        column in axes(removed_directions, 2)
+    ]
+    cache = _FacialReductionExactCache(problem)
+    last_violation = nothing
+    for direction in directions
+        certificate = _block_face_direction_certificate(
+            problem,
+            block,
+            direction;
+            cache,
+            block_index,
+        )
+        certificate.kind == :none || continue
+        last_violation = certificate.violation
+        break
+    end
+    last_violation === nothing && return nothing
+
+    trace_violation = _block_trace_vanish_violation(
+        problem,
+        block,
+        directions;
+        cache,
+        block_index,
+    )
+    trace_violation === nothing && return nothing
+    return "PSD block $(block_index) cache face is not valid for the current affine slice ($(last_violation); $(trace_violation))"
+end
+
+function _cached_facial_reduction_violation(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    if isempty(reduction.exposed_scalars) && isempty(reduction.keep_bases)
+        return "cached reduction has no exposed scalar or PSD face"
+    end
+    for position in reduction.exposed_scalars
+        violation = _cached_scalar_face_violation(problem, position)
+        violation === nothing || return violation
+    end
+    for block_index in sort(collect(keys(reduction.keep_bases)))
+        violation = _cached_keep_basis_violation(
+            problem,
+            block_index,
+            reduction.keep_bases[block_index],
+        )
+        violation === nothing || return violation
+    end
+    return nothing
+end
+
+function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
+    records = _loaded_facial_reduction_records!(opt)
+    isempty(records) && return problem
+
+    current = problem
+    matched = 0
+    applied = 0
+    for record in records
+        record isa NamedTuple || continue
+        (:signature in keys(record)) || continue
+        _facial_reduction_signature_matches(current, record.signature) || continue
+        matched += 1
+
+        reduction = try
+            _cached_facial_reduction(record)
+        catch err
+            _log(opt, "Facial reduction: skipped malformed cache record ($(err))")
+            continue
+        end
+        if reduction === nothing
+            _log(opt, "Facial reduction: skipped malformed cache record")
+            continue
+        end
+
+        violation = _cached_facial_reduction_violation(current, reduction)
+        if violation !== nothing
+            _log(opt, "Facial reduction: cached face did not validate ($(violation))")
+            continue
+        end
+
+        reduced_problem = _apply_facial_reduction(
+            current,
+            reduction.exposed_scalars,
+            reduction.keep_bases,
+        )
+        if reduced_problem.affine === nothing
+            _log(
+                opt,
+                "Facial reduction: cached face produced an inconsistent affine system; ignoring it",
+            )
+            continue
+        end
+        applied += 1
+        removed_psd_directions = sum(
+            (current.blocks[index].size - size(reduction.keep_bases[index], 2) for
+             index in keys(reduction.keep_bases));
+            init = 0,
+        )
+        _log(
+            opt,
+            "Facial reduction: applied cached face from $(reduction.source), fixed $(length(reduction.exposed_scalars)) scalar cone direction(s) and removed $(removed_psd_directions) PSD direction(s)",
+        )
+        current = reduced_problem
+    end
+
+    if applied == 0
+        if matched == 0
+            _log(opt, "Facial reduction: no cached reduction record matched the current problem")
+        else
+            _log(opt, "Facial reduction: no cached reduction record validated for the current problem")
+        end
+    end
+    return current
+end
+
 function _exact_slack_keep_bases(
     opt::Optimizer,
     problem::ProblemData,
@@ -1760,6 +2099,11 @@ function _facially_reduce_problem(
         return tentative_problem
     end
     exposed_scalars, keep_bases = reduction
+    certified_reduction = _CertifiedFacialReduction(
+        "certified solver reduction",
+        exposed_scalars,
+        keep_bases,
+    )
     removed_psd_directions = sum(
         (problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases));
         init = 0,
@@ -1775,6 +2119,7 @@ function _facially_reduce_problem(
         end
         throw(ErrorException(message))
     end
+    _record_successful_facial_reduction!(opt, problem, certified_reduction)
     _log(
         opt,
         "facial reduction: fixed $(length(exposed_scalars)) scalar cone direction(s) and removed $(removed_psd_directions) PSD direction(s)",

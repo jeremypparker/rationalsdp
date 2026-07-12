@@ -3,6 +3,189 @@
 const MOIU = MOI.Utilities
 const ExactRational = Rational{BigInt}
 
+"""Mutable counters collected during one `optimize!` call."""
+mutable struct FacialReductionStatistics
+    phase1_attempts::Int
+    phase1_time_sec::Float64
+    oracle_attempts::Int
+    oracle_iterations::Int
+    oracle_time_sec::Float64
+    exact_rref_calls::Int
+    exact_rref_dimensions::Vector{Tuple{Int,Int}}
+    exact_rref_time_sec::Float64
+    exact_row_space_checks::Int
+    exact_row_space_check_time_sec::Float64
+    exact_certificate_checks::Int
+    exact_certificate_time_sec::Float64
+    psd_eigendecompositions_by_block_size::Dict{Int,Int}
+    psd_eigendecomposition_time_sec::Float64
+    certified_directions_proposed::Int
+    certified_directions_accepted::Int
+    certified_directions_rejected::Int
+    tentative_directions_proposed::Int
+    tentative_directions_accepted::Int
+    tentative_directions_rejected::Int
+    cone_dimension_removed_per_round::Vector{Int}
+    affine_cache_peak_bytes::Int
+    facial_reduction_cache_peak_bytes::Int
+    certified_reductions_applied::Int
+    tentative_restrictions_applied::Int
+end
+
+FacialReductionStatistics() = FacialReductionStatistics(
+    0, 0.0, 0, 0, 0.0, 0, Tuple{Int,Int}[], 0.0, 0, 0.0, 0, 0.0,
+    Dict{Int,Int}(), 0.0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0,
+)
+
+function _facial_reduction_statistics_snapshot(stats::FacialReductionStatistics)
+    return (
+        phase1_attempts = stats.phase1_attempts,
+        phase1_time_sec = stats.phase1_time_sec,
+        oracle_attempts = stats.oracle_attempts,
+        oracle_iterations = stats.oracle_iterations,
+        oracle_time_sec = stats.oracle_time_sec,
+        exact_rref_calls = stats.exact_rref_calls,
+        exact_rref_dimensions = copy(stats.exact_rref_dimensions),
+        exact_rref_time_sec = stats.exact_rref_time_sec,
+        exact_row_space_checks = stats.exact_row_space_checks,
+        exact_row_space_check_time_sec = stats.exact_row_space_check_time_sec,
+        exact_certificate_checks = stats.exact_certificate_checks,
+        exact_certificate_time_sec = stats.exact_certificate_time_sec,
+        psd_eigendecompositions_by_block_size = copy(stats.psd_eigendecompositions_by_block_size),
+        psd_eigendecomposition_time_sec = stats.psd_eigendecomposition_time_sec,
+        certified_directions_proposed = stats.certified_directions_proposed,
+        certified_directions_accepted = stats.certified_directions_accepted,
+        certified_directions_rejected = stats.certified_directions_rejected,
+        tentative_directions_proposed = stats.tentative_directions_proposed,
+        tentative_directions_accepted = stats.tentative_directions_accepted,
+        tentative_directions_rejected = stats.tentative_directions_rejected,
+        cone_dimension_removed_per_round = copy(stats.cone_dimension_removed_per_round),
+        affine_cache_peak_bytes = stats.affine_cache_peak_bytes,
+        facial_reduction_cache_peak_bytes = stats.facial_reduction_cache_peak_bytes,
+        certified_reductions_applied = stats.certified_reductions_applied,
+        tentative_restrictions_applied = stats.tentative_restrictions_applied,
+    )
+end
+
+function _current_facial_reduction_statistics()
+    return try
+        Base.task_local_storage(:rational_sdp_facial_reduction_statistics)
+    catch
+        nothing
+    end
+end
+
+function _with_facial_reduction_statistics(f::Function, stats::FacialReductionStatistics)
+    previous = try
+        Base.task_local_storage(:rational_sdp_facial_reduction_statistics)
+    catch
+        nothing
+    end
+    Base.task_local_storage(:rational_sdp_facial_reduction_statistics, stats)
+    try
+        return f()
+    finally
+        Base.task_local_storage(:rational_sdp_facial_reduction_statistics, previous)
+    end
+end
+
+function _record_approximate_cache_memory!(kind::Symbol, value)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    bytes = try
+        Base.summarysize(value)
+    catch
+        0
+    end
+    if kind === :affine
+        stats.affine_cache_peak_bytes = max(stats.affine_cache_peak_bytes, bytes)
+    elseif kind === :facial_reduction
+        stats.facial_reduction_cache_peak_bytes = max(
+            stats.facial_reduction_cache_peak_bytes,
+            bytes,
+        )
+    end
+    return
+end
+
+function _record_phase1_attempt!(elapsed_sec::Real)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    stats.phase1_attempts += 1
+    stats.phase1_time_sec += Float64(elapsed_sec)
+    return
+end
+
+function _record_oracle_attempt!(iterations::Integer, elapsed_sec::Real)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    stats.oracle_attempts += 1
+    stats.oracle_iterations += Int(iterations)
+    stats.oracle_time_sec += Float64(elapsed_sec)
+    return
+end
+
+function _record_row_space_check!(elapsed_sec::Real)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    stats.exact_row_space_checks += 1
+    stats.exact_row_space_check_time_sec += Float64(elapsed_sec)
+    return
+end
+
+function _record_certificate_check!(elapsed_sec::Real)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    stats.exact_certificate_checks += 1
+    stats.exact_certificate_time_sec += Float64(elapsed_sec)
+    return
+end
+
+function _record_psd_eigendecomposition!(block_size::Int, elapsed_sec::Real)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    stats.psd_eigendecompositions_by_block_size[block_size] =
+        get(stats.psd_eigendecompositions_by_block_size, block_size, 0) + 1
+    stats.psd_eigendecomposition_time_sec += Float64(elapsed_sec)
+    return
+end
+
+function _record_directions!(kind::Symbol, proposed::Int, accepted::Int, rejected::Int)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    proposed >= 0 && accepted >= 0 && rejected >= 0 ||
+        error("Direction statistics cannot be negative.")
+    if kind === :certified
+        stats.certified_directions_proposed += proposed
+        stats.certified_directions_accepted += accepted
+        stats.certified_directions_rejected += rejected
+    elseif kind === :tentative
+        stats.tentative_directions_proposed += proposed
+        stats.tentative_directions_accepted += accepted
+        stats.tentative_directions_rejected += rejected
+    else
+        error("Unknown facial-reduction direction kind $(kind).")
+    end
+    return
+end
+
+function _record_reduction_round!(old_barrier_dimension::Int, new_barrier_dimension::Int; tentative::Bool)
+    new_barrier_dimension < old_barrier_dimension ||
+        error("A reported facial reduction did not decrease barrier dimension.")
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    push!(
+        stats.cone_dimension_removed_per_round,
+        old_barrier_dimension - new_barrier_dimension,
+    )
+    if tentative
+        stats.tentative_restrictions_applied += 1
+    else
+        stats.certified_reductions_applied += 1
+    end
+    return
+end
+
 MOIU.@model(
     StorageModel,
     (),
@@ -176,6 +359,7 @@ mutable struct Optimizer{T<:Real} <: MOI.AbstractOptimizer
     next_scalar_quadratic_index::Int
     facial_reduction_save_records::Vector{Any}
     facial_reduction_loaded_records::Union{Nothing,Vector{Any}}
+    facial_reduction_statistics::FacialReductionStatistics
 end
 
 function Optimizer{T}(; kwargs...) where {T<:Rational}
@@ -212,6 +396,7 @@ function Optimizer{T}(; kwargs...) where {T<:Rational}
         1,
         Any[],
         nothing,
+        FacialReductionStatistics(),
     )
 end
 
@@ -225,6 +410,10 @@ function Optimizer{T}(; kwargs...) where {T<:Real}
 end
 
 Optimizer(; kwargs...) = Optimizer{Rational{BigInt}}(; kwargs...)
+
+function facial_reduction_statistics(opt::Optimizer)
+    return _facial_reduction_statistics_snapshot(opt.facial_reduction_statistics)
+end
 
 function _reset_results!(opt::Optimizer)
     opt.termination_status = MOI.OPTIMIZE_NOT_CALLED

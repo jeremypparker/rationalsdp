@@ -3,6 +3,9 @@
 `RationalSDP.jl` is an experimental semidefinite-programming optimizer for
 JuMP/MOI models with exact rational data. It solves SDP-like problems
 numerically, then returns an exactly affine-feasible rational primal point.
+Exact primal feasibility does not by itself constitute an exact optimality
+proof: ordinary `MOI.OPTIMAL` results use the usual numerical convergence
+interpretation unless a particular problem is settled by exact elimination.
 
 The package is aimed at proof-oriented workflows.
 
@@ -96,10 +99,12 @@ For larger SOS models, expect performance and robustness to depend strongly on
 the Gram basis and on whether the feasible set lies on a PSD face. The solver
 can prune some forced zero directions exactly and can run facial reduction when
 the exposed face can be certified from exact problem data. For constant-objective
-feasibility problems, an uncertified numerical face may also be used purely as a
-search aid. Any point found that way is accepted only after exact validation of
-all affine equations and cones in the original, unreduced SDP; the restriction
-is never used to claim infeasibility or an objective bound.
+problems, an uncertified numerical face may also be used purely as a search aid.
+Any point found that way is accepted only after exact validation of all affine
+equations and cones in the original, unreduced SDP; the restriction is never
+used to claim infeasibility or an objective bound. For a nonconstant objective,
+such a point is returned with `MOI.OTHER_LIMIT` and `MOI.FEASIBLE_POINT`, not
+`MOI.OPTIMAL`.
 
 ## Facial Reduction
 
@@ -120,10 +125,12 @@ float type, system solver, iteration limit, and tolerance settings as Phase I;
 
 Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
 expose a nonzero face, vanish on free coordinates, and have an exact affine-row
-certificate. PSD kernel directions are accepted only when the exact affine rows
-or PSD implications prove the direction is forced to zero. Uncertified
-rationalized kernel directions are never applied merely because the resulting
-affine system remains consistent.
+certificate. PSD kernel directions are accepted as certified facial reductions
+only when the exact affine rows or PSD implications prove the direction is
+forced to zero. An uncertified rationalized kernel direction may restrict a
+feasible-point search, but it is never treated as an equivalent face; any
+returned point is validated against the unreduced SDP, and optimization over
+that restriction cannot return `MOI.OPTIMAL`.
 
 ## Quasiconvex One-Parameter Problems
 
@@ -263,6 +270,14 @@ affine slice is contained in the saved face before applying it, so objective
 coefficient changes are fine and incompatible constraint changes fall back to
 the normal facial-reduction search.
 
+Each solve records facial-reduction counters and timings. After a solve, obtain
+an immutable snapshot with `RationalSDP.facial_reduction_statistics(optimizer)`.
+The snapshot includes Phase-I and oracle work, exact RREF dimensions and time,
+exact certificate checks, PSD eigendecompositions by block size, certified and
+tentative direction outcomes, dimension removed per round, and approximate peak
+memory for affine and facial-reduction caches. Tentative faces are never written
+to the facial-reduction cache or used as an infeasibility certificate.
+
 The default working type is `Double64`. `Float64` is faster but less robust;
 `BigFloat` is slower but can help on ill-conditioned models. MultiFloats.jl v3
 scalar types are also accepted, for example `Float64x2`, `Float64x3`, and
@@ -309,7 +324,7 @@ Important current limitations:
 - no general nonconvex quadratic support
 - quasiconvex support is restricted to one bounded objective parameter
 - exact recovery can fail on badly conditioned or nearly infeasible problems
-- facial reduction is partial; uncertified face candidates are only feasibility-search aids
+- facial reduction is partial; uncertified face candidates are only feasible-point search aids
 - large SOS models can be slow
 
 Use established SDP solvers when you need broad conic coverage, dual

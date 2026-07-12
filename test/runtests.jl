@@ -358,6 +358,7 @@ include("slowtest_helpers.jl")
         optimize!(model)
 
         @test termination_status(model) == MOI.ITERATION_LIMIT
+        test_facial_reduction_statistics(model)
         @test primal_status(model) == MOI.FEASIBLE_POINT
         @test result_count(model) == 1
         @test value(x) > 0//1
@@ -1734,6 +1735,7 @@ include("slowtest_helpers.jl")
         @test value(B) > 729//1
         @test value(B) < 730//1
         @test is_psd_exact(value.(Q))
+        test_facial_reduction_statistics(model)
     end
 
     @testset "Quartic Lorenz SOS mean upper bound" begin
@@ -1762,6 +1764,7 @@ include("slowtest_helpers.jl")
         @test value(B) > 728//1
         @test value(B) < 730//1
         @test is_psd_exact(value.(Q))
+        test_facial_reduction_statistics(model)
     end
 
     @testset "Alternative rational output type" begin
@@ -1781,6 +1784,7 @@ include("slowtest_helpers.jl")
         model = rational_model(Rational{BigInt})
         instance = build_explicit_kse_model(3//4, model)
         optimize!(instance.model)
+        test_facial_reduction_statistics(instance.model)
 
         @test termination_status(instance.model) == MOI.OPTIMAL
         @test all(iszero(value(coeff)) for expr in instance.certificate.expressions for coeff in coefficients(expr))
@@ -1790,6 +1794,8 @@ include("slowtest_helpers.jl")
         @test value(instance.B) < 281//100
     end
 end
+
+include("facial_reduction_statistics_tests.jl")
 
 include("quasiconvex_parameter_tests.jl")
 include("sumofsquares_tests.jl")

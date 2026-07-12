@@ -11,13 +11,37 @@ mutable struct _FacialReductionExactCache
     A_transpose::Union{Nothing,Nemo.QQMatrix}
 end
 
+struct _TentativeFaceDirection{F<:AbstractFloat}
+    block_index::Int
+    direction::Vector{ExactRational}
+    eigenvalue::F
+    residual::F
+    score::F
+end
+
 function _FacialReductionExactCache(problem::ProblemData)
-    return _FacialReductionExactCache(
+    cache = _FacialReductionExactCache(
         problem,
         Union{Nothing,Vector{Nemo.QQMatrix}}[nothing for _ in problem.blocks],
         Union{Nothing,Vector{Vector{ExactRational}}}[nothing for _ in problem.blocks],
         nothing,
     )
+    _record_approximate_cache_memory!(:facial_reduction, cache)
+    return cache
+end
+
+function _facial_reduction_eigen(opt::Optimizer, matrix::AbstractMatrix{F}) where {F<:AbstractFloat}
+    start_time = time_ns()
+    result = eigen(Symmetric((matrix + transpose(matrix)) / 2))
+    _record_psd_eigendecomposition!(size(matrix, 1), (time_ns() - start_time) / 1.0e9)
+    return result
+end
+
+function _facial_reduction_eigvals(opt::Optimizer, matrix::AbstractMatrix{F}) where {F<:AbstractFloat}
+    start_time = time_ns()
+    result = eigvals(Symmetric((matrix + transpose(matrix)) / 2))
+    _record_psd_eigendecomposition!(size(matrix, 1), (time_ns() - start_time) / 1.0e9)
+    return result
 end
 
 function _facial_reduction_block_affine_slice!(
@@ -42,6 +66,7 @@ function _facial_reduction_block_affine_slice!(
         )
     end
     cache.block_affine_slices[block_index] = matrices
+    _record_approximate_cache_memory!(:facial_reduction, cache)
     return matrices
 end
 
@@ -52,6 +77,7 @@ function _facial_reduction_A_transpose!(
     cache.problem === problem || error("Facial-reduction exact cache belongs to another problem.")
     if cache.A_transpose === nothing
         cache.A_transpose = transpose(_to_nemo_matrix(problem.A))
+        _record_approximate_cache_memory!(:facial_reduction, cache)
     end
     return cache.A_transpose
 end
@@ -116,17 +142,22 @@ function _block_annihilation_violation(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
     block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
-    problem.affine === nothing && return "no exact affine parametrization is available"
-    direction_column = _nemo_direction_column(direction)
-    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-    for (matrix_index, matrix) in enumerate(matrices)
-        violation = _nemo_product_nonzero(matrix * direction_column)
-        violation === nothing && continue
-        row_index, value = violation
-        location = matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-        return "row=$(row_index), affine=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+    start_time = time_ns()
+    try
+        problem.affine === nothing && return "no exact affine parametrization is available"
+        direction_column = _nemo_direction_column(direction)
+        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+        for (matrix_index, matrix) in enumerate(matrices)
+            violation = _nemo_product_nonzero(matrix * direction_column)
+            violation === nothing && continue
+            row_index, value = violation
+            location = matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+            return "row=$(row_index), affine=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+        end
+        return nothing
+    finally
+        _record_row_space_check!((time_ns() - start_time) / 1.0e9)
     end
-    return nothing
 end
 
 function _block_quadratic_vanish_violation(
@@ -137,18 +168,23 @@ function _block_quadratic_vanish_violation(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
     block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
-    problem.affine === nothing && return "no exact affine parametrization is available"
-    direction_column = _nemo_direction_column(direction)
-    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-    for (matrix_index, matrix) in enumerate(matrices)
-        value = _nemo_quadratic_value(matrix, direction_column)
-        if !iszero(value)
-            location =
-                matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-            return "quadratic=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+    start_time = time_ns()
+    try
+        problem.affine === nothing && return "no exact affine parametrization is available"
+        direction_column = _nemo_direction_column(direction)
+        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+        for (matrix_index, matrix) in enumerate(matrices)
+            value = _nemo_quadratic_value(matrix, direction_column)
+            if !iszero(value)
+                location =
+                    matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+                return "quadratic=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+            end
         end
+        return nothing
+    finally
+        _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
-    return nothing
 end
 
 function _block_trace_vanish_violation(
@@ -159,23 +195,28 @@ function _block_trace_vanish_violation(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
     block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
-    isempty(directions) && return "no directions"
-    problem.affine === nothing && return "no exact affine parametrization is available"
-    direction_columns = [_nemo_direction_column(direction) for direction in directions]
-    matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-    for (matrix_index, matrix) in enumerate(matrices)
-        value = sum(
-            (_nemo_quadratic_value(matrix, direction_column) for
-             direction_column in direction_columns);
-            init = zero(Nemo.QQ),
-        )
-        if !iszero(value)
-            location =
-                matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-            return "trace=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+    start_time = time_ns()
+    try
+        isempty(directions) && return "no directions"
+        problem.affine === nothing && return "no exact affine parametrization is available"
+        direction_columns = [_nemo_direction_column(direction) for direction in directions]
+        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
+        for (matrix_index, matrix) in enumerate(matrices)
+            value = sum(
+                (_nemo_quadratic_value(matrix, direction_column) for
+                 direction_column in direction_columns);
+                init = zero(Nemo.QQ),
+            )
+            if !iszero(value)
+                location =
+                    matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
+                return "trace=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+            end
         end
+        return nothing
+    finally
+        _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
-    return nothing
 end
 
 function _block_face_direction_certificate(
@@ -186,29 +227,34 @@ function _block_face_direction_certificate(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
     block_index::Int = something(findfirst(==(block), problem.blocks)),
 )
-    row_violation = _block_annihilation_violation(
-        problem,
-        block,
-        direction;
-        cache,
-        block_index,
-    )
-    row_violation === nothing && return (kind = :affine_rows, violation = nothing)
+    start_time = time_ns()
+    try
+        row_violation = _block_annihilation_violation(
+            problem,
+            block,
+            direction;
+            cache,
+            block_index,
+        )
+        row_violation === nothing && return (kind = :affine_rows, violation = nothing)
 
-    diagonal_violation = _block_quadratic_vanish_violation(
-        problem,
-        block,
-        direction;
-        cache,
-        block_index,
-    )
-    diagonal_violation === nothing && return (kind = :psd_diagonal, violation = nothing)
+        diagonal_violation = _block_quadratic_vanish_violation(
+            problem,
+            block,
+            direction;
+            cache,
+            block_index,
+        )
+        diagonal_violation === nothing && return (kind = :psd_diagonal, violation = nothing)
 
-    return (
-        kind = :none,
-        violation =
-            "row certificate failed ($(row_violation)); PSD diagonal certificate failed ($(diagonal_violation))",
-    )
+        return (
+            kind = :none,
+            violation =
+                "row certificate failed ($(row_violation)); PSD diagonal certificate failed ($(diagonal_violation))",
+        )
+    finally
+        _record_certificate_check!((time_ns() - start_time) / 1.0e9)
+    end
 end
 
 function _exact_face_direction(
@@ -368,6 +414,7 @@ function _certified_pivoted_subspace_directions(
 ) where {F<:AbstractFloat}
     candidates = _pivoted_rational_subspace_directions(subspace, opt.settings, F)
     isempty(candidates) && return Vector{ExactRational}[]
+    _record_directions!(:certified, length(candidates), 0, 0)
 
     accepted = Vector{Vector{ExactRational}}()
     rejected = 0
@@ -387,6 +434,7 @@ function _certified_pivoted_subspace_directions(
             last_violation = violation
         end
     end
+    _record_directions!(:certified, 0, length(accepted), rejected)
 
     accepted = _linearly_independent_directions(accepted)
     if !isempty(accepted)
@@ -438,6 +486,7 @@ function _exact_block_nullspace_directions(
     filter!(direction -> any(!iszero, direction), directions)
     directions = _linearly_independent_directions(directions)
     cache.block_exact_directions[block_index] = directions
+    _record_approximate_cache_memory!(:facial_reduction, cache)
     return directions
 end
 
@@ -452,7 +501,7 @@ function _candidate_kernel_directions(
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
-    eigen_factor = eigen(symmetric_matrix)
+    eigen_factor = _facial_reduction_eigen(opt, symmetric_matrix)
     exposure_tolerance = max(
         _to_working_float(F, opt.settings.facial_reduction_exposure_tolerance),
         F(100) * eps(F),
@@ -497,6 +546,7 @@ function _candidate_kernel_directions(
             heuristic === nothing && continue
 
             direction = heuristic.direction
+            _record_directions!(:certified, 1, 0, 0)
             certificate = _block_face_direction_certificate(
                 problem,
                 block,
@@ -514,6 +564,7 @@ function _candidate_kernel_directions(
                 )
                 push!(heuristic_directions, direction)
                 push!(individually_certified_directions, direction)
+                _record_directions!(:certified, 0, 1, 0)
             else
                 rejected_heuristics += 1
                 _log(
@@ -521,6 +572,7 @@ function _candidate_kernel_directions(
                     "Facial reduction: rejected rationalized boundary kernel direction for PSD block $(block_index) (eig=$(_format_metric(eigen_factor.values[kernel_index])), residual=$(_format_metric(heuristic.residual)), rationalize_tol=$(_format_metric(heuristic.tolerance))); no exact face certificate ($(certificate.violation)): $(direction_summary)",
                 )
                 push!(heuristic_directions, direction)
+                _record_directions!(:certified, 0, 0, 1)
             end
         end
         heuristic_directions = _linearly_independent_directions(heuristic_directions)
@@ -584,7 +636,7 @@ function _heuristic_kernel_direction_candidates(
     ::Type{F},
 ) where {F<:AbstractFloat}
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
-    eigen_factor = eigen(symmetric_matrix)
+    eigen_factor = _facial_reduction_eigen(opt, symmetric_matrix)
     exposure_tolerance = max(
         _to_working_float(F, opt.settings.facial_reduction_exposure_tolerance),
         F(100) * eps(F),
@@ -593,7 +645,7 @@ function _heuristic_kernel_direction_candidates(
         index for (index, value) in enumerate(eigen_factor.values) if
         abs(value) <= exposure_tolerance
     ]
-    candidates = NamedTuple[]
+    candidates = _TentativeFaceDirection{F}[]
     for kernel_index in sort(kernel_indices; by = index -> abs(eigen_factor.values[index]))
         heuristic = _heuristic_kernel_direction(
             block_matrix,
@@ -602,21 +654,99 @@ function _heuristic_kernel_direction_candidates(
             F,
         )
         heuristic === nothing && continue
-        push!(
-            candidates,
-            (
-                residual = heuristic.residual,
-                eigenvalue = eigen_factor.values[kernel_index],
-                block_index = block_index,
-                direction = heuristic.direction,
-            ),
-        )
+        eigenvalue = eigen_factor.values[kernel_index]
+        score = abs(heuristic.residual) + abs(eigenvalue)
+        push!(candidates, _TentativeFaceDirection{F}(
+            block_index,
+            _normalize_rational_direction(heuristic.direction),
+            eigenvalue,
+            heuristic.residual,
+            score,
+        ))
     end
     return candidates
 end
 
+function _tentative_candidate_sort_key(candidate::_TentativeFaceDirection)
+    return (
+        candidate.score,
+        abs(candidate.eigenvalue),
+        candidate.residual,
+        candidate.block_index,
+        string(candidate.direction),
+    )
+end
+
+function _tentative_candidate_keep_bases(
+    problem::ProblemData,
+    candidates::Vector{<:_TentativeFaceDirection},
+)
+    directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}()
+    for candidate in candidates
+        push!(
+            get!(directions_by_block, candidate.block_index, Vector{Vector{ExactRational}}()),
+            candidate.direction,
+        )
+    end
+
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for block_index in sort(collect(keys(directions_by_block)))
+        directions = _linearly_independent_directions(directions_by_block[block_index])
+        isempty(directions) && continue
+        keep_basis = _orthogonal_complement_basis(
+            directions,
+            problem.blocks[block_index].size,
+        )
+        size(keep_basis, 2) == problem.blocks[block_index].size && continue
+        keep_bases[block_index] = keep_basis
+    end
+    return keep_bases
+end
+
+function _tentative_batch_problem(
+    problem::ProblemData,
+    candidates::Vector{<:_TentativeFaceDirection},
+)
+    keep_bases = _tentative_candidate_keep_bases(problem, candidates)
+    isempty(keep_bases) && return problem
+    return _apply_facial_reduction(
+        problem,
+        Int[],
+        keep_bases;
+        certified = false,
+    )
+end
+
+function _tentative_greedy_admission(
+    problem::ProblemData,
+    candidates::Vector{_TentativeFaceDirection{F}},
+) where {F<:AbstractFloat}
+    accepted_candidates = _TentativeFaceDirection{F}[]
+    consistent_problem = nothing
+    for candidate_item in candidates
+        trial_candidates = vcat(accepted_candidates, [candidate_item])
+        trial_problem = _tentative_batch_problem(problem, trial_candidates)
+        if trial_problem.affine === nothing
+            continue
+        end
+        push!(accepted_candidates, candidate_item)
+        consistent_problem = trial_problem
+    end
+    return consistent_problem, accepted_candidates
+end
+
+function _tentative_search_result(
+    problem,
+    fallback_problem,
+    return_details::Bool,
+)
+    return return_details ?
+           (problem = problem, fallback_problem = fallback_problem) :
+           problem
+end
+
 """
-Construct a heuristic face used only to search for a feasible point. This is not
+Construct a heuristic face used only to search for an exact feasible point. This is not
 a facial-reduction certificate: callers must validate any recovered point
 exactly against the unreduced problem and must not infer infeasibility or an
 objective bound from this restriction.
@@ -626,8 +756,10 @@ function _tentative_feasibility_search_problem(
     problem::ProblemData,
     candidate::Vector{F},
     ::Type{F},
+    ;
+    return_details::Bool = false,
 ) where {F<:AbstractFloat}
-    candidates = NamedTuple[]
+    candidates = _TentativeFaceDirection{F}[]
     for (block_index, block) in enumerate(problem.blocks)
         append!(
             candidates,
@@ -640,23 +772,88 @@ function _tentative_feasibility_search_problem(
             ),
         )
     end
-    sort!(candidates; by = item -> (abs(item.residual), abs(item.eigenvalue), item.block_index))
+    isempty(candidates) && return _tentative_search_result(nothing, nothing, return_details)
+    sort!(candidates; by = _tentative_candidate_sort_key)
 
-    for item in candidates
-        keep_basis = _orthogonal_complement_basis(
-            [item.direction],
-            problem.blocks[item.block_index].size,
+    # Keep only one exact representative and an exact independent set per block.
+    unique_candidates = _TentativeFaceDirection{F}[]
+    directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}()
+    seen_by_block = Dict{Int,Set{Any}}()
+    for candidate_item in candidates
+        seen = get!(seen_by_block, candidate_item.block_index, Set{Any}())
+        key = Tuple(candidate_item.direction)
+        if key in seen
+            continue
+        end
+        push!(seen, key)
+        directions = get!(
+            directions_by_block,
+            candidate_item.block_index,
+            Vector{Vector{ExactRational}}(),
         )
-        reduced_problem =
-            _apply_facial_reduction(problem, Int[], Dict(item.block_index => keep_basis))
-        reduced_problem.affine === nothing && continue
+        independent = _linearly_independent_directions(vcat(directions, [candidate_item.direction]))
+        if length(independent) == length(directions)
+            continue
+        end
+        push!(directions, candidate_item.direction)
+        push!(unique_candidates, candidate_item)
+    end
+
+    isempty(unique_candidates) && begin
+        _record_directions!(:tentative, length(candidates), 0, length(candidates))
+        return _tentative_search_result(nothing, nothing, return_details)
+    end
+
+    # Prefer the complete batch. It is formed from the original problem so a
+    # failed batch never mutates the problem that will be retried.
+    batch_problem = _tentative_batch_problem(problem, unique_candidates)
+    if batch_problem.affine !== nothing
+        fallback_problem = nothing
+        if length(unique_candidates) > 1
+            conservative_problem = _tentative_batch_problem(
+                problem,
+                unique_candidates[1:1],
+            )
+            if conservative_problem.affine !== nothing &&
+               _barrier_dimension(conservative_problem) >
+               _barrier_dimension(batch_problem)
+                fallback_problem = conservative_problem
+            end
+        end
+        _record_directions!(
+            :tentative,
+            length(candidates),
+            length(unique_candidates),
+            length(candidates) - length(unique_candidates),
+        )
         _log(
             opt,
-            "Feasibility search: tentatively removed one PSD direction from block $(item.block_index); any recovered point will be checked exactly against the unreduced SDP",
+            "Feasibility search: tentatively batched $(length(unique_candidates)) PSD direction(s) across $(length(Set(candidate_item.block_index for candidate_item in unique_candidates))) block(s); any recovered point will be checked exactly against the unreduced SDP",
         )
-        return reduced_problem
+        return _tentative_search_result(batch_problem, fallback_problem, return_details)
     end
-    return nothing
+
+    # Deterministic rollback: admit candidates one at a time, always
+    # recomputing the combined face from the original problem.
+    consistent_problem, accepted_candidates = _tentative_greedy_admission(
+        problem,
+        unique_candidates,
+    )
+
+    accepted_count = length(accepted_candidates)
+    _record_directions!(
+        :tentative,
+        length(candidates),
+        accepted_count,
+        length(candidates) - accepted_count,
+    )
+    consistent_problem === nothing &&
+        return _tentative_search_result(nothing, nothing, return_details)
+    _log(
+        opt,
+        "Feasibility search: batched tentative admission rolled back to $(accepted_count) of $(length(unique_candidates)) PSD direction(s); any recovered point will be checked exactly against the unreduced SDP",
+    )
+    return _tentative_search_result(consistent_problem, nothing, return_details)
 end
 
 function _is_inexact_facial_reduction_error(err)
@@ -746,7 +943,7 @@ function _log_phase1_candidate_diagnostics(
     for (block_index, block) in enumerate(problem.blocks)
         block_matrix = _vector_to_matrix(candidate, block)
         symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
-        eigenvalues = eigvals(symmetric_matrix)
+        eigenvalues = _facial_reduction_eigvals(opt, block_matrix)
         isempty(eigenvalues) && continue
         _log(
             opt,
@@ -849,9 +1046,21 @@ function _facial_reduction_oracle_attempt(
     ::Type{HF},
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
+        oracle_start_time = time_ns()
+        oracle_recorded = false
+        record_oracle(iterations::Integer = 0) = begin
+            oracle_recorded && return
+            _record_oracle_attempt!(
+                iterations,
+                (time_ns() - oracle_start_time) / 1.0e9,
+            )
+            oracle_recorded = true
+            return
+        end
         model = _build_facial_reduction_oracle(problem, HF)
         if model === nothing
             _log(opt, "Facial reduction oracle unavailable: exact normalization equalities are inconsistent")
+            record_oracle()
             return nothing
         end
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
@@ -877,6 +1086,7 @@ function _facial_reduction_oracle_attempt(
                 opt,
                 "Facial reduction oracle unavailable: $(typeof(err))",
             )
+            record_oracle()
             return nothing
         end
         elapsed_sec = (time_ns() - start_time) / 1.0e9
@@ -886,6 +1096,7 @@ function _facial_reduction_oracle_attempt(
                 opt,
                 "Facial reduction oracle: status=$(status), time=$(@sprintf("%.2f", elapsed_sec))s",
             )
+            record_oracle(Hypatia.Solvers.get_num_iters(solver))
             return nothing
         end
         candidate = try
@@ -893,14 +1104,21 @@ function _facial_reduction_oracle_attempt(
         catch
             nothing
         end
-        candidate === nothing && return nothing
-        all(isfinite, candidate) || return nothing
+        if candidate === nothing
+            record_oracle(Hypatia.Solvers.get_num_iters(solver))
+            return nothing
+        end
+        if !all(isfinite, candidate)
+            record_oracle(Hypatia.Solvers.get_num_iters(solver))
+            return nothing
+        end
         slow_progress_note =
             status == Hypatia.Solvers.SlowProgress ? "; trying current iterate" : ""
         _log(
             opt,
             "Facial reduction oracle: status=$(status), iter=$(Hypatia.Solvers.get_num_iters(solver)), time=$(@sprintf("%.2f", elapsed_sec))s$(slow_progress_note)",
         )
+        record_oracle(Hypatia.Solvers.get_num_iters(solver))
         return candidate
     end)
 end
@@ -1186,6 +1404,8 @@ function _prepare_facial_reduction_cache!(opt::Optimizer)
         records = _read_facial_reduction_cache(load_path; missing_ok = true)
         opt.facial_reduction_loaded_records = records
         append!(opt.facial_reduction_save_records, records)
+        _record_approximate_cache_memory!(:facial_reduction, opt.facial_reduction_loaded_records)
+        _record_approximate_cache_memory!(:facial_reduction, opt.facial_reduction_save_records)
     end
     return
 end
@@ -1200,6 +1420,7 @@ function _loaded_facial_reduction_records!(opt::Optimizer)
     else
         records = _read_facial_reduction_cache(load_path)
         opt.facial_reduction_loaded_records = records
+        _record_approximate_cache_memory!(:facial_reduction, records)
         _log(
             opt,
             "Facial reduction: loaded $(length(records)) cached reduction record(s) from $(abspath(load_path))",
@@ -1270,6 +1491,7 @@ function _record_successful_facial_reduction!(
     save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
     save_path === nothing && return
     push!(opt.facial_reduction_save_records, _facial_reduction_record(problem, reduction))
+    _record_approximate_cache_memory!(:facial_reduction, opt.facial_reduction_save_records)
     full_path = _write_facial_reduction_cache(
         save_path,
         opt.facial_reduction_save_records,
@@ -1432,6 +1654,8 @@ function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
             current,
             reduction.exposed_scalars,
             reduction.keep_bases,
+            ;
+            certified = true,
         )
         if reduced_problem.affine === nothing
             _log(
@@ -1441,11 +1665,14 @@ function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
             continue
         end
         applied += 1
+        old_barrier_dimension = _barrier_dimension(current)
         removed_psd_directions = sum(
             (current.blocks[index].size - size(reduction.keep_bases[index], 2) for
              index in keys(reduction.keep_bases));
             init = 0,
         )
+        new_barrier_dimension = _barrier_dimension(reduced_problem)
+        _record_reduction_round!(old_barrier_dimension, new_barrier_dimension; tentative = false)
         _log(
             opt,
             "Facial reduction: applied cached face from $(reduction.source), fixed $(length(reduction.exposed_scalars)) scalar cone direction(s) and removed $(removed_psd_directions) PSD direction(s)",
@@ -1598,7 +1825,7 @@ function _facial_reduction_block_directions(
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
-    eigen_factor = eigen(symmetric_matrix)
+    eigen_factor = _facial_reduction_eigen(opt, symmetric_matrix)
     eigenvalues = eigen_factor.values
     isempty(eigenvalues) && return Vector{ExactRational}[]
 
@@ -1637,6 +1864,7 @@ function _facial_reduction_block_directions(
 
     qr_factor = qr(Matrix(symmetric_matrix), ColumnNorm())
     candidate_columns = unique(qr_factor.p[1:numeric_rank])
+    _record_directions!(:certified, length(candidate_columns), 0, 0)
     exact_directions = Vector{Vector{ExactRational}}()
     for column_index in candidate_columns
         direction = _exact_face_direction(
@@ -1652,6 +1880,12 @@ function _facial_reduction_block_directions(
         direction === nothing && continue
         push!(exact_directions, direction)
     end
+    _record_directions!(
+        :certified,
+        0,
+        length(exact_directions),
+        length(candidate_columns) - length(exact_directions),
+    )
     exact_directions = _linearly_independent_directions(exact_directions)
 
     if isempty(exact_directions) && maximum(eigenvalues) > exposure_tolerance
@@ -1863,8 +2097,19 @@ function _apply_facial_reduction(
     problem::ProblemData,
     exposed_scalars::Vector{Int},
     keep_bases::Dict{Int,Matrix{ExactRational}},
+    ;
+    certified::Bool = false,
 )
+    if certified
+        violation = _cached_facial_reduction_violation(
+            problem,
+            _CertifiedFacialReduction("in-memory", exposed_scalars, keep_bases),
+        )
+        violation === nothing ||
+            error("Certified facial reduction failed exact preservation checks: $(violation)")
+    end
     old_dimension = length(problem.objective_vector_raw)
+    old_barrier_dimension = _barrier_dimension(problem)
     blocks = BlockStructure[]
     block_replacements = Dict{Int,Union{Nothing,BlockStructure}}()
     next_position = old_dimension + 1
@@ -1953,7 +2198,7 @@ function _apply_facial_reduction(
     affine = _solve_affine_system(A, b)
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
-    return ProblemData(
+    reduced_problem = ProblemData(
         problem.original_variables,
         blocks,
         positive_scalars,
@@ -1967,6 +2212,10 @@ function _apply_facial_reduction(
         problem.scalar_constraint_rows,
         problem.psd_constraint_blocks,
     )
+    new_barrier_dimension = _barrier_dimension(reduced_problem)
+    new_barrier_dimension < old_barrier_dimension ||
+        error("Facial reduction was applied without decreasing barrier dimension.")
+    return reduced_problem
 end
 
 function _facial_reduction_round(
@@ -2036,7 +2285,12 @@ function _facially_reduce_problem(
         (problem.blocks[index].size - size(keep_bases[index], 2) for index in keys(keep_bases));
         init = 0,
     )
-    reduced_problem = _apply_facial_reduction(problem, exposed_scalars, keep_bases)
+    reduced_problem = _apply_facial_reduction(
+        problem,
+        exposed_scalars,
+        keep_bases;
+        certified = false,
+    )
     if reduced_problem.affine === nothing
         message =
             "Facial reduction found a PSD block on the cone boundary, " *
@@ -2047,6 +2301,11 @@ function _facially_reduce_problem(
         end
         throw(ErrorException(message))
     end
+    _record_reduction_round!(
+        _barrier_dimension(problem),
+        _barrier_dimension(reduced_problem);
+        tentative = false,
+    )
     _record_successful_facial_reduction!(opt, problem, reduction)
     _log(
         opt,
@@ -2055,7 +2314,7 @@ function _facially_reduce_problem(
     return reduced_problem
 end
 
-function _facially_reduce_feasibility_search_problem(
+function _facially_reduce_search_problem(
     opt::Optimizer,
     problem::ProblemData,
     candidate::Vector{F},
@@ -2074,6 +2333,8 @@ function _facially_reduce_feasibility_search_problem(
             problem,
             reduction.exposed_scalars,
             reduction.keep_bases,
+            ;
+            certified = false,
         )
         if reduced_problem.affine === nothing
             message =
@@ -2081,16 +2342,44 @@ function _facially_reduce_feasibility_search_problem(
                 "but the exposed nullspace directions could not be represented exactly over the rational coefficient field."
             if _facial_reduction_irrational_behavior(opt.settings) == :warn
                 _log(opt, message)
-                return (problem = problem, tentative = false)
+                return (
+                    problem = problem,
+                    tentative = false,
+                    fallback_problem = nothing,
+                )
             end
             throw(ErrorException(message))
         end
+        _record_reduction_round!(
+            _barrier_dimension(problem),
+            _barrier_dimension(reduced_problem);
+            tentative = false,
+        )
         _record_successful_facial_reduction!(opt, problem, reduction)
-        return (problem = reduced_problem, tentative = false)
+        return (
+            problem = reduced_problem,
+            tentative = false,
+            fallback_problem = nothing,
+        )
     end
-    tentative_problem = _tentative_feasibility_search_problem(opt, problem, candidate, F)
+    tentative_result = _tentative_feasibility_search_problem(
+        opt,
+        problem,
+        candidate,
+        F;
+        return_details = true,
+    )
+    tentative_problem = tentative_result.problem
+    if tentative_problem !== nothing
+        _record_reduction_round!(
+            _barrier_dimension(problem),
+            _barrier_dimension(tentative_problem);
+            tentative = true,
+        )
+    end
     return (
         problem = tentative_problem === nothing ? problem : tentative_problem,
         tentative = tentative_problem !== nothing,
+        fallback_problem = tentative_result.fallback_problem,
     )
 end

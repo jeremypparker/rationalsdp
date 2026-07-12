@@ -186,6 +186,7 @@ end
         optimize!(model)
 
         @test termination_status(model) == MOI.OPTIMAL
+        test_facial_reduction_statistics(model)
         @test primal_status(model) == MOI.FEASIBLE_POINT
         @test iszero(value(V)(s => 0, i => 0, r => 0, G => 0))
         test_exact_extracted_sdp(model)
@@ -235,11 +236,20 @@ end
         decay_poly = -S * I * (s^2 + i^2) - SIdVdt
         positive_cref = @constraint(model, positive_poly >= 0, SOSCone(), domain = D)
         decay_cref = @constraint(model, decay_poly >= 0, SOSCone(), domain = D)
+        @variable(model, objective_marker)
+        @constraint(model, objective_marker == 0//1)
+        @objective(model, Min, objective_marker)
 
         optimize!(model)
 
-        @test termination_status(model) == MOI.OPTIMAL
+        @test termination_status(model) == MOI.OTHER_LIMIT
+        test_facial_reduction_statistics(model)
         @test primal_status(model) == MOI.FEASIBLE_POINT
+        @test objective_value(model) == 0//1
+        @test occursin(
+            "optimality for the original SDP is not established",
+            MOI.get(backend(model), MOI.RawStatusString()),
+        )
         @test iszero(value(V)(i => 0, n => 0, l => 0, m => 0))
         test_exact_extracted_sdp(model)
     end

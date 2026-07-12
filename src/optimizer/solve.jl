@@ -122,6 +122,14 @@ function _populate_constraint_results!(
 end
 
 function MOI.optimize!(opt::Optimizer{T}) where {T}
+    stats = FacialReductionStatistics()
+    opt.facial_reduction_statistics = stats
+    return _with_facial_reduction_statistics(stats) do
+        _optimize_impl!(opt)
+    end
+end
+
+function _optimize_impl!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
     _validate_settings(opt.settings)
@@ -160,6 +168,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)
         if barrier_dim == 0 && size(nullspace, 2) == 0
+            feasibility = _exact_primal_feasibility(original_problem, particular)
+            feasibility.ok || begin
+                opt.termination_status = MOI.NUMERICAL_ERROR
+                opt.primal_status = MOI.NO_SOLUTION
+                opt.raw_status = "Exact validation against the original SDP failed: $(feasibility.reason)"
+                opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+                return
+            end
             objective_value = _exact_objective_value(problem, particular)
             for (index, variable) in enumerate(problem.original_variables)
                 opt.variable_primal[variable] = _to_output_type(T, particular[index])
@@ -183,6 +199,14 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
                 _log(opt, "unbounded on affine nullspace")
                 return
             end
+            feasibility = _exact_primal_feasibility(original_problem, particular)
+            feasibility.ok || begin
+                opt.termination_status = MOI.NUMERICAL_ERROR
+                opt.primal_status = MOI.NO_SOLUTION
+                opt.raw_status = "Exact validation against the original SDP failed: $(feasibility.reason)"
+                opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+                return
+            end
             objective_value = _exact_objective_value(problem, particular)
             for (index, variable) in enumerate(problem.original_variables)
                 opt.variable_primal[variable] = _to_output_type(T, particular[index])
@@ -204,8 +228,9 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         phase2_initial_point = phase1_result.phase2_initial_point
         phase1_candidate = phase1_result.phase1_candidate
         phase1_dual_slack = phase1_result.phase1_dual_slack
-        tentative_feasibility_search_used = false
+        tentative_face_search_used = false
         feasibility_objective = all(iszero, original_problem.objective_vector_min)
+        tentative_fallback_problem = nothing
 
         facial_reduction_round = 0
         while anchor === nothing &&
@@ -213,28 +238,16 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
               phase1_candidate !== nothing &&
               facial_reduction_round < opt.settings.facial_reduction_max_rounds
             _log(opt, "Attempting facial reduction")
-            reduction_result = if feasibility_objective
-                _facially_reduce_feasibility_search_problem(
-                    opt,
-                    problem,
-                    phase1_candidate,
-                    phase1_dual_slack,
-                    F,
-                )
-            else
-                (
-                    problem = _facially_reduce_problem(
-                        opt,
-                        problem,
-                        phase1_candidate,
-                        phase1_dual_slack,
-                        F,
-                    ),
-                    tentative = false,
-                )
-            end
+            reduction_result = _facially_reduce_search_problem(
+                opt,
+                problem,
+                phase1_candidate,
+                phase1_dual_slack,
+                F,
+            )
             reduced_problem = reduction_result.problem
-            tentative_feasibility_search_used |= reduction_result.tentative
+            tentative_face_search_used |= reduction_result.tentative
+            tentative_fallback_problem = reduction_result.fallback_problem
             problem_changed =
                 length(reduced_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
                 size(reduced_problem.A) != size(problem.A) ||
@@ -249,6 +262,23 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
             phase2_initial_point = phase1_result.phase2_initial_point
             phase1_candidate = phase1_result.phase1_candidate
             phase1_dual_slack = phase1_result.phase1_dual_slack
+
+            if anchor === nothing && tentative_fallback_problem !== nothing
+                fallback_problem = tentative_fallback_problem
+                tentative_fallback_problem = nothing
+                facial_reduction_round += 1
+                problem = fallback_problem
+                numeric_blocks = _numeric_blocks(problem.blocks)
+                _log(
+                    opt,
+                    "Tentative batch did not recover an exact interior; retrying its deterministic greedy fallback",
+                )
+                phase1_result = _phase1_anchor_attempt(opt, problem, F)
+                anchor = phase1_result.anchor
+                phase2_initial_point = phase1_result.phase2_initial_point
+                phase1_candidate = phase1_result.phase1_candidate
+                phase1_dual_slack = phase1_result.phase1_dual_slack
+            end
         end
 
         if problem.affine === nothing
@@ -314,9 +344,13 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
         opt.objective_value = _to_output_type(T, objective_value)
         opt.primal_status = MOI.FEASIBLE_POINT
         opt.dual_status = MOI.NO_SOLUTION
-        if phase2_termination_reason == :optimal
+        if tentative_face_search_used && !feasibility_objective
+            opt.termination_status = MOI.OTHER_LIMIT
+            opt.raw_status =
+                "Exact feasible point found using a tentative face restriction; optimality for the original SDP is not established"
+        elseif phase2_termination_reason == :optimal
             opt.termination_status = MOI.OPTIMAL
-            opt.raw_status = tentative_feasibility_search_used ?
+            opt.raw_status = tentative_face_search_used ?
                              "Feasible point found by tentative face search and validated exactly against the original SDP" :
                              "Solved"
         elseif phase2_termination_reason == :outer_iteration_limit

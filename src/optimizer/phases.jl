@@ -1176,6 +1176,7 @@ function _phase1_anchor_attempt(
     problem::ProblemData,
     ::Type{F},
 ) where {F<:AbstractFloat}
+    phase1_start_time = time_ns()
     anchor = nothing
     phase2_initial_point = nothing
     phase1_candidate = nothing
@@ -1293,7 +1294,7 @@ function _phase1_anchor_attempt(
         end
     end
 
-    return (
+    result = (
         anchor = anchor,
         phase2_initial_point = phase2_initial_point,
         phase1_candidate = phase1_candidate,
@@ -1302,6 +1303,8 @@ function _phase1_anchor_attempt(
         phase1_status = phase1_status,
         phase1_dual_slack = phase1_dual_slack,
     )
+    _record_phase1_attempt!((time_ns() - phase1_start_time) / 1.0e9)
+    return result
 end
 
 function _newton_phase2!(

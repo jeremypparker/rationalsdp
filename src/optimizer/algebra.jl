@@ -140,8 +140,23 @@ function _rref_pivots(reduced, variable_count::Int)
     return pivot_rows, pivot_columns
 end
 
+function _exact_rref(aug::Matrix{ExactRational})
+    start_time = time_ns()
+    try
+        _, reduced = Nemo.rref(_to_nemo_matrix(aug))
+        return reduced
+    finally
+        stats = _current_facial_reduction_statistics()
+        if stats isa FacialReductionStatistics
+            stats.exact_rref_calls += 1
+            push!(stats.exact_rref_dimensions, size(aug))
+            stats.exact_rref_time_sec += (time_ns() - start_time) / 1.0e9
+        end
+    end
+end
+
 function _rref(aug::Matrix{ExactRational})
-    _, reduced_nemo = Nemo.rref(_to_nemo_matrix(aug))
+    reduced_nemo = _exact_rref(aug)
     reduced = _from_nemo_matrix(reduced_nemo)
     _, pivot_columns = _rref_pivots(reduced, size(aug, 2) - 1)
     return reduced, pivot_columns
@@ -155,13 +170,14 @@ function _solve_affine_system(
 )
     p = size(A, 2)
     if size(A, 1) == 0
-        return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
+        affine = (zeros(ExactRational, p), Matrix{ExactRational}(I, p, p))
+        return _assert_affine_invariant(A, b, affine)
     end
     size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
 
     checkpoint !== nothing && checkpoint("affine elimination: before Nemo exact rref")
     rhs_column = p + 1
-    _, reduced = Nemo.rref(_to_nemo_matrix(hcat(A, b)))
+    reduced = _exact_rref(hcat(A, b))
     checkpoint !== nothing && checkpoint("affine elimination: after Nemo exact rref")
     pivot_rows, pivot_columns = _rref_pivots(reduced, p)
     for row in axes(reduced, 1)
@@ -185,7 +201,23 @@ function _solve_affine_system(
                 (nullspace[pivot_column, basis_index] = -_from_nemo_rational(coefficient))
         end
     end
-    return particular, nullspace
+    affine = (particular, nullspace)
+    _assert_affine_invariant(A, b, affine)
+    return affine
+end
+
+function _assert_affine_invariant(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+    affine::Tuple{Vector{ExactRational},Matrix{ExactRational}},
+)
+    particular, nullspace = affine
+    size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
+    size(A, 2) == length(particular) || error("Affine particular point has the wrong dimension.")
+    A * particular == b || error("Exact affine invariant failed: A*p != b.")
+    A * nullspace == zeros(ExactRational, size(A, 1), size(nullspace, 2)) ||
+        error("Exact affine invariant failed: A*N != 0.")
+    return affine
 end
 
 function _independent_affine_equalities(
@@ -231,10 +263,11 @@ function _restrict_affine_system(
     coordinate_affine = _solve_affine_system(rows * nullspace, rhs - rows * particular)
     coordinate_affine === nothing && return nothing
     coordinate_particular, coordinate_nullspace = coordinate_affine
-    return (
+    result = (
         particular + nullspace * coordinate_particular,
         nullspace * coordinate_nullspace,
     )
+    return _assert_affine_invariant(rows, rhs, result)
 end
 
 function _coordinate_equality_rows(dimension::Int, indices::Vector{Int})
@@ -740,18 +773,22 @@ function _numeric_affine_data(
     ::Type{F},
 ) where {F<:AbstractFloat}
     particular_numeric = _to_working_array(F, particular)
-    return NumericAffineData{F}(particular_numeric, nullspace, nothing, nothing, nothing)
+    result = NumericAffineData{F}(particular_numeric, nullspace, nothing, nothing, nothing)
+    _record_approximate_cache_memory!(:affine, result)
+    return result
 end
 
 function _numeric_exact_nullspace!(numeric_affine::NumericAffineData{F}) where {F<:AbstractFloat}
     if size(numeric_affine.exact_nullspace, 2) == 0
         if numeric_affine.numeric_exact_nullspace === nothing
             numeric_affine.numeric_exact_nullspace = Matrix{F}(undef, size(numeric_affine.exact_nullspace)...)
+            _record_approximate_cache_memory!(:affine, numeric_affine)
         end
         return numeric_affine.numeric_exact_nullspace
     end
     if numeric_affine.numeric_exact_nullspace === nothing
         numeric_affine.numeric_exact_nullspace = _to_working_array(F, numeric_affine.exact_nullspace)
+        _record_approximate_cache_memory!(:affine, numeric_affine)
     end
     return numeric_affine.numeric_exact_nullspace
 end
@@ -760,6 +797,7 @@ function _numeric_nullspace!(numeric_affine::NumericAffineData{F}) where {F<:Abs
     if size(numeric_affine.exact_nullspace, 2) == 0
         if numeric_affine.numeric_phase2_basis === nothing
             numeric_affine.numeric_phase2_basis = Matrix{F}(undef, size(numeric_affine.exact_nullspace)...)
+            _record_approximate_cache_memory!(:affine, numeric_affine)
         end
         return numeric_affine.numeric_phase2_basis
     end
@@ -769,6 +807,7 @@ function _numeric_nullspace!(numeric_affine::NumericAffineData{F}) where {F<:Abs
         factor = qr(exact_numeric_nullspace)
         lmul!(factor.Q, basis)
         numeric_affine.numeric_phase2_basis = basis
+        _record_approximate_cache_memory!(:affine, numeric_affine)
     end
     return numeric_affine.numeric_phase2_basis
 end

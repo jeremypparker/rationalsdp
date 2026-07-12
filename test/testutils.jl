@@ -131,3 +131,36 @@ function test_exact_extracted_sdp(model::JuMP.GenericModel)
     @test RationalSDP._exact_primal_feasibility(problem, point).ok
     return point
 end
+
+function facial_reduction_stats(model::JuMP.GenericModel)
+    bridge_optimizer = getfield(backend(model), :optimizer)
+    opt = getfield(bridge_optimizer, :model)
+    return RationalSDP.facial_reduction_statistics(opt)
+end
+
+function test_facial_reduction_statistics(model::JuMP.GenericModel)
+    stats = facial_reduction_stats(model)
+    @test stats.phase1_attempts >= 0
+    @test stats.phase1_time_sec >= 0
+    @test stats.oracle_attempts >= 0
+    @test stats.oracle_iterations >= 0
+    @test stats.oracle_time_sec >= 0
+    @test stats.exact_rref_calls == length(stats.exact_rref_dimensions)
+    @test stats.exact_rref_time_sec >= 0
+    @test stats.exact_row_space_checks >= 0
+    @test stats.exact_certificate_checks >= 0
+    @test stats.exact_row_space_check_time_sec >= 0
+    @test stats.exact_certificate_time_sec >= 0
+    @test all(value >= 0 for value in values(stats.psd_eigendecompositions_by_block_size))
+    @test stats.psd_eigendecomposition_time_sec >= 0
+    @test stats.certified_directions_proposed >= 0
+    @test stats.certified_directions_accepted >= 0
+    @test stats.certified_directions_rejected >= 0
+    @test stats.tentative_directions_proposed >= 0
+    @test stats.tentative_directions_accepted >= 0
+    @test stats.tentative_directions_rejected >= 0
+    @test all(value > 0 for value in stats.cone_dimension_removed_per_round)
+    @test stats.affine_cache_peak_bytes >= 0
+    @test stats.facial_reduction_cache_peak_bytes >= 0
+    return stats
+end

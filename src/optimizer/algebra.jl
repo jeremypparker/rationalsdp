@@ -270,6 +270,38 @@ function _restrict_affine_system(
     return _assert_affine_invariant(rows, rhs, result)
 end
 
+function _extend_and_restrict_affine_system(
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+    added_dimension::Int,
+    restriction_rows::Matrix{ExactRational},
+    restriction_rhs::Vector{ExactRational},
+)
+    affine === nothing && return nothing
+    added_dimension >= 0 || error("Added affine dimension must be nonnegative.")
+    size(restriction_rows, 1) == length(restriction_rhs) ||
+        error("Affine restriction rows and rhs must match.")
+    particular, nullspace = affine
+    old_dimension = length(particular)
+    size(nullspace, 1) == old_dimension || error("Affine nullspace has the wrong row count.")
+    extended_particular = vcat(particular, zeros(ExactRational, added_dimension))
+    extended_nullspace = zeros(ExactRational, old_dimension + added_dimension, size(nullspace, 2) + added_dimension)
+    size(nullspace, 2) > 0 && (extended_nullspace[1:old_dimension, 1:size(nullspace, 2)] = nullspace)
+    added_dimension > 0 && (extended_nullspace[old_dimension + 1:end, size(nullspace, 2) + 1:end] = Matrix{ExactRational}(I, added_dimension, added_dimension))
+
+    coordinate_affine = _solve_affine_system(
+        restriction_rows * extended_nullspace,
+        restriction_rhs - restriction_rows * extended_particular,
+    )
+    coordinate_affine === nothing && return nothing
+    coordinate_particular, coordinate_nullspace = coordinate_affine
+    result = (
+        extended_particular + extended_nullspace * coordinate_particular,
+        extended_nullspace * coordinate_nullspace,
+    )
+    _assert_affine_invariant(restriction_rows, restriction_rhs, result)
+    return result
+end
+
 function _coordinate_equality_rows(dimension::Int, indices::Vector{Int})
     unique_indices = unique(sort(indices))
     rows = zeros(ExactRational, length(unique_indices), dimension)

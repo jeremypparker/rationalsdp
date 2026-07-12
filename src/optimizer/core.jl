@@ -225,6 +225,7 @@ Base.@kwdef mutable struct Settings
     working_float_type::DataType = Double64
     facial_reduction::Bool = true
     facial_reduction_max_rounds::Int = 24
+    facial_reduction_rank_expansion_rounds::Int = 1
     facial_reduction_float_type::DataType = AbstractFloat
     facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"
@@ -870,6 +871,8 @@ function _validate_settings(settings::Settings)
     end
     settings.facial_reduction_max_rounds >= 0 ||
         throw(ArgumentError("facial_reduction_max_rounds must be nonnegative."))
+    settings.facial_reduction_rank_expansion_rounds >= 0 ||
+        throw(ArgumentError("facial_reduction_rank_expansion_rounds must be nonnegative."))
     settings.phase1_exact_recovery_pivot_log_frequency >= 0 ||
         throw(ArgumentError("phase1_exact_recovery_pivot_log_frequency must be nonnegative."))
     settings.exact_refinement_bisections >= 0 ||

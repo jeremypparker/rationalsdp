@@ -165,6 +165,14 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
         problem = cached_problem
         cached_problem_changed && _log_banner(opt, problem)
 
+        sieved_problem = _sieve_facial_reduction_problem(opt, problem)
+        sieved_problem_changed =
+            length(sieved_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
+            size(sieved_problem.A) != size(problem.A) ||
+            _barrier_dimension(sieved_problem) != _barrier_dimension(problem)
+        problem = sieved_problem
+        sieved_problem_changed && _log_banner(opt, problem)
+
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)
         if barrier_dim == 0 && size(nullspace, 2) == 0
@@ -255,6 +263,14 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             problem_changed || break
             facial_reduction_round += 1
             problem = reduced_problem
+            if !reduction_result.tentative
+                sieved_problem = _sieve_facial_reduction_problem(opt, problem)
+                sieved_problem_changed =
+                    length(sieved_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
+                    size(sieved_problem.A) != size(problem.A) ||
+                    _barrier_dimension(sieved_problem) != _barrier_dimension(problem)
+                problem = sieved_problem
+            end
             numeric_blocks = _numeric_blocks(problem.blocks)
             _log_banner(opt, problem)
             phase1_result = _phase1_anchor_attempt(opt, problem, F)

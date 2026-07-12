@@ -854,11 +854,11 @@ include("slowtest_helpers.jl")
             zeros(Rational{BigInt}, 6),
             0//1,
             zeros(Rational{BigInt}, 6),
-            zeros(Rational{BigInt}, 0, 6),
-            Rational{BigInt}[],
-            (
+            Matrix{Rational{BigInt}}(I, 6, 6),
+            triangle_entries(fill(1//1, 3, 3)),
+            RationalSDP._solve_affine_system(
+                Matrix{Rational{BigInt}}(I, 6, 6),
                 triangle_entries(fill(1//1, 3, 3)),
-                zeros(Rational{BigInt}, 6, 0),
             ),
         )
         M = Float64[
@@ -952,11 +952,11 @@ include("slowtest_helpers.jl")
             Rational{BigInt}[0//1, 0//1, 0//1],
             0//1,
             Rational{BigInt}[0//1, 0//1, 0//1],
-            zeros(Rational{BigInt}, 0, 3),
-            Rational{BigInt}[],
-            (
+            Matrix{Rational{BigInt}}(I, 3, 3),
+            Rational{BigInt}[1//1, -1//1, 1//1],
+            RationalSDP._solve_affine_system(
+                Matrix{Rational{BigInt}}(I, 3, 3),
                 Rational{BigInt}[1//1, -1//1, 1//1],
-                zeros(Rational{BigInt}, 3, 0),
             ),
         )
         directions =
@@ -970,7 +970,7 @@ include("slowtest_helpers.jl")
         @test directions == [Rational{BigInt}[1//1, 1//1]]
 
         exact_cache = RationalSDP._FacialReductionExactCache(exact_boundary_problem)
-        @test exact_cache.block_affine_slices[1] === nothing
+        @test exact_cache.row_space === nothing
         @test exact_cache.block_exact_directions[1] === nothing
         cached_directions = RationalSDP._exact_block_nullspace_directions(
             exact_boundary_problem,
@@ -979,7 +979,6 @@ include("slowtest_helpers.jl")
             block_index = 1,
         )
         @test cached_directions == [Rational{BigInt}[1//1, 1//1]]
-        @test exact_cache.block_affine_slices[1] !== nothing
         @test exact_cache.block_exact_directions[1] === cached_directions
         @test RationalSDP._exact_block_nullspace_directions(
             exact_boundary_problem,
@@ -994,7 +993,8 @@ include("slowtest_helpers.jl")
             cache = exact_cache,
         )
         @test exact_slack == zeros(Rational{BigInt}, 3)
-        @test exact_cache.A_transpose !== nothing
+        RationalSDP._facial_reduction_row_space!(exact_cache, exact_boundary_problem)
+        @test exact_cache.row_space !== nothing
 
         psd_certified_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
@@ -1424,6 +1424,369 @@ include("slowtest_helpers.jl")
         keep_bases = reduction.keep_bases
         @test exposed_scalars == [1]
         @test isempty(keep_bases)
+    end
+
+    @testset "Facial reduction merges certified complementary faces" begin
+        block = RationalSDP.BlockStructure(
+            3,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+            collect(1:6),
+            [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)],
+            [1, 3, 6],
+        )
+        A = Rational{BigInt}[
+            1//1 0//1 0//1 0//1 0//1 0//1
+            0//1 0//1 1//1 0//1 0//1 0//1
+            0//1 0//1 0//1 0//1 0//1 1//1
+        ]
+        b = Rational{BigInt}[0//1, 0//1, 1//1]
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0//1,
+            zeros(Rational{BigInt}, 6),
+            A,
+            b,
+            RationalSDP._solve_affine_system(A, b),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+        keep_without_first = Rational{BigInt}[0 0; 1 0; 0 1]
+        keep_without_second = Rational{BigInt}[1 0; 0 0; 0 1]
+        first = RationalSDP._CertifiedFacialReduction(
+            "first",
+            Int[],
+            Dict(1 => keep_without_first),
+        )
+        second = RationalSDP._CertifiedFacialReduction(
+            "second",
+            Int[],
+            Dict(1 => keep_without_second),
+        )
+        merged = RationalSDP._merge_certified_facial_reductions(opt, problem, [first, second])
+        @test merged !== nothing
+        @test occursin("first", merged.source)
+        @test occursin("second", merged.source)
+        @test size(merged.keep_bases[1], 2) == 1
+        reduced = RationalSDP._apply_facial_reduction(
+            problem,
+            merged.exposed_scalars,
+            merged.keep_bases,
+        )
+        @test [reduced_block.size for reduced_block in reduced.blocks] == [1]
+        @test reduced.affine !== nothing
+    end
+
+    @testset "Facial reduction rank expansion targets the residual face" begin
+        block = RationalSDP.BlockStructure(
+            3,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+            collect(1:6),
+            [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)],
+            [1, 3, 6],
+        )
+        A = Rational{BigInt}[
+            1//1 0//1 0//1 0//1 0//1 0//1
+            0//1 0//1 1//1 0//1 0//1 0//1
+            0//1 0//1 0//1 0//1 0//1 1//1
+        ]
+        b = Rational{BigInt}[0//1, 0//1, 1//1]
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0//1,
+            zeros(Rational{BigInt}, 6),
+            A,
+            b,
+            RationalSDP._solve_affine_system(A, b),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_float_type = Float64,
+            facial_reduction_rank_expansion_rounds = 1,
+        )
+        first = RationalSDP._CertifiedFacialReduction(
+            "initial",
+            Int[],
+            Dict(1 => Rational{BigInt}[0 0; 1 0; 0 1]),
+        )
+        expanded = RationalSDP._facial_reduction_round_with_rank_expansion(
+            opt,
+            problem,
+            first,
+            Float64,
+        )
+        @test expanded !== nothing
+        @test size(expanded.keep_bases[1], 2) == 1
+        @test RationalSDP._cached_facial_reduction_violation(problem, expanded) === nothing
+    end
+
+    @testset "Sieve exact affine-row certificates" begin
+        block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:3],
+            collect(1:3),
+            [(1, 1), (2, 1), (2, 2)],
+            [1, 3],
+        )
+        make_problem(A, b; positive_scalars = Int[], dimension = size(A, 2)) =
+            RationalSDP.ProblemData(
+                MOI.VariableIndex[],
+                [block],
+                positive_scalars,
+                zeros(Rational{BigInt}, dimension),
+                0 // 1,
+                zeros(Rational{BigInt}, dimension),
+                A,
+                b,
+                RationalSDP._solve_affine_system(A, b),
+            )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+
+        problem = make_problem(Rational{BigInt}[1 2 1], Rational{BigInt}[0])
+        positive = RationalSDP._sieve_row_reduction(
+            opt,
+            problem,
+            Rational{BigInt}[1],
+            "positive row",
+        )
+        negative = RationalSDP._sieve_row_reduction(
+            opt,
+            problem,
+            Rational{BigInt}[-1],
+            "negative row",
+        )
+        @test positive !== nothing
+        @test size(positive.reduction.keep_bases[1], 2) == 1
+        @test negative === nothing
+
+        free_problem = make_problem(
+            Rational{BigInt}[1 1 2 1],
+            Rational{BigInt}[0];
+            dimension = 4,
+        )
+        @test RationalSDP._sieve_row_reduction(
+            opt,
+            free_problem,
+            Rational{BigInt}[1],
+            "free row",
+        ) === nothing
+        rhs_problem = make_problem(Rational{BigInt}[1 2 1], Rational{BigInt}[1])
+        @test RationalSDP._sieve_row_reduction(
+            opt,
+            rhs_problem,
+            Rational{BigInt}[1],
+            "nonzero rhs",
+        ) === nothing
+        indefinite_problem = make_problem(Rational{BigInt}[1 0 -1], Rational{BigInt}[0])
+        @test RationalSDP._sieve_row_reduction(
+            opt,
+            indefinite_problem,
+            Rational{BigInt}[1],
+            "indefinite row",
+        ) === nothing
+
+        transformed_problem = make_problem(
+            Rational{BigInt}[
+                1 1 1
+                1 1 0
+            ],
+            Rational{BigInt}[0, 0],
+        )
+        certificates = RationalSDP._sieve_facial_reduction_certificates(
+            opt,
+            transformed_problem,
+        )
+        transformed = filter(
+            certificate -> occursin("transformed", certificate.source),
+            certificates,
+        )
+        @test !isempty(transformed)
+        @test any(
+            certificate -> certificate.row[1:3] == Rational{BigInt}[0, 0, 1] &&
+                           certificate.multiplier[1:2] == Rational{BigInt}[1, -1],
+            transformed,
+        )
+
+        mixed_block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:3],
+            collect(2:4),
+            [(1, 1), (2, 1), (2, 2)],
+            [2, 4],
+        )
+        mixed_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [mixed_block],
+            [1],
+            zeros(Rational{BigInt}, 4),
+            0 // 1,
+            zeros(Rational{BigInt}, 4),
+            Rational{BigInt}[1 1 2 1],
+            Rational{BigInt}[0],
+            RationalSDP._solve_affine_system(
+                Rational{BigInt}[1 1 2 1],
+                Rational{BigInt}[0],
+            ),
+        )
+        mixed = RationalSDP._sieve_row_reduction(
+            opt,
+            mixed_problem,
+            Rational{BigInt}[1],
+            "mixed row",
+        )
+        @test mixed !== nothing
+        @test mixed.reduction.exposed_scalars == [1]
+        @test size(mixed.reduction.keep_bases[1], 2) == 1
+
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        @variable(model, X[1:2, 1:2], PSD)
+        @constraint(model, X[1, 1] + 2 * X[1, 2] + X[2, 2] == 0)
+        @constraint(model, X[2, 2] == 1)
+        @objective(model, Min, 0 // 1)
+        optimize!(model)
+        bridge_optimizer = getfield(backend(model), :optimizer)
+        solved_opt = getfield(bridge_optimizer, :model)
+        @test termination_status(model) == MOI.OPTIMAL
+        @test RationalSDP.facial_reduction_statistics(solved_opt).oracle_attempts == 0
+
+        cascade_block = RationalSDP.BlockStructure(
+            3,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:6],
+            collect(1:6),
+            [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)],
+            [1, 3, 6],
+        )
+        cascade_A = Rational{BigInt}[
+            1 0 0 0 0 0
+            -1 0 1 0 0 0
+        ]
+        cascade_b = Rational{BigInt}[0, 0]
+        cascade_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [cascade_block],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0 // 1,
+            zeros(Rational{BigInt}, 6),
+            cascade_A,
+            cascade_b,
+            RationalSDP._solve_affine_system(cascade_A, cascade_b),
+        )
+        cascaded = RationalSDP._sieve_facial_reduction_problem(opt, cascade_problem)
+        @test [reduced_block.size for reduced_block in cascaded.blocks] == [1]
+
+        # Compare row-space membership with the affine particular/nullspace
+        # definition on several small, rank-deficient rational systems.
+        for case in 1:8
+            p = 5
+            m = 4
+            A_small = Rational{BigInt}[
+                ((i + 2j + case) % 5 - 2) // 1 for i in 1:m, j in 1:p
+            ]
+            x0 = Rational{BigInt}[((case + j) % 4 - 1) // 1 for j in 1:p]
+            b_small = A_small * x0
+            small_problem = RationalSDP.ProblemData(
+                MOI.VariableIndex[],
+                RationalSDP.BlockStructure[],
+                Int[],
+                zeros(Rational{BigInt}, p),
+                0 // 1,
+                zeros(Rational{BigInt}, p),
+                A_small,
+                b_small,
+                RationalSDP._solve_affine_system(A_small, b_small),
+            )
+            cache = RationalSDP._FacialReductionExactCache(small_problem)
+            for query in 1:6
+                indices = [j for j in 1:p if (j + query + case) % 3 == 0]
+                values = Rational{BigInt}[((j + 2query + case) % 5 - 2) // 1 for j in indices]
+                ell = zeros(Rational{BigInt}, p)
+                ell[indices] = values
+                particular, nullspace = small_problem.affine
+                old_ok = dot(ell, particular) == 0 // 1 &&
+                         all(iszero, transpose(ell) * nullspace)
+                multiplier = RationalSDP._row_space_multiplier(
+                    small_problem,
+                    indices,
+                    values;
+                    cache,
+                )
+                @test (multiplier !== nothing) == old_ok
+                if multiplier !== nothing
+                    @test transpose(A_small) * multiplier == ell
+                    @test dot(b_small, multiplier) == 0 // 1
+                end
+            end
+        end
+
+        empty_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            RationalSDP.BlockStructure[],
+            Int[],
+            zeros(Rational{BigInt}, 3),
+            0 // 1,
+            zeros(Rational{BigInt}, 3),
+            zeros(Rational{BigInt}, 0, 3),
+            Rational{BigInt}[],
+            RationalSDP._solve_affine_system(zeros(Rational{BigInt}, 0, 3), Rational{BigInt}[]),
+        )
+        @test RationalSDP._row_space_multiplier(
+            empty_problem,
+            [1],
+            Rational{BigInt}[1],
+        ) === nothing
+    end
+
+    @testset "Incremental affine restriction matches full elimination" begin
+        A0 = Rational{BigInt}[
+            1 2 0 1
+            0 1 1 -1
+            1 3 1 0
+        ]
+        b0 = Rational{BigInt}[2, 1, 3]
+        affine0 = RationalSDP._solve_affine_system(A0, b0)
+        @test affine0 !== nothing
+        restrictions = Rational{BigInt}[
+            1 0 0 0 1 0
+            0 0 1 0 0 1
+            0 1 0 0 0 0
+        ]
+        restriction_rhs = Rational{BigInt}[0, 0, 1]
+        incremental = RationalSDP._extend_and_restrict_affine_system(
+            affine0,
+            2,
+            restrictions,
+            restriction_rhs,
+        )
+        @test incremental !== nothing
+        p_inc, N_inc = incremental
+        p_ext = vcat(affine0[1], zeros(Rational{BigInt}, 2))
+        N_ext = zeros(Rational{BigInt}, 6, size(affine0[2], 2) + 2)
+        N_ext[1:4, 1:size(affine0[2], 2)] = affine0[2]
+        N_ext[5:6, size(affine0[2], 2) + 1:end] = Matrix{Rational{BigInt}}(I, 2, 2)
+        full = RationalSDP._solve_affine_system(
+            restrictions * N_ext,
+            restriction_rhs - restrictions * p_ext,
+        )
+        @test full !== nothing
+        p_full_coord, N_full_coord = full
+        @test p_inc == p_ext + N_ext * p_full_coord
+        @test N_inc == N_ext * N_full_coord
+        @test restrictions * p_inc == restriction_rhs
+        @test restrictions * N_inc == zeros(Rational{BigInt}, 3, size(N_inc, 2))
+
+        inconsistent = RationalSDP._extend_and_restrict_affine_system(
+            affine0,
+            0,
+            Rational{BigInt}[0 0 0 0],
+            Rational{BigInt}[999],
+        )
+        @test inconsistent === nothing
     end
 
     @testset "SIRS facial reduction handles uncertified boundary candidates" begin

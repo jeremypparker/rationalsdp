@@ -773,6 +773,9 @@ function _quasiconvex_feasible_point(
             phase1_candidate,
             phase1_dual_slack,
             F,
+            ;
+            rank_expansion = false,
+            merge_evidence = false,
         )
         problem_changed =
             length(reduced_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||

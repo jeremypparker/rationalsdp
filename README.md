@@ -113,6 +113,22 @@ RationalSDP tries to move the problem to a smaller exact face before Phase II.
 The reduction code treats numerical information as evidence and only applies a
 face after exact certification.
 
+Before invoking a numerical oracle, an exact Sieve pass inspects both signs of
+each affine equality row. Rows whose multiplier lies in the product dual cone,
+has zero right-hand side, and has no free-coordinate component are accepted as
+complete exposing certificates. The pass also examines exact row-reduced
+combinations while retaining their rational row multipliers, so every accepted
+face has explicit provenance.
+For very large affine systems, multiplier reconstruction is bounded to avoid
+turning preprocessing into a dense quadratic-cost step; individual rows are
+still checked exactly and the numerical oracle remains available.
+
+Candidate kernel certificates use an exact row-space cache for
+`[Aᵀ; bᵀ]`: each generated form is answered by an exact multiplier `y` with
+`Aᵀy = ℓ` and `bᵀy = 0`. This avoids materializing one affine-slice matrix per
+nullspace coordinate; the old full-block nullspace construction is retained
+only as a bounded small-problem fallback.
+
 The cheap evidence pass tries, in order:
 
 - a cone-dual slack returned by the Hypatia Phase I solve
@@ -122,6 +138,14 @@ If those do not certify a reducing face, RationalSDP launches a separate
 Hypatia exposing-vector oracle. By default this oracle uses the same Hypatia
 float type, system solver, iteration limit, and tolerance settings as Phase I;
 `facial_reduction_float_type` can still override the oracle float type.
+
+When both cheap evidence sources certify faces, their exact kernel and scalar
+exposures are merged before the reduced problem is built. After each certified
+reduction, a bounded rank-expansion oracle pass can search for another exposing
+slack normalized on the residual face; control its number of rounds with
+`facial_reduction_rank_expansion_rounds` (default `1`). Fixed-parameter
+quasiconvex probes deliberately use the conservative evidence path so that
+inconclusive numerical probes do not change the bisection result.
 
 Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
 expose a nonzero face, vanish on free coordinates, and have an exact affine-row
@@ -221,6 +245,7 @@ The full set of optimizer attributes is:
 - `working_float_type`
 - `facial_reduction`
 - `facial_reduction_max_rounds`
+- `facial_reduction_rank_expansion_rounds`
 - `facial_reduction_float_type`
 - `facial_reduction_exposure_tolerance`
 - `facial_reduction_rank_tolerance`

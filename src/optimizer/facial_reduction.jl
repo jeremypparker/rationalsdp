@@ -4,9 +4,15 @@
 # current affine slice, then convert the exposed nullspace directions back into
 # exact rational linear constraints on the original primal variables.
 
+mutable struct _FacialReductionRowSpaceCache
+    pivot_columns::Vector{Int}
+    selected_rows::Vector{Int}
+    inverse::Matrix{ExactRational}
+end
+
 mutable struct _FacialReductionExactCache
     problem::ProblemData
-    block_affine_slices::Vector{Union{Nothing,Vector{Nemo.QQMatrix}}}
+    row_space::Union{Nothing,_FacialReductionRowSpaceCache}
     block_exact_directions::Vector{Union{Nothing,Vector{Vector{ExactRational}}}}
     A_transpose::Union{Nothing,Nemo.QQMatrix}
 end
@@ -22,7 +28,7 @@ end
 function _FacialReductionExactCache(problem::ProblemData)
     cache = _FacialReductionExactCache(
         problem,
-        Union{Nothing,Vector{Nemo.QQMatrix}}[nothing for _ in problem.blocks],
+        nothing,
         Union{Nothing,Vector{Vector{ExactRational}}}[nothing for _ in problem.blocks],
         nothing,
     )
@@ -42,32 +48,6 @@ function _facial_reduction_eigvals(opt::Optimizer, matrix::AbstractMatrix{F}) wh
     result = eigvals(Symmetric((matrix + transpose(matrix)) / 2))
     _record_psd_eigendecomposition!(size(matrix, 1), (time_ns() - start_time) / 1.0e9)
     return result
-end
-
-function _facial_reduction_block_affine_slice!(
-    cache::_FacialReductionExactCache,
-    problem::ProblemData,
-    block_index::Int,
-)
-    cache.problem === problem || error("Facial-reduction exact cache belongs to another problem.")
-    cached = cache.block_affine_slices[block_index]
-    cached === nothing || return cached
-    problem.affine === nothing && return Nemo.QQMatrix[]
-
-    block = problem.blocks[block_index]
-    particular, nullspace = problem.affine
-    matrices = Nemo.QQMatrix[
-        _to_nemo_matrix(_vector_to_matrix(particular, block)),
-    ]
-    for column in axes(nullspace, 2)
-        push!(
-            matrices,
-            _to_nemo_matrix(_vector_to_matrix(view(nullspace, :, column), block)),
-        )
-    end
-    cache.block_affine_slices[block_index] = matrices
-    _record_approximate_cache_memory!(:facial_reduction, cache)
-    return matrices
 end
 
 function _facial_reduction_A_transpose!(
@@ -134,6 +114,137 @@ function _format_exact_direction(
            "]"
 end
 
+function _facial_reduction_row_space!(
+    cache::_FacialReductionExactCache,
+    problem::ProblemData,
+)
+    cache.problem === problem || error("Facial-reduction exact cache belongs to another problem.")
+    cached = cache.row_space
+    cached === nothing || return cached
+
+    row_count, variable_count = size(problem.A)
+    C = zeros(ExactRational, variable_count + 1, row_count)
+    row_count > 0 && (C[1:variable_count, :] = transpose(problem.A))
+    row_count > 0 && (C[variable_count + 1, :] = transpose(problem.b))
+    if row_count == 0
+        result = _FacialReductionRowSpaceCache(Int[], Int[], zeros(ExactRational, 0, 0))
+        cache.row_space = result
+        return result
+    end
+
+    reduced = _from_nemo_matrix(_exact_rref(C))
+    pivot_columns = Int[]
+    for row in axes(reduced, 1)
+        pivot = findfirst(column -> !iszero(reduced[row, column]), axes(reduced, 2))
+        pivot === nothing || push!(pivot_columns, pivot)
+    end
+    rank = length(pivot_columns)
+    if rank == 0
+        result = _FacialReductionRowSpaceCache(Int[], Int[], zeros(ExactRational, 0, 0))
+        cache.row_space = result
+        return result
+    end
+
+    basis = C[:, pivot_columns]
+    _, selected_rows = _rref_row_pivots(transpose(basis))
+    selected_rows = selected_rows[1:rank]
+    square = basis[selected_rows, :]
+    inverse = _from_nemo_matrix(
+        _exact_rref(hcat(transpose(square), Matrix{ExactRational}(I, rank, rank)))[:, rank + 1:(2 * rank)],
+    )
+    result = _FacialReductionRowSpaceCache(pivot_columns, selected_rows, inverse)
+    cache.row_space = result
+    _record_approximate_cache_memory!(:facial_reduction, result)
+    return result
+end
+
+function _row_space_multiplier(
+    problem::ProblemData,
+    indices::Vector{Int},
+    values::Vector{ExactRational};
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+)
+    length(indices) == length(values) || error("Sparse row indices and values must have equal lengths.")
+    row_space = _facial_reduction_row_space!(cache, problem)
+    rank = length(row_space.pivot_columns)
+    rank == 0 && return isempty(indices) ? zeros(ExactRational, size(problem.A, 1)) : nothing
+    variable_count = size(problem.A, 2)
+    rhs_selected = zeros(ExactRational, rank)
+    for (index, value) in zip(indices, values)
+        1 <= index <= variable_count || error("Sparse row index is out of bounds.")
+        for (selected_index, row_index) in enumerate(row_space.selected_rows)
+            row_index == index && (rhs_selected[selected_index] += value)
+        end
+    end
+    coefficients = row_space.inverse * rhs_selected
+    multiplier = zeros(ExactRational, size(problem.A, 1))
+    multiplier[row_space.pivot_columns] = coefficients
+
+    lhs = zeros(ExactRational, variable_count)
+    for (equation_index, coefficient) in zip(row_space.pivot_columns, coefficients)
+        iszero(coefficient) || (lhs .+= coefficient .* vec(problem.A[equation_index, :]))
+    end
+    all(iszero, lhs[setdiff(collect(1:variable_count), indices)]) || return nothing
+    for (index, value) in zip(indices, values)
+        lhs[index] == value || return nothing
+    end
+    iszero(dot(problem.b, multiplier)) || return nothing
+    return multiplier
+end
+
+function _block_annihilation_forms(block::BlockStructure, direction::Vector{ExactRational})
+    length(direction) == block.size || error("PSD kernel direction has the wrong dimension.")
+    forms = Tuple{Vector{Int},Vector{ExactRational}}[]
+    for row_index in 1:block.size
+        coefficients = Dict{Int,ExactRational}()
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            coefficient = if i == j == row_index
+                direction[j]
+            elseif i != j && i == row_index
+                direction[j]
+            elseif i != j && j == row_index
+                direction[i]
+            else
+                zero(ExactRational)
+            end
+            iszero(coefficient) || (coefficients[block.global_positions[local_index]] = coefficient)
+        end
+        indices = sort(collect(keys(coefficients)))
+        push!(forms, (indices, [coefficients[index] for index in indices]))
+    end
+    return forms
+end
+
+function _block_quadratic_form(block::BlockStructure, direction::Vector{ExactRational})
+    length(direction) == block.size || error("PSD kernel direction has the wrong dimension.")
+    coefficients = Dict{Int,ExactRational}()
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        coefficient = i == j ? direction[i]^2 : 2 * direction[i] * direction[j]
+        iszero(coefficient) || (coefficients[block.global_positions[local_index]] = coefficient)
+    end
+    indices = sort(collect(keys(coefficients)))
+    return indices, [coefficients[index] for index in indices]
+end
+
+function _affine_form_violation(
+    problem::ProblemData,
+    indices::Vector{Int},
+    values::Vector{ExactRational},
+)
+    problem.affine === nothing && return "no exact affine parametrization is available"
+    particular, nullspace = problem.affine
+    value = sum((particular[index] * coefficient for (index, coefficient) in zip(indices, values)); init = zero(ExactRational))
+    iszero(value) || return "particular value=$(_format_exact_rational_compact(value))"
+    for column in axes(nullspace, 2)
+        value = sum(
+            (nullspace[index, column] * coefficient for (index, coefficient) in zip(indices, values));
+            init = zero(ExactRational),
+        )
+        iszero(value) || return "affine_basis=$(column), value=$(_format_exact_rational_compact(value))"
+    end
+    return nothing
+end
+
 function _block_annihilation_violation(
     problem::ProblemData,
     block::BlockStructure,
@@ -145,14 +256,10 @@ function _block_annihilation_violation(
     start_time = time_ns()
     try
         problem.affine === nothing && return "no exact affine parametrization is available"
-        direction_column = _nemo_direction_column(direction)
-        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-        for (matrix_index, matrix) in enumerate(matrices)
-            violation = _nemo_product_nonzero(matrix * direction_column)
-            violation === nothing && continue
-            row_index, value = violation
-            location = matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-            return "row=$(row_index), affine=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+        for (row_index, (indices, values)) in enumerate(_block_annihilation_forms(block, direction))
+            _row_space_multiplier(problem, indices, values; cache) === nothing || continue
+            _affine_form_violation(problem, indices, values) === nothing && continue
+            return "row=$(row_index), row-space membership certificate unavailable"
         end
         return nothing
     finally
@@ -171,17 +278,10 @@ function _block_quadratic_vanish_violation(
     start_time = time_ns()
     try
         problem.affine === nothing && return "no exact affine parametrization is available"
-        direction_column = _nemo_direction_column(direction)
-        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-        for (matrix_index, matrix) in enumerate(matrices)
-            value = _nemo_quadratic_value(matrix, direction_column)
-            if !iszero(value)
-                location =
-                    matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-                return "quadratic=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
-            end
-        end
-        return nothing
+        indices, values = _block_quadratic_form(block, direction)
+        _row_space_multiplier(problem, indices, values; cache) === nothing || return nothing
+        _affine_form_violation(problem, indices, values) === nothing && return nothing
+        return "quadratic row-space membership certificate unavailable"
     finally
         _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
@@ -199,21 +299,19 @@ function _block_trace_vanish_violation(
     try
         isempty(directions) && return "no directions"
         problem.affine === nothing && return "no exact affine parametrization is available"
-        direction_columns = [_nemo_direction_column(direction) for direction in directions]
-        matrices = _facial_reduction_block_affine_slice!(cache, problem, block_index)
-        for (matrix_index, matrix) in enumerate(matrices)
-            value = sum(
-                (_nemo_quadratic_value(matrix, direction_column) for
-                 direction_column in direction_columns);
-                init = zero(Nemo.QQ),
-            )
-            if !iszero(value)
-                location =
-                    matrix_index == 1 ? "particular" : "affine_basis=$(matrix_index - 1)"
-                return "trace=$(location), value=$(_format_exact_rational_compact(_from_nemo_rational(value)))"
+        coefficients = Dict{Int,ExactRational}()
+        for direction in directions
+            indices, values = _block_quadratic_form(block, direction)
+            for (index, value) in zip(indices, values)
+                coefficients[index] = get(coefficients, index, zero(ExactRational)) + value
             end
         end
-        return nothing
+        filter!(pair -> !iszero(pair.second), coefficients)
+        indices = sort(collect(keys(coefficients)))
+        values = [coefficients[index] for index in indices]
+        _row_space_multiplier(problem, indices, values; cache) === nothing || return nothing
+        _affine_form_violation(problem, indices, values) === nothing && return nothing
+        return "trace row-space membership certificate unavailable"
     finally
         _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
@@ -471,8 +569,19 @@ function _exact_block_nullspace_directions(
     cached = cache.block_exact_directions[block_index]
     cached === nothing || return cached
 
+    particular, nullspace = problem.affine
+    if (1 + size(nullspace, 2)) * block.size^2 > 20_000
+        cache.block_exact_directions[block_index] = Vector{Vector{ExactRational}}()
+        return cache.block_exact_directions[block_index]
+    end
     basis = Nemo.identity_matrix(Nemo.QQ, block.size)
-    for matrix in _facial_reduction_block_affine_slice!(cache, problem, block_index)
+    matrices = Nemo.QQMatrix[
+        _to_nemo_matrix(_vector_to_matrix(particular, block)),
+    ]
+    for column in axes(nullspace, 2)
+        push!(matrices, _to_nemo_matrix(_vector_to_matrix(view(nullspace, :, column), block)))
+    end
+    for matrix in matrices
         _, kernel = Nemo.nullspace(matrix * basis)
         basis = basis * kernel
         size(basis, 2) == 0 && break
@@ -975,10 +1084,15 @@ end
 function _build_facial_reduction_oracle(
     problem::ProblemData,
     ::Type{F},
+    ;
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
 ) where {F<:AbstractFloat}
     row_count = size(problem.A, 1)
     cone_positions = _phase1_active_positions(problem)
-    oracle_equalities = _facial_reduction_oracle_equalities(problem)
+    oracle_equalities = _facial_reduction_oracle_equalities(
+        problem;
+        normalization_row,
+    )
     oracle_equalities === nothing && return nothing
     equality_matrix, equality_rhs = oracle_equalities
     A_eq = _to_working_sparse_matrix(F, equality_matrix)
@@ -1044,6 +1158,8 @@ function _facial_reduction_oracle_attempt(
     opt::Optimizer,
     problem::ProblemData,
     ::Type{HF},
+    ;
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         oracle_start_time = time_ns()
@@ -1057,7 +1173,11 @@ function _facial_reduction_oracle_attempt(
             oracle_recorded = true
             return
         end
-        model = _build_facial_reduction_oracle(problem, HF)
+        model = _build_facial_reduction_oracle(
+            problem,
+            HF;
+            normalization_row,
+        )
         if model === nothing
             _log(opt, "Facial reduction oracle unavailable: exact normalization equalities are inconsistent")
             record_oracle()
@@ -1142,7 +1262,11 @@ function _facial_reduction_slack(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 )
     y_nemo = _to_nemo_matrix(reshape(y, :, 1))
-    s = vec(_from_nemo_matrix(_facial_reduction_A_transpose!(cache, problem) * y_nemo))
+    s = if isempty(y)
+        zeros(ExactRational, size(problem.A, 2))
+    else
+        vec(_from_nemo_matrix(_facial_reduction_A_transpose!(cache, problem) * y_nemo))
+    end
     scalar_slack = Dict{Int,ExactRational}()
     for index in problem.positive_scalars
         scalar_slack[index] = s[index]
@@ -1166,7 +1290,10 @@ function _facial_reduction_oracle_tolerances(
     return unique(tolerances)
 end
 
-function _facial_reduction_oracle_equalities(problem::ProblemData)
+function _facial_reduction_oracle_equalities(
+    problem::ProblemData;
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
+)
     equality_rows = Vector{Vector{ExactRational}}()
     equality_rhs = ExactRational[]
     for position in _facial_reduction_free_positions(problem)
@@ -1175,7 +1302,9 @@ function _facial_reduction_oracle_equalities(problem::ProblemData)
     end
     push!(equality_rows, copy(problem.b))
     push!(equality_rhs, 0 // 1)
-    push!(equality_rows, _facial_reduction_trace_row(problem))
+    length(normalization_row) == size(problem.A, 1) ||
+        error("Facial-reduction oracle normalization row has the wrong length.")
+    push!(equality_rows, copy(normalization_row))
     push!(equality_rhs, 1 // 1)
 
     equality_matrix = Matrix(transpose(hcat(equality_rows...)))
@@ -1270,10 +1399,14 @@ function _exact_facial_reduction_oracle_slack(
     ::Type{F},
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
 ) where {F<:AbstractFloat}
     free_positions = _facial_reduction_free_positions(problem)
-    trace_row = _facial_reduction_trace_row(problem)
-    oracle_equalities = _facial_reduction_oracle_equalities(problem)
+    trace_row = normalization_row
+    oracle_equalities = _facial_reduction_oracle_equalities(
+        problem;
+        normalization_row,
+    )
     oracle_equalities === nothing && return nothing
     equality_matrix, equality_rhs = oracle_equalities
     oracle_affine = _solve_affine_system(Matrix(equality_matrix), equality_rhs)
@@ -1334,6 +1467,16 @@ struct _CertifiedFacialReduction
     exposed_scalars::Vector{Int}
     keep_bases::Dict{Int,Matrix{ExactRational}}
 end
+
+struct _SieveRowCertificate
+    source::String
+    multiplier::Vector{ExactRational}
+    row::Vector{ExactRational}
+    reduction::_CertifiedFacialReduction
+end
+
+const _SIEVE_TRANSFORM_MAX_ENTRIES = 250_000
+const _FACIAL_REDUCTION_AFFINE_COMPACTION_FACTOR = 4
 
 const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
 const _FACIAL_REDUCTION_CACHE_VERSION = 1
@@ -1735,6 +1878,161 @@ function _certified_reduction_from_exact_slack(
     return nothing
 end
 
+function _sieve_row_reduction(
+    opt::Optimizer,
+    problem::ProblemData,
+    multiplier::Vector{ExactRational},
+    source::AbstractString,
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    row_override::Union{Nothing,Vector{ExactRational}} = nothing,
+    rhs_override::Union{Nothing,ExactRational} = nothing,
+)
+    length(multiplier) == size(problem.A, 1) || return nothing
+    all(iszero, multiplier) && return nothing
+
+    row = row_override === nothing ? vec(transpose(multiplier) * problem.A) : row_override
+    rhs = rhs_override === nothing ? dot(multiplier, problem.b) : rhs_override
+    iszero(rhs) || return nothing
+
+    free_positions = _facial_reduction_free_positions(problem)
+    all(iszero, row[free_positions]) || return nothing
+
+    scalar_slack = Dict{Int,ExactRational}(
+        index => row[index] for index in problem.positive_scalars
+    )
+    block_slack = Dict{Int,Matrix{ExactRational}}(
+        block_index => _dual_vector_to_matrix(row, block) for
+        (block_index, block) in enumerate(problem.blocks)
+    )
+    all(value -> value >= 0 // 1, values(scalar_slack)) || return nothing
+    all(_positive_semidefinite_exact(block_slack[index]) for index in keys(block_slack)) ||
+        return nothing
+    any(!iszero, row) || return nothing
+
+    reduction = _certified_reduction_from_exact_slack(
+        opt,
+        problem,
+        scalar_slack,
+        block_slack,
+        source,
+    )
+    reduction === nothing && return nothing
+    return _SieveRowCertificate(
+        String(source),
+        copy(multiplier),
+        vcat(row, rhs),
+        reduction,
+    )
+end
+
+function _rref_row_pivots(matrix::AbstractMatrix{ExactRational})
+    reduced = _from_nemo_matrix(_exact_rref(Matrix(matrix)))
+    pivots = Int[]
+    for row in axes(reduced, 1)
+        pivot = findfirst(column -> !iszero(reduced[row, column]), axes(reduced, 2))
+        pivot === nothing || push!(pivots, pivot)
+    end
+    return reduced, pivots
+end
+
+function _exact_row_reduction_with_multipliers(
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+)
+    size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
+    row_count = size(A, 1)
+    augmented = hcat(A, b)
+    reduced, pivot_columns = _rref(augmented)
+    nonzero_rows = [
+        row for row in axes(reduced, 1) if any(!iszero, reduced[row, 1:size(A, 2)])
+    ]
+    isempty(nonzero_rows) && return reduced, Vector{Vector{ExactRational}}()
+
+    # Pick a square nonsingular set of original rows.  The selected rows span
+    # the same row space as the RREF rows, so their coefficients give exact
+    # provenance without forming an augmented matrix with a full identity
+    # block.
+    _, independent_rows = _rref_row_pivots(transpose(augmented))
+    rank = length(pivot_columns)
+    rank > 0 || return reduced, Vector{Vector{ExactRational}}()
+    length(independent_rows) >= rank || return reduced, Vector{Vector{ExactRational}}()
+    independent_rows = independent_rows[1:rank]
+    pivot_columns = pivot_columns[1:rank]
+    square = augmented[independent_rows, pivot_columns]
+    inverse = _from_nemo_matrix(
+        _exact_rref(hcat(transpose(square), Matrix{ExactRational}(I, rank, rank)))[:, rank + 1:(2 * rank)],
+    )
+
+    multipliers = Vector{Vector{ExactRational}}()
+    for row_index in nonzero_rows
+        coefficients = inverse * vec(reduced[row_index, pivot_columns])
+        multiplier = zeros(ExactRational, row_count)
+        multiplier[independent_rows] = coefficients
+        vec(transpose(multiplier) * augmented) == vec(reduced[row_index, :]) ||
+            return reduced, Vector{Vector{ExactRational}}()
+        push!(multipliers, multiplier)
+    end
+    return reduced, multipliers
+end
+
+function _sieve_facial_reduction_certificates(
+    opt::Optimizer,
+    problem::ProblemData,
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+)
+    problem.affine === nothing && return _SieveRowCertificate[]
+    row_count = size(problem.A, 1)
+    certificates = _SieveRowCertificate[]
+
+    for row_index in 1:row_count
+        unit = zeros(ExactRational, row_count)
+        unit[row_index] = 1 // 1
+        for sign in (1 // 1, -1 // 1)
+            multiplier = sign .* unit
+            source = "Sieve affine row $(row_index) ($(sign > 0 ? "+" : "-"))"
+            certificate = _sieve_row_reduction(
+                opt,
+                problem,
+                multiplier,
+                source;
+                cache,
+                row_override = sign .* vec(problem.A[row_index, :]),
+                rhs_override = sign * problem.b[row_index],
+            )
+            certificate === nothing || push!(certificates, certificate)
+        end
+    end
+
+    if row_count * (size(problem.A, 2) + 1) > _SIEVE_TRANSFORM_MAX_ENTRIES
+        _log(
+            opt,
+            "Facial reduction Sieve: skipping transformed-row provenance for " *
+            "a large affine system ($(row_count)×$(size(problem.A, 2))); " *
+            "individual exact rows were still inspected",
+        )
+        return certificates
+    end
+
+    _, multipliers = _exact_row_reduction_with_multipliers(problem.A, problem.b)
+    for (row_index, multiplier) in enumerate(multipliers)
+        for sign in (1 // 1, -1 // 1)
+            signed_multiplier = sign .* multiplier
+            source = "Sieve transformed row $(row_index) ($(sign > 0 ? "+" : "-"))"
+            certificate = _sieve_row_reduction(
+                opt,
+                problem,
+                signed_multiplier,
+                source;
+                cache,
+            )
+            certificate === nothing || push!(certificates, certificate)
+        end
+    end
+    return certificates
+end
+
 function _certify_dual_slack_evidence(
     opt::Optimizer,
     problem::ProblemData,
@@ -1909,6 +2207,7 @@ function _certify_oracle_point_evidence(
     ::Type{F},
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
 ) where {F<:AbstractFloat}
     exact_oracle_slack = _exact_facial_reduction_oracle_slack(
         opt,
@@ -1917,6 +2216,7 @@ function _certify_oracle_point_evidence(
         F,
         ;
         cache,
+        normalization_row,
     )
     if exact_oracle_slack !== nothing
         scalar_slack_exact, block_slack_exact = exact_oracle_slack
@@ -1997,6 +2297,99 @@ function _first_certified_facial_reduction(
     return nothing
 end
 
+function _merge_certified_facial_reductions(
+    opt::Optimizer,
+    problem::ProblemData,
+    reductions::Vector{_CertifiedFacialReduction},
+)
+    isempty(reductions) && return nothing
+
+    exposed_scalars = sort(unique(vcat((reduction.exposed_scalars for reduction in reductions)...)))
+    directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}()
+    for reduction in reductions
+        for (block_index, keep_basis) in reduction.keep_bases
+            removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
+            directions = get!(directions_by_block, block_index, Vector{Vector{ExactRational}}())
+            append!(
+                directions,
+                [
+                    _normalize_rational_direction(collect(view(removed_directions, :, column))) for
+                    column in axes(removed_directions, 2)
+                ],
+            )
+        end
+    end
+
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for (block_index, directions) in directions_by_block
+        directions = _linearly_independent_directions(directions)
+        isempty(directions) && continue
+        keep_basis = _orthogonal_complement_basis(
+            directions,
+            problem.blocks[block_index].size,
+        )
+        size(keep_basis, 2) == problem.blocks[block_index].size && continue
+        keep_bases[block_index] = keep_basis
+    end
+
+    merged = _CertifiedFacialReduction(
+        join(unique(reduction.source for reduction in reductions), " + "),
+        exposed_scalars,
+        keep_bases,
+    )
+    _cached_facial_reduction_violation(problem, merged) === nothing || return nothing
+    return merged
+end
+
+function _sieve_facial_reduction_pass(
+    opt::Optimizer,
+    problem::ProblemData,
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+)
+    certificates = _sieve_facial_reduction_certificates(opt, problem; cache)
+    isempty(certificates) && return nothing
+    reductions = [certificate.reduction for certificate in certificates]
+    merged = _merge_certified_facial_reductions(opt, problem, reductions)
+    merged === nothing && return nothing
+    return (reduction = merged, certificates = certificates)
+end
+
+function _sieve_facial_reduction_problem(
+    opt::Optimizer,
+    problem::ProblemData,
+)
+    problem.affine === nothing && return problem
+    current = problem
+    pass_limit = max(1, _barrier_dimension(problem) + 1)
+    for pass_index in 1:pass_limit
+        cache = _FacialReductionExactCache(current)
+        result = _sieve_facial_reduction_pass(opt, current; cache)
+        result === nothing && break
+        reduction = result.reduction
+        reduced = _apply_facial_reduction(
+            current,
+            reduction.exposed_scalars,
+            reduction.keep_bases;
+            certified = true,
+        )
+        reduced.affine === nothing && break
+        old_dimension = _barrier_dimension(current)
+        new_dimension = _barrier_dimension(reduced)
+        new_dimension < old_dimension || break
+        _record_reduction_round!(old_dimension, new_dimension; tentative = false)
+        _record_successful_facial_reduction!(opt, current, reduction)
+        _log(
+            opt,
+            "Facial reduction Sieve pass $(pass_index): removed " *
+            "$(old_dimension - new_dimension) barrier direction(s) from " *
+            "$(length(result.certificates)) exact row certificate(s)",
+        )
+        current = reduced
+    end
+    return current
+end
+
 function _face_reduction_rows(
     block::BlockStructure,
     keep_basis::Matrix{ExactRational},
@@ -2040,17 +2433,25 @@ function _facial_reduction_oracle_round(
     ::Type{HF},
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
+    source::AbstractString = "oracle",
 ) where {HF<:AbstractFloat}
-    oracle_point = _facial_reduction_oracle_attempt(opt, problem, HF)
+    oracle_point = _facial_reduction_oracle_attempt(
+        opt,
+        problem,
+        HF;
+        normalization_row,
+    )
     oracle_point === nothing && return nothing
 
-    evidence = _FacialReductionEvidence(:oracle_point, "oracle", oracle_point)
-    reduction = _certify_facial_reduction_evidence(
+    evidence = _FacialReductionEvidence(:oracle_point, String(source), oracle_point)
+    reduction = _certify_oracle_point_evidence(
         opt,
         problem,
         evidence,
         HF;
         cache,
+        normalization_row,
     )
     reduction === nothing && return nothing
     return reduction
@@ -2080,17 +2481,97 @@ function _certified_facial_reduction_from_initial_evidence(
     ::Type{F},
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    merge_evidence::Bool = true,
 ) where {F<:AbstractFloat}
-    reduction = _first_certified_facial_reduction(
+    merge_evidence || return _first_certified_facial_reduction(
         opt,
         problem,
         _cheap_facial_reduction_evidence(candidate, phase1_dual_slack, F),
-        F,
-        ;
+        F;
         cache,
     )
-    reduction === nothing && return nothing
-    return reduction
+    reductions = _CertifiedFacialReduction[]
+    for evidence in _cheap_facial_reduction_evidence(candidate, phase1_dual_slack, F)
+        reduction = _certify_facial_reduction_evidence(
+            opt,
+            problem,
+            evidence,
+            F;
+            cache,
+        )
+        reduction === nothing || push!(reductions, reduction)
+    end
+    return _merge_certified_facial_reductions(opt, problem, reductions)
+end
+
+function _facial_reduction_target_trace_row(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    row = zeros(ExactRational, size(problem.A, 1))
+    exposed_scalars = Set(reduction.exposed_scalars)
+    for index in problem.positive_scalars
+        index in exposed_scalars && continue
+        row .+= problem.A[:, index]
+    end
+    for (block_index, block) in enumerate(problem.blocks)
+        keep_basis = get(
+            reduction.keep_bases,
+            block_index,
+            Matrix{ExactRational}(I, block.size, block.size),
+        )
+        isempty(keep_basis) && continue
+        face_matrix = keep_basis * transpose(keep_basis)
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            coefficient = i == j ? face_matrix[i, j] : 2 * face_matrix[i, j]
+            iszero(coefficient) && continue
+            row .+= coefficient .* problem.A[:, block.global_positions[local_index]]
+        end
+    end
+    return row
+end
+
+function _facial_reduction_round_with_rank_expansion(
+    opt::Optimizer,
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+    ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+) where {F<:AbstractFloat}
+    current = reduction
+    for expansion_round in 1:opt.settings.facial_reduction_rank_expansion_rounds
+        normalization_row = _facial_reduction_target_trace_row(problem, current)
+        any(!iszero, normalization_row) || break
+        _log(
+            opt,
+            "Facial reduction: rank-expansion oracle round $(expansion_round) targeting the current residual face",
+        )
+        next = _facial_reduction_oracle_round(
+            opt,
+            problem,
+            _facial_reduction_oracle_float_type(opt, problem);
+            cache,
+            normalization_row,
+            source = "rank-expansion oracle $(expansion_round)",
+        )
+        next === nothing && break
+        merged = _merge_certified_facial_reductions(opt, problem, [current, next])
+        merged === nothing && break
+        old_removed = sum(
+            problem.blocks[index].size - size(current.keep_bases[index], 2) for
+            index in keys(current.keep_bases);
+            init = 0,
+        ) + length(current.exposed_scalars)
+        new_removed = sum(
+            problem.blocks[index].size - size(merged.keep_bases[index], 2) for
+            index in keys(merged.keep_bases);
+            init = 0,
+        ) + length(merged.exposed_scalars)
+        new_removed > old_removed || break
+        current = merged
+    end
+    return current
 end
 
 function _apply_facial_reduction(
@@ -2192,10 +2673,37 @@ function _apply_facial_reduction(
     positive_scalars = [index for index in problem.positive_scalars if !(index in exposed_scalars)]
     objective_extension = zeros(ExactRational, total_dimension - old_dimension)
 
-    # Recompute the affine representation from the reduced system directly.
-    # Incrementally lifting the old affine basis can drift away from the exact
-    # reduced equations after multiple PSD face reductions on SOS-style models.
-    affine = _solve_affine_system(A, b)
+    restriction_matrix = if isempty(extra_rows)
+        zeros(ExactRational, 0, total_dimension)
+    else
+        reduce(vcat, (reshape(row, 1, :) for row in extra_rows))
+    end
+    affine = _extend_and_restrict_affine_system(
+        problem.affine,
+        total_dimension - old_dimension,
+        restriction_matrix,
+        extra_rhs,
+    )
+    old_particular, old_nullspace = problem.affine === nothing ?
+        (ExactRational[], zeros(ExactRational, 0, 0)) : problem.affine
+    affine_representation_complete = size(problem.A, 1) > 0 ||
+                                     size(old_nullspace, 2) == length(old_particular)
+    incremental_valid = affine_representation_complete && affine !== nothing &&
+                        A * affine[1] == b &&
+                        A * affine[2] == zeros(ExactRational, size(A, 1), size(affine[2], 2)) &&
+                        restriction_matrix * affine[1] == extra_rhs &&
+                        restriction_matrix * affine[2] == zeros(ExactRational, size(restriction_matrix, 1), size(affine[2], 2))
+    if !incremental_valid
+        @debug "Facial reduction incremental affine restriction failed; falling back to full exact elimination"
+        affine = _solve_affine_system(A, b)
+    end
+    if size(A, 1) > _FACIAL_REDUCTION_AFFINE_COMPACTION_FACTOR * max(1, size(problem.A, 1))
+        compacted = _independent_affine_equalities(A, b)
+        if compacted !== nothing
+            A, b = compacted
+            affine = _solve_affine_system(A, b)
+        end
+    end
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
     reduced_problem = ProblemData(
@@ -2223,8 +2731,21 @@ function _facial_reduction_round(
     problem::ProblemData,
     candidate::Vector{F},
     ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    rank_expansion::Bool = true,
+    merge_evidence::Bool = true,
 ) where {F<:AbstractFloat}
-    return _facial_reduction_round(opt, problem, candidate, nothing, F)
+    return _facial_reduction_round(
+        opt,
+        problem,
+        candidate,
+        nothing,
+        F;
+        cache,
+        rank_expansion,
+        merge_evidence,
+    )
 end
 
 function _facial_reduction_round(
@@ -2235,6 +2756,8 @@ function _facial_reduction_round(
     ::Type{F},
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    rank_expansion::Bool = true,
+    merge_evidence::Bool = true,
 ) where {F<:AbstractFloat}
     problem.affine === nothing && return nothing
     reduction = _certified_facial_reduction_from_initial_evidence(
@@ -2245,17 +2768,27 @@ function _facial_reduction_round(
         F,
         ;
         cache,
+        merge_evidence,
     )
-    reduction === nothing || return reduction
-    _log(
-        opt,
-        "Facial reduction: initial evidence found no exact reducing face; trying exposing-vector oracle",
-    )
-    return _facial_reduction_oracle_round(
+    if reduction === nothing
+        _log(
+            opt,
+            "Facial reduction: initial evidence found no exact reducing face; trying exposing-vector oracle",
+        )
+        reduction = _facial_reduction_oracle_round(
+            opt,
+            problem,
+            _facial_reduction_oracle_float_type(opt, problem);
+            cache,
+        )
+    end
+    reduction === nothing && return nothing
+    rank_expansion || return reduction
+    return _facial_reduction_round_with_rank_expansion(
         opt,
         problem,
-        _facial_reduction_oracle_float_type(opt, problem),
-        ;
+        reduction,
+        _facial_reduction_oracle_float_type(opt, problem);
         cache,
     )
 end
@@ -2265,8 +2798,19 @@ function _facially_reduce_problem(
     problem::ProblemData,
     candidate::Vector{F},
     ::Type{F},
+    ;
+    rank_expansion::Bool = true,
+    merge_evidence::Bool = true,
 ) where {F<:AbstractFloat}
-    return _facially_reduce_problem(opt, problem, candidate, nothing, F)
+    return _facially_reduce_problem(
+        opt,
+        problem,
+        candidate,
+        nothing,
+        F;
+        rank_expansion,
+        merge_evidence,
+    )
 end
 
 function _facially_reduce_problem(
@@ -2275,9 +2819,20 @@ function _facially_reduce_problem(
     candidate::Vector{F},
     phase1_dual_slack::Union{Nothing,Vector{F}},
     ::Type{F},
+    ;
+    rank_expansion::Bool = true,
+    merge_evidence::Bool = true,
 ) where {F<:AbstractFloat}
     opt.settings.facial_reduction || return problem
-    reduction = _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
+    reduction = _facial_reduction_round(
+        opt,
+        problem,
+        candidate,
+        phase1_dual_slack,
+        F;
+        rank_expansion,
+        merge_evidence,
+    )
     reduction === nothing && return problem
     exposed_scalars = reduction.exposed_scalars
     keep_bases = reduction.keep_bases

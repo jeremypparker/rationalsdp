@@ -224,12 +224,6 @@ git-tree-sha1 = "7442a5dfe1ebb773c29cc2962a8980f47221d76c"
 uuid = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
 version = "0.9.5"
 
-[[deps.DoubleFloats]]
-deps = ["GenericLinearAlgebra", "LinearAlgebra", "Printf", "Quadmath", "Random", "SpecialFunctions"]
-git-tree-sha1 = "04db2353eeee394969230e5ba883a8ce731cd770"
-uuid = "497a8b3b-efae-58df-a0af-a86822472b78"
-version = "1.7.1"
-
 [[deps.Downloads]]
 deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
@@ -787,16 +781,6 @@ deps = ["StyledStrings"]
 uuid = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 version = "1.11.0"
 
-[[deps.Quadmath]]
-deps = ["Compat", "Printf", "Random"]
-git-tree-sha1 = "79cd6923b7e5fdb4130cdb0f6c0038d7f65a9717"
-uuid = "be4d8f0f-7fa4-5f49-b795-2f01399ab2dd"
-version = "1.0.1"
-weakdeps = ["SpecialFunctions"]
-
-    [deps.Quadmath.extensions]
-    QuadmathSpecialFunctionsExt = ["SpecialFunctions"]
-
 [[deps.REPL]]
 deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
 uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
@@ -814,7 +798,7 @@ uuid = "fb686558-2515-59ef-acaa-46db3789a887"
 version = "0.4.4"
 
 [[deps.RationalSDP]]
-deps = ["DoubleFloats", "Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "MultiFloats", "Nemo", "Printf", "Serialization", "SparseArrays"]
+deps = ["Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "MultiFloats", "Nemo", "Printf", "Serialization", "SparseArrays"]
 path = ".."
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"

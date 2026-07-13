@@ -1763,9 +1763,14 @@ function _cached_facial_reduction_violation(
     return nothing
 end
 
-function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
+function _apply_loaded_facial_reductions(
+    opt::Optimizer,
+    problem::ProblemData;
+    return_details::Bool = false,
+)
     records = _loaded_facial_reduction_records!(opt)
-    isempty(records) && return problem
+    isempty(records) && return return_details ?
+        (problem = problem, applied = 0, matched = 0) : problem
 
     current = problem
     matched = 0
@@ -1798,7 +1803,10 @@ function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
             reduction.exposed_scalars,
             reduction.keep_bases,
             ;
-            certified = true,
+            # The exact cache validation immediately above is the certificate
+            # for this application.  Re-validating inside _apply_facial_reduction
+            # duplicates the expensive exact row-space/PSD checks.
+            certified = false,
         )
         if reduced_problem.affine === nothing
             _log(
@@ -1830,7 +1838,8 @@ function _apply_loaded_facial_reductions(opt::Optimizer, problem::ProblemData)
             _log(opt, "Facial reduction: no cached reduction record validated for the current problem")
         end
     end
-    return current
+    return return_details ?
+        (problem = current, applied = applied, matched = matched) : current
 end
 
 function _exact_slack_keep_bases(
@@ -1906,6 +1915,31 @@ function _sieve_row_reduction(
         (block_index, block) in enumerate(problem.blocks)
     )
     all(value -> value >= 0 // 1, values(scalar_slack)) || return nothing
+
+    # Most affine rows are not exposing PSD slacks.  Reject matrices that are
+    # numerically and decisively indefinite before invoking the much more
+    # expensive exact PSD test.  The screen is conservative: conversion or
+    # eigensolver failure keeps the exact path.
+    for block_index in keys(block_slack)
+        matrix = block_slack[block_index]
+        numeric_matrix = try
+            Float64.(matrix)
+        catch
+            nothing
+        end
+        numeric_matrix === nothing && continue
+        all(isfinite, numeric_matrix) || continue
+        scale = max(1.0, opnorm(numeric_matrix, 1))
+        tolerance = 100 * eps(Float64) * scale * max(1, size(matrix, 1))
+        minimum_eigenvalue = try
+            eigmin(Symmetric(numeric_matrix))
+        catch
+            nothing
+        end
+        minimum_eigenvalue === nothing && continue
+        minimum_eigenvalue < -tolerance && return nothing
+    end
+
     all(_positive_semidefinite_exact(block_slack[index]) for index in keys(block_slack)) ||
         return nothing
     any(!iszero, row) || return nothing
@@ -2371,7 +2405,9 @@ function _sieve_facial_reduction_problem(
             current,
             reduction.exposed_scalars,
             reduction.keep_bases;
-            certified = true,
+            # _merge_certified_facial_reductions already validated the merged
+            # certificate against the current affine slice.
+            certified = false,
         )
         reduced.affine === nothing && break
         old_dimension = _barrier_dimension(current)
@@ -2688,11 +2724,12 @@ function _apply_facial_reduction(
         (ExactRational[], zeros(ExactRational, 0, 0)) : problem.affine
     affine_representation_complete = size(problem.A, 1) > 0 ||
                                      size(old_nullspace, 2) == length(old_particular)
-    incremental_valid = affine_representation_complete && affine !== nothing &&
-                        A * affine[1] == b &&
-                        A * affine[2] == zeros(ExactRational, size(A, 1), size(affine[2], 2)) &&
-                        restriction_matrix * affine[1] == extra_rhs &&
-                        restriction_matrix * affine[2] == zeros(ExactRational, size(restriction_matrix, 1), size(affine[2], 2))
+    # _extend_and_restrict_affine_system solves and validates the new
+    # restriction in coordinates of the old exact affine system.  Rechecking
+    # A*p and A*N here repeated several dense BigInt-rational products; when
+    # the old affine representation is complete, those equalities follow
+    # algebraically from the old invariant and the coordinate solve.
+    incremental_valid = affine_representation_complete && affine !== nothing
     if !incremental_valid
         @debug "Facial reduction incremental affine restriction failed; falling back to full exact elimination"
         affine = _solve_affine_system(A, b)

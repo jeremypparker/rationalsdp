@@ -58,15 +58,16 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "working_float_type") == BigFloat
         @test get_optimizer_attribute(model, "facial_reduction_save_file") == "fr-cache.bin"
         @test get_optimizer_attribute(model, "facial_reduction_load_file") == "fr-cache.bin"
+        @test get_optimizer_attribute(model, "facial_reduction_rank_expansion_rounds") == 0
     end
 
     @testset "Working float type selection" begin
         model = rational_model(Rational{BigInt})
-        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Float64x2
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
-        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Float64x2
         @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :auto
-        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Float64x2
 
         set_optimizer_attribute(model, "working_float_type", Float64)
         @test get_optimizer_attribute(model, "working_float_type") == Float64
@@ -82,10 +83,10 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "facial_reduction_float_type", "auto")
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == Float64
 
-        set_optimizer_attribute(model, "working_float_type", RationalSDP.Double64)
-        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Double64
-        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Double64
-        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Double64
+        set_optimizer_attribute(model, "working_float_type", RationalSDP.Float64x2)
+        @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Float64x2
+        @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Float64x2
+        @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Float64x2
 
         set_optimizer_attribute(model, "working_float_type", "Float64x2")
         @test get_optimizer_attribute(model, "working_float_type") == RationalSDP.Float64x2
@@ -169,15 +170,15 @@ include("slowtest_helpers.jl")
 
         settings = RationalSDP.Settings(phase1_hypatia_syssolver = :qrchol_dense)
         syssolver, use_dense_model, preprocess =
-            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Double64)
-        @test syssolver isa RationalSDP.Hypatia.Solvers.QRCholDenseSystemSolver{RationalSDP.Double64}
+            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Float64x2)
+        @test syssolver isa RationalSDP.Hypatia.Solvers.QRCholDenseSystemSolver{RationalSDP.Float64x2}
         @test use_dense_model
         @test preprocess
 
         settings = RationalSDP.Settings(phase1_hypatia_syssolver = :symindef_indirect)
         syssolver, use_dense_model, preprocess =
-            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Double64)
-        @test syssolver isa RationalSDP.Hypatia.Solvers.SymIndefIndirectSystemSolver{RationalSDP.Double64}
+            RationalSDP._hypatia_phase1_syssolver(settings, RationalSDP.Float64x2)
+        @test syssolver isa RationalSDP.Hypatia.Solvers.SymIndefIndirectSystemSolver{RationalSDP.Float64x2}
         @test !use_dense_model
         @test !preprocess
 
@@ -191,7 +192,7 @@ include("slowtest_helpers.jl")
         settings = RationalSDP.Settings(phase1_hypatia_syssolver = :symindef_sparse)
         @test_throws ErrorException RationalSDP._hypatia_phase1_syssolver(
             settings,
-            RationalSDP.Double64,
+            RationalSDP.Float64x2,
         )
 
         settings = RationalSDP.Settings(
@@ -1280,8 +1281,13 @@ include("slowtest_helpers.jl")
                 facial_reduction_load_file = cache_file,
             )
             RationalSDP._prepare_facial_reduction_cache!(load_opt)
-            reduced_problem =
-                RationalSDP._apply_loaded_facial_reductions(load_opt, matching_problem)
+            loaded_details = RationalSDP._apply_loaded_facial_reductions(
+                load_opt,
+                matching_problem;
+                return_details = true,
+            )
+            reduced_problem = loaded_details.problem
+            @test loaded_details.applied == 1
             @test [block.size for block in reduced_problem.blocks] == [1]
             @test reduced_problem.objective_vector_raw[1:3] ==
                   Rational{BigInt}[7//1, 0//1, 0//1]
@@ -1293,8 +1299,13 @@ include("slowtest_helpers.jl")
                 facial_reduction_load_file = cache_file,
             )
             RationalSDP._prepare_facial_reduction_cache!(invalid_load_opt)
-            unreduced_problem =
-                RationalSDP._apply_loaded_facial_reductions(invalid_load_opt, invalid_problem)
+            invalid_details = RationalSDP._apply_loaded_facial_reductions(
+                invalid_load_opt,
+                invalid_problem;
+                return_details = true,
+            )
+            unreduced_problem = invalid_details.problem
+            @test invalid_details.applied == 0
             @test [block.size for block in unreduced_problem.blocks] == [2]
         finally
             rm(cache_file; force = true)

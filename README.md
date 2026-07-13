@@ -31,7 +31,7 @@ RationalSDP currently supports:
 - exact rational primal values via `value`
 - exact rational objective values via `objective_value`
 - `Rational{BigInt}` and other rational output types
-- selectable numerical working types: `Float64`, `Double64`, `BigFloat`, etc.
+- selectable numerical working types: `Float64`, `Float64x2`, `BigFloat`, etc.
 - Hypatia-backed or native Phase I feasibility search
 - exact affine elimination before the barrier solve
 - coordinate PSD face pruning for forced-boundary cases
@@ -143,7 +143,7 @@ When both cheap evidence sources certify faces, their exact kernel and scalar
 exposures are merged before the reduced problem is built. After each certified
 reduction, a bounded rank-expansion oracle pass can search for another exposing
 slack normalized on the residual face; control its number of rounds with
-`facial_reduction_rank_expansion_rounds` (default `1`). Fixed-parameter
+`facial_reduction_rank_expansion_rounds` (default `0`). Fixed-parameter
 quasiconvex probes deliberately use the conservative evidence path so that
 inconclusive numerical probes do not change the bisection result.
 
@@ -303,7 +303,7 @@ tentative direction outcomes, dimension removed per round, and approximate peak
 memory for affine and facial-reduction caches. Tentative faces are never written
 to the facial-reduction cache or used as an infeasibility certificate.
 
-The default working type is `Double64`. `Float64` is faster but less robust;
+The default working type is `Float64x2`. `Float64` is faster but less robust;
 `BigFloat` is slower but can help on ill-conditioned models. MultiFloats.jl v3
 scalar types are also accepted, for example `Float64x2`, `Float64x3`, and
 `Float64x4` via type values or optimizer-attribute strings.

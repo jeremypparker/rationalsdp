@@ -1,6 +1,5 @@
 module RationalSDP
 
-using DoubleFloats: Double64
 import Hypatia
 import Logging
 import MultiFloats

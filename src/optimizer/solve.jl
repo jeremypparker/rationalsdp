@@ -157,7 +157,12 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
             return
         end
-        cached_problem = _apply_loaded_facial_reductions(opt, problem)
+        cached_result = _apply_loaded_facial_reductions(
+            opt,
+            problem;
+            return_details = true,
+        )
+        cached_problem = cached_result.problem
         cached_problem_changed =
             length(cached_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
             size(cached_problem.A) != size(problem.A) ||
@@ -165,13 +170,19 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
         problem = cached_problem
         cached_problem_changed && _log_banner(opt, problem)
 
-        sieved_problem = _sieve_facial_reduction_problem(opt, problem)
-        sieved_problem_changed =
-            length(sieved_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
-            size(sieved_problem.A) != size(problem.A) ||
-            _barrier_dimension(sieved_problem) != _barrier_dimension(problem)
-        problem = sieved_problem
-        sieved_problem_changed && _log_banner(opt, problem)
+        # A cache record is already an exact certificate for the current
+        # affine slice.  Running the row Sieve again is redundant, and was
+        # particularly surprising when facial_reduction=false was used to
+        # request a cache-only solve.
+        if opt.settings.facial_reduction && cached_result.applied == 0
+            sieved_problem = _sieve_facial_reduction_problem(opt, problem)
+            sieved_problem_changed =
+                length(sieved_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
+                size(sieved_problem.A) != size(problem.A) ||
+                _barrier_dimension(sieved_problem) != _barrier_dimension(problem)
+            problem = sieved_problem
+            sieved_problem_changed && _log_banner(opt, problem)
+        end
 
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)
@@ -263,14 +274,6 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             problem_changed || break
             facial_reduction_round += 1
             problem = reduced_problem
-            if !reduction_result.tentative
-                sieved_problem = _sieve_facial_reduction_problem(opt, problem)
-                sieved_problem_changed =
-                    length(sieved_problem.objective_vector_raw) != length(problem.objective_vector_raw) ||
-                    size(sieved_problem.A) != size(problem.A) ||
-                    _barrier_dimension(sieved_problem) != _barrier_dimension(problem)
-                problem = sieved_problem
-            end
             numeric_blocks = _numeric_blocks(problem.blocks)
             _log_banner(opt, problem)
             phase1_result = _phase1_anchor_attempt(opt, problem, F)

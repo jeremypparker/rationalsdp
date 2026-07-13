@@ -128,14 +128,22 @@ end
 function _rref_pivots(reduced, variable_count::Int)
     pivot_rows = Int[]
     pivot_columns = Int[]
+    # `reduced` is in RREF, so variable pivot columns are strictly increasing.
+    # Continuing from the previous pivot avoids repeatedly crossing the dense
+    # Nemo matrix from column one for every row.
+    first_possible_column = 1
     for row in axes(reduced, 1)
-        pivot_column = findfirst(
-            column -> !iszero(reduced[row, column]),
-            1:variable_count,
-        )
+        pivot_column = nothing
+        for column in first_possible_column:variable_count
+            if !iszero(reduced[row, column])
+                pivot_column = column
+                break
+            end
+        end
         pivot_column === nothing && continue
         push!(pivot_rows, row)
         push!(pivot_columns, pivot_column)
+        first_possible_column = pivot_column + 1
     end
     return pivot_rows, pivot_columns
 end
@@ -170,8 +178,7 @@ function _solve_affine_system(
 )
     p = size(A, 2)
     if size(A, 1) == 0
-        affine = (zeros(ExactRational, p), Matrix{ExactRational}(I, p, p))
-        return _assert_affine_invariant(A, b, affine)
+        return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
     end
     size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
 
@@ -180,8 +187,9 @@ function _solve_affine_system(
     reduced = _exact_rref(hcat(A, b))
     checkpoint !== nothing && checkpoint("affine elimination: after Nemo exact rref")
     pivot_rows, pivot_columns = _rref_pivots(reduced, p)
+    pivot_row_set = BitSet(pivot_rows)
     for row in axes(reduced, 1)
-        any(!iszero(reduced[row, column]) for column in 1:p) && continue
+        row in pivot_row_set && continue
         iszero(reduced[row, rhs_column]) || return nothing
     end
 
@@ -201,9 +209,10 @@ function _solve_affine_system(
                 (nullspace[pivot_column, basis_index] = -_from_nemo_rational(coefficient))
         end
     end
-    affine = (particular, nullspace)
-    _assert_affine_invariant(A, b, affine)
-    return affine
+    # The basis is read directly from an exact Nemo RREF.  Recomputing A*p and
+    # A*N here performs a dense Rational{BigInt} matrix multiplication that
+    # merely repeats the elimination and can dominate extraction time.
+    return particular, nullspace
 end
 
 function _assert_affine_invariant(

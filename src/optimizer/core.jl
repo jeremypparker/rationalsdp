@@ -222,10 +222,13 @@ Base.@kwdef mutable struct Settings
     phase1_stop_after_candidate_diagnostics::Bool = false
     phase1_exact_recovery_diagnostics::Bool = false
     phase1_exact_recovery_pivot_log_frequency::Int = 10
-    working_float_type::DataType = Double64
+    working_float_type::DataType = Float64x2
     facial_reduction::Bool = true
     facial_reduction_max_rounds::Int = 24
-    facial_reduction_rank_expansion_rounds::Int = 1
+    # Rank expansion launches another exposing-vector solve after an exact
+    # face has already been certified.  Keep it opt-in: the common case is
+    # that the first certified face is already sufficient.
+    facial_reduction_rank_expansion_rounds::Int = 0
     facial_reduction_float_type::DataType = AbstractFloat
     facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"

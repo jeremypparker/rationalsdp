@@ -95,6 +95,33 @@ function _normalize_rational_direction(direction::Vector{ExactRational})
     return ExactRational[entry // 1 for entry in integer_entries]
 end
 
+function _projective_rational_direction(
+    candidate::Vector{F},
+    tolerance::F,
+) where {F<:AbstractFloat}
+    isempty(candidate) && return ExactRational[]
+    all(isfinite, candidate) || return ExactRational[]
+
+    # Eigenvectors are arbitrarily scaled, and their unit normalization is
+    # usually irrational even when the exposed line is rational.  Recover the
+    # line from coordinate ratios instead of rationalizing that common scale.
+    pivot = argmax(index -> abs(candidate[index]), eachindex(candidate))
+    pivot_value = candidate[pivot]
+    iszero(pivot_value) && return ExactRational[]
+
+    direction = zeros(ExactRational, length(candidate))
+    direction[pivot] = 1 // 1
+    for index in eachindex(candidate)
+        index == pivot && continue
+        direction[index] = rationalize(
+            BigInt,
+            BigFloat(candidate[index] / pivot_value);
+            tol = BigFloat(tolerance),
+        )
+    end
+    return direction
+end
+
 function _format_exact_direction(
     direction::Vector{ExactRational};
     max_entries::Int = 64,
@@ -317,6 +344,81 @@ function _block_trace_vanish_violation(
     end
 end
 
+function _block_weighted_subspace_exposure(
+    problem::ProblemData,
+    block::BlockStructure,
+    directions::Vector{Vector{ExactRational}},
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    isempty(directions) && return nothing
+    problem.affine === nothing && return nothing
+
+    direction_matrix = hcat(directions...)
+    size(direction_matrix, 1) == block.size || return nothing
+    rank = size(direction_matrix, 2)
+    weight_positions = _triangle_positions(rank)
+    weight_dimension = length(weight_positions)
+    form_columns = zeros(ExactRational, size(problem.A, 2), weight_dimension)
+
+    for (weight_index, (a, b)) in enumerate(weight_positions)
+        weight_basis = zeros(ExactRational, rank, rank)
+        weight_basis[a, b] = 1 // 1
+        weight_basis[b, a] = 1 // 1
+        exposed_matrix = direction_matrix * weight_basis * transpose(direction_matrix)
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            form_columns[block.global_positions[local_index], weight_index] =
+                i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
+        end
+    end
+
+    particular, nullspace = problem.affine
+    affine_basis = hcat(particular, nullspace)
+    vanish_constraints = transpose(affine_basis) * form_columns
+    weight_subspace = _nullspace_basis_exact(vanish_constraints)
+    size(weight_subspace, 2) == 0 && return nothing
+
+    identity_target = ExactRational[
+        a == b ? 1 // 1 : 0 // 1 for (a, b) in weight_positions
+    ]
+    numeric_weight_subspace = _to_working_array(F, weight_subspace)
+    numeric_coordinates = try
+        numeric_weight_subspace \ _to_working_array(F, identity_target)
+    catch
+        return nothing
+    end
+    all(isfinite, numeric_coordinates) || return nothing
+
+    for tolerance in _facial_reduction_subspace_tolerances(settings, F)
+        rational_coordinates = ExactRational[
+            rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
+            value in numeric_coordinates
+        ]
+        weight_vector = weight_subspace * rational_coordinates
+        weight_matrix = zeros(ExactRational, rank, rank)
+        for (weight_index, (a, b)) in enumerate(weight_positions)
+            weight_matrix[a, b] = weight_vector[weight_index]
+            weight_matrix[b, a] = weight_vector[weight_index]
+        end
+        _positive_definite_exact(weight_matrix) || continue
+
+        exposed_matrix = direction_matrix * weight_matrix * transpose(direction_matrix)
+        exposed_indices = Int[]
+        exposed_values = ExactRational[]
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            value = i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
+            iszero(value) && continue
+            push!(exposed_indices, block.global_positions[local_index])
+            push!(exposed_values, value)
+        end
+        _affine_form_violation(problem, exposed_indices, exposed_values) === nothing ||
+            continue
+        return (weight = weight_matrix, tolerance = tolerance)
+    end
+
+    return nothing
+end
+
 function _block_face_direction_certificate(
     problem::ProblemData,
     block::BlockStructure,
@@ -405,9 +507,7 @@ function _heuristic_kernel_direction(
         pushfirst!(tolerances, coarse_tolerance)
     end
     for tolerance in tolerances
-        raw_direction = ExactRational[
-            rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for value in candidate
-        ]
+        raw_direction = _projective_rational_direction(candidate, tolerance)
         any(!iszero, raw_direction) || continue
         numeric_direction = _to_working_array(F, raw_direction)
         direction_scale = max(one(F), _max_abs(numeric_direction))
@@ -459,11 +559,11 @@ function _pivoted_rational_subspace_directions(
         row_space_matrix[:, pivot_indices] \ row_space_matrix[:, remaining_indices]
     end
 
-    tolerances = if relation_tolerance === nothing
-        _recovery_tolerances(settings, F)
-    else
-        F[_to_working_float(F, relation_tolerance)]
-    end
+    tolerances = _facial_reduction_subspace_tolerances(
+        settings,
+        F;
+        relation_tolerance,
+    )
 
     for tolerance in tolerances
         rational_relations = Matrix{ExactRational}(undef, size(relations)...)
@@ -491,6 +591,32 @@ function _pivoted_rational_subspace_directions(
     return Vector{ExactRational}[]
 end
 
+function _facial_reduction_subspace_tolerances(
+    settings::Settings,
+    ::Type{F};
+    relation_tolerance = nothing,
+) where {F<:AbstractFloat}
+    if relation_tolerance !== nothing
+        return F[_to_working_float(F, relation_tolerance)]
+    end
+
+    tolerances = _recovery_tolerances(settings, F)
+    append!(
+        tolerances,
+        F[
+            F(1.0e-2),
+            F(1.0e-3),
+            F(1.0e-4),
+            F(1.0e-5),
+            F(1.0e-6),
+            F(1.0e-7),
+            _to_working_float(F, settings.facial_reduction_exposure_tolerance),
+        ],
+    )
+    filter!(tolerance -> tolerance > zero(F), tolerances)
+    return sort!(unique(tolerances); rev = true)
+end
+
 function _linearly_independent_directions(directions::Vector{Vector{ExactRational}})
     isempty(directions) && return directions
     matrix = hcat(directions...)
@@ -510,42 +636,87 @@ function _certified_pivoted_subspace_directions(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
-    candidates = _pivoted_rational_subspace_directions(subspace, opt.settings, F)
-    isempty(candidates) && return Vector{ExactRational}[]
-    _record_directions!(:certified, length(candidates), 0, 0)
-
-    accepted = Vector{Vector{ExactRational}}()
-    rejected = 0
+    attempted_tolerances = 0
+    proposed_directions = 0
     last_violation = nothing
-    for direction in candidates
-        violation = _block_annihilation_violation(
+    for tolerance in _facial_reduction_subspace_tolerances(opt.settings, F)
+        candidates = _pivoted_rational_subspace_directions(
+            subspace,
+            opt.settings,
+            F;
+            relation_tolerance = tolerance,
+        )
+        isempty(candidates) && continue
+        attempted_tolerances += 1
+        proposed_directions += length(candidates)
+        _record_directions!(:certified, length(candidates), 0, 0)
+
+        weighted_exposure = _block_weighted_subspace_exposure(
             problem,
             block,
-            direction;
+            candidates,
+            opt.settings,
+            F,
+        )
+        if weighted_exposure !== nothing
+            _record_directions!(:certified, 0, length(candidates), 0)
+            _log(
+                opt,
+                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
+            )
+            return candidates
+        end
+
+        joint_violation = _block_trace_vanish_violation(
+            problem,
+            block,
+            candidates;
             cache,
             block_index,
         )
-        if violation === nothing
-            push!(accepted, direction)
-        else
-            rejected += 1
-            last_violation = violation
+        if joint_violation === nothing
+            _record_directions!(:certified, 0, length(candidates), 0)
+            _log(
+                opt,
+                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (joint PSD trace certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)))",
+            )
+            return candidates
+        end
+        last_violation = joint_violation
+
+        accepted = Vector{Vector{ExactRational}}()
+        rejected = 0
+        for direction in candidates
+            violation = _block_annihilation_violation(
+                problem,
+                block,
+                direction;
+                cache,
+                block_index,
+            )
+            if violation === nothing
+                push!(accepted, direction)
+            else
+                rejected += 1
+                last_violation = violation
+            end
+        end
+        _record_directions!(:certified, 0, length(accepted), rejected)
+
+        accepted = _linearly_independent_directions(accepted)
+        if !isempty(accepted)
+            _log(
+                opt,
+                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s); relation_tol=$(_format_metric(tolerance)))",
+            )
+            return accepted
         end
     end
-    _record_directions!(:certified, 0, length(accepted), rejected)
 
-    accepted = _linearly_independent_directions(accepted)
-    if !isempty(accepted)
-        _log(
-            opt,
-            "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s))",
-        )
-        return accepted
-    end
-
+    proposed_directions == 0 && return Vector{ExactRational}[]
     _log(
         opt,
-        "Facial reduction: rejected pivoted $(description) candidate for PSD block $(block_index); no exact affine row certificate for $(rejected) direction(s) ($(last_violation))",
+        "Facial reduction: rejected pivoted $(description) candidates for PSD block $(block_index) across $(attempted_tolerances) relation tolerance(s); no exact subspace certificate for $(proposed_directions) proposed direction(s) ($(last_violation))",
     )
     return Vector{ExactRational}[]
 end
@@ -1714,6 +1885,15 @@ function _cached_keep_basis_violation(
         collect(view(removed_directions, :, column)) for
         column in axes(removed_directions, 2)
     ]
+    weighted_exposure = _block_weighted_subspace_exposure(
+        problem,
+        block,
+        directions,
+        Settings(),
+        Float64,
+    )
+    weighted_exposure === nothing || return nothing
+
     cache = _FacialReductionExactCache(problem)
     last_violation = nothing
     for direction in directions

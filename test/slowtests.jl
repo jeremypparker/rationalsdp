@@ -67,6 +67,56 @@ end
         @test value(B) < 730//1
     end
 
+    @testset "SAIRS Lyapunov SOS feasibility with projective face recovery" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64x2")
+        set_optimizer_attribute(model, "working_float_type", "Float64x2")
+        set_optimizer_attribute(model, "facial_reduction_float_type", "Float64x2")
+
+        n = 1
+        @polyvar S[1:n] A[1:n] I[1:n]
+
+        mu = fill(1//10, n)
+        beta1 = [i == j ? 8//10 : 1//10 for i in 1:n, j in 1:n]
+        beta2 = [i == j ? 8//10 : 1//10 for i in 1:n, j in 1:n]
+        nu = fill(1//10, n)
+        alpha = 1//10
+        gamma = 1//10
+        delta1 = 1//10
+        delta2 = 1//10
+
+        dSdt = [
+            mu[i] -
+            sum(beta1[i, j] * S[i] * A[j] + beta2[i, j] * S[i] * I[j] for j in 1:n) -
+            (mu[i] + nu[i]) * S[i] +
+            gamma * (1 - S[i] - A[i] - I[i]) for i in 1:n
+        ]
+        dAdt = [
+            sum(beta1[i, j] * S[i] * A[j] + beta2[i, j] * S[i] * I[j] for j in 1:n) -
+            (mu[i] + alpha + delta1) * A[i] for i in 1:n
+        ]
+        dIdt = [alpha * A[i] - (mu[i] + delta2) * I[i] for i in 1:n]
+
+        var = vcat(S, A, I)
+        basisV = monomials(var, 0:4)
+        @variable(model, coeffsV[1:length(basisV)])
+        V = dot(basisV, coeffsV)
+        dVdt = sum(
+            differentiate(V, S[i]) * dSdt[i] +
+            differentiate(V, A[i]) * dAdt[i] +
+            differentiate(V, I[i]) * dIdt[i] for i in 1:n
+        )
+        normf = sum(dSdt[i]^2 + dAdt[i]^2 + dIdt[i]^2 for i in 1:n)
+
+        @constraint(model, dVdt - normf in SOSCone())
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        test_facial_reduction_statistics(model)
+        test_exact_extracted_sdp(model)
+    end
+
     @testset "KSE time average bound with split even basis" begin
         function test_kse_certificate(instance)
             @test termination_status(instance.model) == MOI.OPTIMAL

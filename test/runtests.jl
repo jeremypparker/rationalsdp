@@ -767,6 +767,181 @@ include("slowtest_helpers.jl")
     end
 
     @testset "Facial reduction helper regressions" begin
+        rational_direction = Float64[1.0, 2.0, 5.0]
+        candidate_direction = sqrt(2.0) .* rational_direction
+        block_matrix = Matrix{Float64}(I, 3, 3) -
+                        (rational_direction * transpose(rational_direction)) /
+                        dot(rational_direction, rational_direction)
+        heuristic = RationalSDP._heuristic_kernel_direction(
+            block_matrix,
+            candidate_direction,
+            RationalSDP.Settings(),
+            Float64,
+        )
+        @test heuristic !== nothing
+        @test heuristic.direction == Rational{BigInt}[1//1, 2//1, 5//1]
+
+        subspace_basis = Float64[
+            1 0
+            0 1
+            1 2
+            2 -1
+        ]
+        irrational_rotation = Float64[sqrt(2.0) 1.0; -1.0 sqrt(2.0)]
+        subspace_noise = 2.0e-5 .* Float64[
+            1 2
+            -2 1
+            3 -1
+            -1 2
+        ]
+        recovered_subspace = RationalSDP._pivoted_rational_subspace_directions(
+            subspace_basis * irrational_rotation + subspace_noise,
+            RationalSDP.Settings(),
+            Float64,
+        )
+        @test length(recovered_subspace) == 2
+        recovered_matrix = Float64.(hcat(recovered_subspace...))
+        subspace_projector = subspace_basis * pinv(subspace_basis)
+        @test norm((I - subspace_projector) * recovered_matrix) < 1.0e-10
+
+        block = RationalSDP.BlockStructure(
+            4,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:10],
+            collect(1:10),
+            RationalSDP._triangle_positions(4),
+            [1, 3, 6, 10],
+        )
+        retry_subspace_basis = Float64[
+            37 0
+            0 41
+            13 17
+            11 -19
+        ]
+        retry_subspace = retry_subspace_basis * irrational_rotation + 0.5 .* subspace_noise
+        retry_projector = retry_subspace_basis * pinv(retry_subspace_basis)
+        coarse_subspace = RationalSDP._pivoted_rational_subspace_directions(
+            retry_subspace,
+            RationalSDP.Settings(),
+            Float64;
+            relation_tolerance = 1.0e-2,
+        )
+        @test norm(
+            (I - retry_projector) * Float64.(hcat(coarse_subspace...)),
+        ) > 1.0e-3
+
+        exact_subspace_basis = Rational{BigInt}[37 0; 0 41; 13 17; 11 -19]
+        gram_form = exact_subspace_basis * transpose(exact_subspace_basis)
+        trace_row = Rational{BigInt}[
+            i == j ? gram_form[i, j] : 2 * gram_form[i, j]
+            for (i, j) in block.local_positions
+        ]
+        trace_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 10),
+            0//1,
+            zeros(Rational{BigInt}, 10),
+            reshape(trace_row, 1, :),
+            Rational{BigInt}[0//1],
+            RationalSDP._solve_affine_system(
+                reshape(trace_row, 1, :),
+                Rational{BigInt}[0//1],
+            ),
+        )
+        reduction_opt = RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+        certified_subspace = RationalSDP._certified_pivoted_subspace_directions(
+            reduction_opt,
+            trace_problem,
+            block,
+            1,
+            retry_subspace,
+            Float64,
+            "regression subspace",
+        )
+        @test length(certified_subspace) == 2
+        @test norm(
+            (I - retry_projector) * Float64.(hcat(certified_subspace...)),
+        ) < 1.0e-10
+
+        exposing_range = Rational{BigInt}[
+            1 0
+            0 1
+            1 1
+            2 -1
+        ]
+        exposing_weight = Rational{BigInt}[2 1; 1 3]
+        exposing_matrix =
+            exposing_range * exposing_weight * transpose(exposing_range)
+        exposing_row = Rational{BigInt}[
+            i == j ? exposing_matrix[i, j] : 2 * exposing_matrix[i, j]
+            for (i, j) in block.local_positions
+        ]
+        # A trace-zero row-space direction makes the normalized exposing-slack
+        # affine family nontrivial.  It is chosen orthogonal (in packed dual
+        # coordinates) to the projector-fit residual, so the joint fit must
+        # recover the positive-semidefinite exposing row rather than merely
+        # rationalizing the projector itself.
+        trace_zero_row = Rational{BigInt}[
+            204, -270, -141, 44, 278, -100, -226, -4, 78, 37
+        ]
+        exposing_A = Matrix(transpose(hcat(exposing_row, trace_zero_row)))
+        exposing_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 10),
+            0//1,
+            zeros(Rational{BigInt}, 10),
+            exposing_A,
+            Rational{BigInt}[0//1, 0//1],
+            RationalSDP._solve_affine_system(
+                exposing_A,
+                Rational{BigInt}[0//1, 0//1],
+            ),
+        )
+        exact_projector =
+            exposing_range *
+            inv(transpose(exposing_range) * exposing_range) *
+            transpose(exposing_range)
+        normalized_projector_slack = Rational{BigInt}[
+            (i == j ? exact_projector[i, j] : 2 * exact_projector[i, j]) /
+            tr(exact_projector) for (i, j) in block.local_positions
+        ]
+        @test !RationalSDP._dual_slack_has_exact_certificate(
+            exposing_problem,
+            normalized_projector_slack,
+        )
+
+        weighted_subspace =
+            Float64.(exposing_range) * irrational_rotation + 0.25 .* subspace_noise
+        weighted_certified = RationalSDP._certified_pivoted_subspace_directions(
+            reduction_opt,
+            exposing_problem,
+            block,
+            1,
+            weighted_subspace,
+            Float64,
+            "weighted regression subspace",
+        )
+        @test length(weighted_certified) == 2
+        @test norm(
+            (I - Float64.(exact_projector)) * Float64.(hcat(weighted_certified...)),
+        ) < 1.0e-10
+        weighted_keep_basis = RationalSDP._orthogonal_complement_basis(
+            weighted_certified,
+            block.size,
+        )
+        weighted_reduction = RationalSDP._CertifiedFacialReduction(
+            "weighted regression",
+            Int[],
+            Dict(1 => weighted_keep_basis),
+        )
+        @test RationalSDP._cached_facial_reduction_violation(
+            exposing_problem,
+            weighted_reduction,
+        ) === nothing
+
         directions = [
             Rational{BigInt}[1//1, 0//1],
             Rational{BigInt}[2//1, 0//1],

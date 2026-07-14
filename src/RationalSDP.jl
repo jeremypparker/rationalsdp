@@ -16,11 +16,14 @@ using MultiFloats:
 import Nemo
 import Serialization
 using LinearAlgebra
+import LinearAlgebra: mul!
+using Tullio: @tullio
 using Printf
 using SparseArrays
 using Base.Threads
 import MathOptInterface as MOI
 
+include("multifloat_matmul.jl")
 include("optimizer.jl")
 
 export Optimizer, Settings, FacialReductionStatistics, facial_reduction_statistics

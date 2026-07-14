@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "55f2ee417b8a50862f5766d48765e3e757bd0cb8"
+project_hash = "ac2898eb8457b2c58ea51fa794891f79fcb6f6d8"
 
 [[deps.AbstractAlgebra]]
 deps = ["LinearAlgebra", "MacroTools", "PrecompileTools", "Preferences", "Random", "RandomExtensions", "SparseArrays"]
@@ -464,6 +464,12 @@ git-tree-sha1 = "5c3d09cc4f31f5fc6af001c250bf1278733100ff"
 uuid = "3cdcf5f2-1ef4-517c-9805-6587b60abb01"
 version = "1.3.4"
 
+[[deps.Requires]]
+deps = ["UUIDs"]
+git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
+uuid = "ae029012-a4dd-5104-9daa-d747884805df"
+version = "1.3.1"
+
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
@@ -575,6 +581,24 @@ version = "0.5.29"
 git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
 uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 version = "0.11.3"
+
+[[deps.Tullio]]
+deps = ["DiffRules", "LinearAlgebra", "Requires"]
+git-tree-sha1 = "de0febfe1243e89f352abd4ca0e9de6c8e6190c5"
+uuid = "bc48ee85-29a4-5162-ae0b-a64e1601d4bc"
+version = "0.3.9"
+
+    [deps.Tullio.extensions]
+    TullioCUDAExt = "CUDA"
+    TullioChainRulesCoreExt = "ChainRulesCore"
+    TullioFillArraysExt = "FillArrays"
+    TullioTrackerExt = "Tracker"
+
+    [deps.Tullio.weakdeps]
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
 
 [[deps.UUIDs]]
 deps = ["Random", "SHA"]

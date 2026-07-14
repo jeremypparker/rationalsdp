@@ -798,7 +798,7 @@ uuid = "fb686558-2515-59ef-acaa-46db3789a887"
 version = "0.4.4"
 
 [[deps.RationalSDP]]
-deps = ["Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "MultiFloats", "Nemo", "Printf", "Serialization", "SparseArrays"]
+deps = ["Hypatia", "LinearAlgebra", "Logging", "MathOptInterface", "MultiFloats", "Nemo", "Printf", "Serialization", "SparseArrays", "Tullio"]
 path = ".."
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"
@@ -813,6 +813,12 @@ version = "1.3.4"
 git-tree-sha1 = "45e428421666073eab6f2da5c9d310d99bb12f9b"
 uuid = "189a3867-3050-52da-a836-e630ba90ab69"
 version = "1.2.2"
+
+[[deps.Requires]]
+deps = ["UUIDs"]
+git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
+uuid = "ae029012-a4dd-5104-9daa-d747884805df"
+version = "1.3.1"
 
 [[deps.RoundingEmulator]]
 git-tree-sha1 = "40b9edad2e5287e05bd413a38f61a8ff55b9557b"
@@ -1009,6 +1015,24 @@ version = "0.5.29"
 git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
 uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 version = "0.11.3"
+
+[[deps.Tullio]]
+deps = ["DiffRules", "LinearAlgebra", "Requires"]
+git-tree-sha1 = "de0febfe1243e89f352abd4ca0e9de6c8e6190c5"
+uuid = "bc48ee85-29a4-5162-ae0b-a64e1601d4bc"
+version = "0.3.9"
+
+    [deps.Tullio.extensions]
+    TullioCUDAExt = "CUDA"
+    TullioChainRulesCoreExt = "ChainRulesCore"
+    TullioFillArraysExt = "FillArrays"
+    TullioTrackerExt = "Tracker"
+
+    [deps.Tullio.weakdeps]
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
 
 [[deps.UUIDs]]
 deps = ["Random", "SHA"]

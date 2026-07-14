@@ -235,6 +235,50 @@ include("slowtest_helpers.jl")
         )
     end
 
+    @testset "MultiFloat dense matmul" begin
+        T = RationalSDP.Float64x2
+        A = T[1 2 3; 4 5 6]
+        B = T[2 1; 0 3; 4 5]
+        C = fill(T(7), 2, 2)
+        C0 = copy(C)
+
+        LinearAlgebra.mul!(C, A, B, T(2), T(-1))
+        expected = Matrix{T}(undef, 2, 2)
+        for j in axes(expected, 2), i in axes(expected, 1)
+            value = zero(T)
+            for k in axes(A, 2)
+                value += A[i, k] * B[k, j]
+            end
+            expected[i, j] = T(2) * value - C0[i, j]
+        end
+        @test C == expected
+
+        Cview_parent = fill(T(-1), 4, 4)
+        Cview = @view Cview_parent[1:3, 1:3]
+        LinearAlgebra.mul!(Cview, A', A, true, false)
+        expected_gram = Matrix{T}(undef, 3, 3)
+        for j in axes(expected_gram, 2), i in axes(expected_gram, 1)
+            value = zero(T)
+            for k in axes(A, 1)
+                value += A[k, i] * A[k, j]
+            end
+            expected_gram[i, j] = value
+        end
+        @test Cview == expected_gram
+
+        n = 128
+        A_large = fill(T(1.25), n, n)
+        B_large = fill(T(-0.75), n, n)
+        C_large = fill(T(3), n, n)
+        C_large_original = copy(C_large)
+        LinearAlgebra.mul!(C_large, A_large, B_large, T(2), T(-1))
+        expected_large = fill(T(2) * T(n) * T(1.25) * T(-0.75), n, n)
+        expected_large .-= C_large_original
+        error_large = maximum(abs, C_large - expected_large)
+        scale_large = max(one(T), maximum(abs, expected_large))
+        @test error_large <= T(100) * eps(T) * scale_large
+    end
+
     @testset "Hypatia centering warning filter" begin
         output = IOBuffer()
         Logging.with_logger(Logging.ConsoleLogger(output, Logging.Warn)) do

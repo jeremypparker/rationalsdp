@@ -113,6 +113,14 @@ end
 # only for the exact matrix kernels where FLINT provides the performance gain.
 _to_nemo_matrix(values::AbstractMatrix{ExactRational}) = Nemo.matrix(Nemo.QQ, values)
 
+function _nemo_matrix_product(
+    left::AbstractMatrix{ExactRational},
+    right::AbstractMatrix{ExactRational},
+)
+    size(left, 2) == size(right, 1) || error("Exact matrix product dimensions must match.")
+    return _from_nemo_matrix(_to_nemo_matrix(left) * _to_nemo_matrix(right))
+end
+
 function _from_nemo_rational(value)
     return ExactRational(BigInt(numerator(value)), BigInt(denominator(value)))
 end
@@ -163,9 +171,14 @@ function _exact_rref(aug::Matrix{ExactRational})
     end
 end
 
-function _rref(aug::Matrix{ExactRational})
+function _rref(
+    aug::Matrix{ExactRational};
+    checkpoint::Union{Nothing,Function} = nothing,
+)
+    checkpoint !== nothing && checkpoint("affine elimination: converting to Nemo and computing exact RREF")
     reduced_nemo = _exact_rref(aug)
     reduced = _from_nemo_matrix(reduced_nemo)
+    checkpoint !== nothing && checkpoint("affine elimination: interpreting exact RREF")
     _, pivot_columns = _rref_pivots(reduced, size(aug, 2) - 1)
     return reduced, pivot_columns
 end
@@ -182,10 +195,16 @@ function _solve_affine_system(
     end
     size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
 
-    checkpoint !== nothing && checkpoint("affine elimination: before Nemo exact rref")
+    checkpoint !== nothing && checkpoint(
+        "affine elimination: building dense $(size(A, 1))-by-$(p + 1) augmented system",
+    )
     rhs_column = p + 1
-    reduced = _exact_rref(hcat(A, b))
-    checkpoint !== nothing && checkpoint("affine elimination: after Nemo exact rref")
+    augmented = hcat(A, b)
+    checkpoint !== nothing && checkpoint(
+        "affine elimination: converting to Nemo and computing exact RREF",
+    )
+    reduced = _exact_rref(augmented)
+    checkpoint !== nothing && checkpoint("affine elimination: interpreting exact RREF")
     pivot_rows, pivot_columns = _rref_pivots(reduced, p)
     pivot_row_set = BitSet(pivot_rows)
     for row in axes(reduced, 1)
@@ -209,7 +228,7 @@ function _solve_affine_system(
                 (nullspace[pivot_column, basis_index] = -_from_nemo_rational(coefficient))
         end
     end
-    # The basis is read directly from an exact Nemo RREF.  Recomputing A*p and
+    # The basis is read directly from an exact Nemo RREF. Recomputing A*p and
     # A*N here performs a dense Rational{BigInt} matrix multiplication that
     # merely repeats the elimination and can dominate extraction time.
     return particular, nullspace
@@ -232,11 +251,16 @@ end
 function _independent_affine_equalities(
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
+    ;
+    checkpoint::Union{Nothing,Function} = nothing,
 )
     size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
     isempty(b) && return A, b
 
-    reduced, _ = _rref(hcat(A, b))
+    checkpoint !== nothing && checkpoint(
+        "affine compaction: building dense $(size(A, 1))-by-$(size(A, 2) + 1) augmented system",
+    )
+    reduced, _ = _rref(hcat(A, b); checkpoint = checkpoint)
     rhs_column = size(A, 2) + 1
     rows = Vector{Vector{ExactRational}}()
     rhs = ExactRational[]
@@ -279,11 +303,203 @@ function _restrict_affine_system(
     return _assert_affine_invariant(rows, rhs, result)
 end
 
+struct _SparseAffineRestrictions
+    indices::Vector{Vector{Int}}
+    values::Vector{Vector{ExactRational}}
+
+    function _SparseAffineRestrictions(
+        indices::Vector{Vector{Int}},
+        values::Vector{Vector{ExactRational}},
+    )
+        length(indices) == length(values) ||
+            error("Sparse affine restriction indices and values must have the same row count.")
+        for (row_indices, row_values) in zip(indices, values)
+            length(row_indices) == length(row_values) ||
+                error("Sparse affine restriction row indices and values must have the same length.")
+            allunique(row_indices) || error("Sparse affine restriction rows must not repeat an index.")
+        end
+        return new(indices, values)
+    end
+end
+
+_sparse_restriction_entry_count(restrictions::_SparseAffineRestrictions) =
+    sum(length, restrictions.indices; init = 0)
+
+function _assert_sparse_affine_invariant(
+    restrictions::_SparseAffineRestrictions,
+    rhs::Vector{ExactRational},
+    affine::Tuple{Vector{ExactRational},Matrix{ExactRational}},
+)
+    length(restrictions.indices) == length(rhs) ||
+        error("Sparse affine restriction rows and rhs must match.")
+    particular, nullspace = affine
+    dimension = length(particular)
+    size(nullspace, 1) == dimension || error("Affine nullspace has the wrong row count.")
+    for row_index in eachindex(rhs)
+        row_indices = restrictions.indices[row_index]
+        row_values = restrictions.values[row_index]
+        all(index -> 1 <= index <= dimension, row_indices) ||
+            error("Sparse affine restriction index is out of bounds.")
+        particular_residual = -rhs[row_index]
+        nullspace_residual = zeros(ExactRational, size(nullspace, 2))
+        for (index, value) in zip(row_indices, row_values)
+            particular_residual += value * particular[index]
+            for column in axes(nullspace, 2)
+                nullspace_residual[column] += value * nullspace[index, column]
+            end
+        end
+        iszero(particular_residual) ||
+            error("Exact affine invariant failed: sparse restriction row $(row_index) is violated by p.")
+        all(iszero, nullspace_residual) ||
+            error("Exact affine invariant failed: sparse restriction row $(row_index) is not zero on N.")
+    end
+    return affine
+end
+
+function _sparse_coordinate_restriction_system(
+    affine::Tuple{Vector{ExactRational},Matrix{ExactRational}},
+    added_dimension::Int,
+    restrictions::_SparseAffineRestrictions,
+    rhs::Vector{ExactRational},
+)
+    length(restrictions.indices) == length(rhs) ||
+        error("Sparse affine restriction rows and rhs must match.")
+    particular, nullspace = affine
+    old_dimension = length(particular)
+    size(nullspace, 1) == old_dimension || error("Affine nullspace has the wrong row count.")
+    added_dimension >= 0 || error("Added affine dimension must be nonnegative.")
+    nullspace_dimension = size(nullspace, 2)
+    coordinate_dimension = nullspace_dimension + added_dimension
+    total_dimension = old_dimension + added_dimension
+    coordinate_rows = zeros(
+        ExactRational,
+        length(rhs),
+        coordinate_dimension,
+    )
+    coordinate_rhs = copy(rhs)
+    for row_index in eachindex(rhs)
+        row_indices = restrictions.indices[row_index]
+        row_values = restrictions.values[row_index]
+        all(index -> 1 <= index <= total_dimension, row_indices) ||
+            error("Sparse affine restriction index is out of bounds.")
+        for (index, value) in zip(row_indices, row_values)
+            if index <= old_dimension
+                coordinate_rhs[row_index] -= value * particular[index]
+                for column in axes(nullspace, 2)
+                    coordinate_rows[row_index, column] += value * nullspace[index, column]
+                end
+            else
+                coordinate_rows[row_index, nullspace_dimension + index - old_dimension] += value
+            end
+        end
+    end
+    return coordinate_rows, coordinate_rhs
+end
+
+function _lift_affine_basis_with_nemo(
+    particular::Vector{ExactRational},
+    nullspace::Matrix{ExactRational},
+    added_dimension::Int,
+    coordinate_particular::Vector{ExactRational},
+    coordinate_nullspace::Matrix{ExactRational},
+)
+    old_dimension = length(particular)
+    coordinate_dimension = size(nullspace, 2) + added_dimension
+    length(coordinate_particular) == coordinate_dimension ||
+        error("Affine coordinate particular point has the wrong dimension.")
+    size(coordinate_nullspace, 1) == coordinate_dimension ||
+        error("Affine coordinate nullspace has the wrong row count.")
+
+    extended_particular = vcat(particular, zeros(ExactRational, added_dimension))
+    extended_nullspace = zeros(
+        ExactRational,
+        old_dimension + added_dimension,
+        coordinate_dimension,
+    )
+    size(nullspace, 2) > 0 &&
+        (extended_nullspace[1:old_dimension, 1:size(nullspace, 2)] = nullspace)
+    added_dimension > 0 &&
+        (extended_nullspace[old_dimension + 1:end, size(nullspace, 2) + 1:end] =
+         Matrix{ExactRational}(I, added_dimension, added_dimension))
+
+    coordinate_basis = hcat(
+        reshape(coordinate_particular, :, 1),
+        coordinate_nullspace,
+    )
+    lifted_basis = _nemo_matrix_product(extended_nullspace, coordinate_basis)
+    return (
+        extended_particular + vec(lifted_basis[:, 1]),
+        Matrix(lifted_basis[:, 2:end]),
+    )
+end
+
+function _extend_and_restrict_affine_system(
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+    added_dimension::Int,
+    restrictions::_SparseAffineRestrictions,
+    restriction_rhs::Vector{ExactRational},
+    ;
+    checkpoint::Union{Nothing,Function} = nothing,
+    settings::Settings = Settings(),
+)
+    affine === nothing && return nothing
+    added_dimension >= 0 || error("Added affine dimension must be nonnegative.")
+    length(restrictions.indices) == length(restriction_rhs) ||
+        error("Sparse affine restriction rows and rhs must match.")
+    particular, nullspace = affine
+    old_dimension = length(particular)
+    size(nullspace, 1) == old_dimension || error("Affine nullspace has the wrong row count.")
+    coordinate_dimension = size(nullspace, 2) + added_dimension
+    checkpoint !== nothing && checkpoint(
+        "affine restriction: assembling $(length(restriction_rhs))-by-$(coordinate_dimension) coordinate system from $(length(restriction_rhs)) block-sparse face equation(s) with $(_sparse_restriction_entry_count(restrictions)) nonzero(s)",
+    )
+    coordinate_rows, coordinate_rhs = _sparse_coordinate_restriction_system(
+        affine,
+        added_dimension,
+        restrictions,
+        restriction_rhs,
+    )
+    checkpoint !== nothing && checkpoint("affine restriction: solving coordinate system exactly")
+    coordinate_affine = _solve_affine_system(
+        coordinate_rows,
+        coordinate_rhs;
+        checkpoint,
+    )
+    coordinate_affine === nothing && return nothing
+    coordinate_particular, coordinate_nullspace = coordinate_affine
+    checkpoint !== nothing && checkpoint(
+        "affine restriction: lifting restricted affine basis with Nemo exact multiplication",
+    )
+    result = _lift_affine_basis_with_nemo(
+        particular,
+        nullspace,
+        added_dimension,
+        coordinate_particular,
+        coordinate_nullspace,
+    )
+    checkpoint !== nothing && checkpoint("affine restriction: validating restricted affine basis")
+    validation_products =
+        BigInt(_sparse_restriction_entry_count(restrictions)) *
+        (1 + size(result[2], 2))
+    validation_limit = settings.facial_reduction_sparse_affine_validation_max_products
+    if validation_products <= validation_limit
+        _assert_sparse_affine_invariant(restrictions, restriction_rhs, result)
+    else
+        checkpoint !== nothing && checkpoint(
+            "affine restriction: skipping redundant sparse validation ($(validation_products) exact products; limit $(validation_limit)); exact RREF and Nemo lifting preserve the restriction algebraically",
+        )
+    end
+    checkpoint !== nothing && checkpoint("affine restriction: completed")
+    return result
+end
+
 function _extend_and_restrict_affine_system(
     affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
     added_dimension::Int,
     restriction_rows::Matrix{ExactRational},
     restriction_rhs::Vector{ExactRational},
+    ;
+    checkpoint::Union{Nothing,Function} = nothing,
 )
     affine === nothing && return nothing
     added_dimension >= 0 || error("Added affine dimension must be nonnegative.")
@@ -292,22 +508,36 @@ function _extend_and_restrict_affine_system(
     particular, nullspace = affine
     old_dimension = length(particular)
     size(nullspace, 1) == old_dimension || error("Affine nullspace has the wrong row count.")
+    coordinate_dimension = size(nullspace, 2) + added_dimension
+    checkpoint !== nothing && checkpoint(
+        "affine restriction: extending $(old_dimension) variables by $(added_dimension) face coordinate(s)",
+    )
     extended_particular = vcat(particular, zeros(ExactRational, added_dimension))
     extended_nullspace = zeros(ExactRational, old_dimension + added_dimension, size(nullspace, 2) + added_dimension)
     size(nullspace, 2) > 0 && (extended_nullspace[1:old_dimension, 1:size(nullspace, 2)] = nullspace)
     added_dimension > 0 && (extended_nullspace[old_dimension + 1:end, size(nullspace, 2) + 1:end] = Matrix{ExactRational}(I, added_dimension, added_dimension))
 
+    checkpoint !== nothing && checkpoint(
+        "affine restriction: forming dense $(size(restriction_rows, 1))-by-$(coordinate_dimension) coordinate system from $(size(restriction_rows, 1)) face equation(s)",
+    )
+    coordinate_rows = restriction_rows * extended_nullspace
+    coordinate_rhs = restriction_rhs - restriction_rows * extended_particular
+    checkpoint !== nothing && checkpoint("affine restriction: solving coordinate system exactly")
     coordinate_affine = _solve_affine_system(
-        restriction_rows * extended_nullspace,
-        restriction_rhs - restriction_rows * extended_particular,
+        coordinate_rows,
+        coordinate_rhs;
+        checkpoint,
     )
     coordinate_affine === nothing && return nothing
     coordinate_particular, coordinate_nullspace = coordinate_affine
+    checkpoint !== nothing && checkpoint("affine restriction: lifting restricted affine basis")
     result = (
         extended_particular + extended_nullspace * coordinate_particular,
         extended_nullspace * coordinate_nullspace,
     )
+    checkpoint !== nothing && checkpoint("affine restriction: validating restricted affine basis")
     _assert_affine_invariant(restriction_rows, restriction_rhs, result)
+    checkpoint !== nothing && checkpoint("affine restriction: completed")
     return result
 end
 

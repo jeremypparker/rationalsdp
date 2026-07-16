@@ -141,6 +141,81 @@ function _format_exact_direction(
            "]"
 end
 
+function _facial_reduction_row_space_is_small(
+    problem::ProblemData,
+    settings::Settings = Settings(),
+)
+    row_count, variable_count = size(problem.A)
+    return BigInt(row_count) * (variable_count + 1) <=
+           settings.facial_reduction_row_space_max_entries
+end
+
+function _weighted_subspace_exposure_work(
+    problem::ProblemData,
+    block::BlockStructure,
+    rank::Int,
+)
+    rank > 0 || return (
+        affine_dimension = 0,
+        block_entries = 0,
+        weight_dimension = 0,
+        form_entries = BigInt(0),
+        affine_products = BigInt(0),
+    )
+    affine_dimension = problem.affine === nothing ? 0 : 1 + size(problem.affine[2], 2)
+    block_entries = length(block.local_positions)
+    weight_dimension = div(rank * (rank + 1), 2)
+    form_entries = BigInt(block_entries) * weight_dimension
+    affine_products = BigInt(affine_dimension) * form_entries
+    return (
+        affine_dimension = affine_dimension,
+        block_entries = block_entries,
+        weight_dimension = weight_dimension,
+        form_entries = form_entries,
+        affine_products = affine_products,
+    )
+end
+
+function _weighted_subspace_exposure_is_small(work, settings::Settings = Settings())
+    return work.form_entries <=
+           settings.facial_reduction_weighted_subspace_max_form_entries &&
+           work.affine_products <=
+           settings.facial_reduction_weighted_subspace_max_affine_products
+end
+
+function _weighted_subspace_exposure_is_cheap(work, settings::Settings = Settings())
+    return work.weight_dimension <=
+           settings.facial_reduction_cheap_weighted_subspace_max_weight_dimension &&
+           work.form_entries <=
+           settings.facial_reduction_cheap_weighted_subspace_max_form_entries &&
+           work.affine_products <=
+           settings.facial_reduction_cheap_weighted_subspace_max_affine_products
+end
+
+function _numeric_weighted_subspace_exposure_is_small(work, settings::Settings = Settings())
+    return work.form_entries <=
+           settings.facial_reduction_numeric_weighted_subspace_max_form_entries &&
+           work.affine_products <=
+           settings.facial_reduction_numeric_weighted_subspace_max_affine_products
+end
+
+function _individual_subspace_certificate_work(
+    problem::ProblemData,
+    block::BlockStructure,
+    direction_count::Int,
+)
+    affine_dimension = problem.affine === nothing ? 0 : 1 + size(problem.affine[2], 2)
+    # Across all annihilation rows for one direction, each packed block entry
+    # is inspected at most twice.  This is a conservative estimate of the
+    # exact affine products performed by the individual-certification loop.
+    affine_products =
+        BigInt(2) * direction_count * affine_dimension * length(block.local_positions)
+    return (affine_dimension = affine_dimension, affine_products = affine_products)
+end
+
+_individual_subspace_certificate_is_small(work, settings::Settings = Settings()) =
+    work.affine_products <= settings.facial_reduction_individual_max_affine_products
+
 function _facial_reduction_row_space!(
     cache::_FacialReductionExactCache,
     problem::ProblemData,
@@ -177,7 +252,7 @@ function _facial_reduction_row_space!(
     selected_rows = selected_rows[1:rank]
     square = basis[selected_rows, :]
     inverse = _from_nemo_matrix(
-        _exact_rref(hcat(transpose(square), Matrix{ExactRational}(I, rank, rank)))[:, rank + 1:(2 * rank)],
+        _exact_rref(hcat(square, Matrix{ExactRational}(I, rank, rank)))[:, rank + 1:(2 * rank)],
     )
     result = _FacialReductionRowSpaceCache(pivot_columns, selected_rows, inverse)
     cache.row_space = result
@@ -190,8 +265,13 @@ function _row_space_multiplier(
     indices::Vector{Int},
     values::Vector{ExactRational};
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    settings::Settings = Settings(),
 )
     length(indices) == length(values) || error("Sparse row indices and values must have equal lengths.")
+    # Exact affine vanishing is sufficient to certify the forms used in
+    # facial reduction.  Avoid materializing a dense rational row-space RREF
+    # merely to obtain an optional multiplier on large systems.
+    _facial_reduction_row_space_is_small(problem, settings) || return nothing
     row_space = _facial_reduction_row_space!(cache, problem)
     rank = length(row_space.pivot_columns)
     rank == 0 && return isempty(indices) ? zeros(ExactRational, size(problem.A, 1)) : nothing
@@ -284,9 +364,9 @@ function _block_annihilation_violation(
     try
         problem.affine === nothing && return "no exact affine parametrization is available"
         for (row_index, (indices, values)) in enumerate(_block_annihilation_forms(block, direction))
-            _row_space_multiplier(problem, indices, values; cache) === nothing || continue
-            _affine_form_violation(problem, indices, values) === nothing && continue
-            return "row=$(row_index), row-space membership certificate unavailable"
+            violation = _affine_form_violation(problem, indices, values)
+            violation === nothing && continue
+            return "row=$(row_index), affine form does not vanish ($(violation))"
         end
         return nothing
     finally
@@ -306,9 +386,9 @@ function _block_quadratic_vanish_violation(
     try
         problem.affine === nothing && return "no exact affine parametrization is available"
         indices, values = _block_quadratic_form(block, direction)
-        _row_space_multiplier(problem, indices, values; cache) === nothing || return nothing
-        _affine_form_violation(problem, indices, values) === nothing && return nothing
-        return "quadratic row-space membership certificate unavailable"
+        violation = _affine_form_violation(problem, indices, values)
+        violation === nothing && return nothing
+        return "quadratic affine form does not vanish ($(violation))"
     finally
         _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
@@ -336,12 +416,104 @@ function _block_trace_vanish_violation(
         filter!(pair -> !iszero(pair.second), coefficients)
         indices = sort(collect(keys(coefficients)))
         values = [coefficients[index] for index in indices]
-        _row_space_multiplier(problem, indices, values; cache) === nothing || return nothing
-        _affine_form_violation(problem, indices, values) === nothing && return nothing
-        return "trace row-space membership certificate unavailable"
+        violation = _affine_form_violation(problem, indices, values)
+        violation === nothing && return nothing
+        return "trace affine form does not vanish ($(violation))"
     finally
         _record_certificate_check!((time_ns() - start_time) / 1.0e9)
     end
+end
+
+function _block_weighted_subspace_form(
+    block::BlockStructure,
+    direction_matrix::AbstractMatrix{ExactRational},
+    weight_matrix::AbstractMatrix{ExactRational},
+)
+    exposed_matrix = direction_matrix * weight_matrix * transpose(direction_matrix)
+    exposed_indices = Int[]
+    exposed_values = ExactRational[]
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        value = i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
+        iszero(value) && continue
+        push!(exposed_indices, block.global_positions[local_index])
+        push!(exposed_values, value)
+    end
+    return exposed_indices, exposed_values
+end
+
+function _numeric_weighted_subspace_exposure(
+    problem::ProblemData,
+    block::BlockStructure,
+    directions::Vector{Vector{ExactRational}},
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    isempty(directions) && return nothing
+    problem.affine === nothing && return nothing
+
+    direction_matrix = hcat(directions...)
+    size(direction_matrix, 1) == block.size || return nothing
+    rank = size(direction_matrix, 2)
+    work = _weighted_subspace_exposure_work(problem, block, rank)
+    _numeric_weighted_subspace_exposure_is_small(work, settings) || return nothing
+
+    weight_positions = _triangle_positions(rank)
+    try
+        numeric_directions = _to_working_array(F, direction_matrix)
+        particular, nullspace = problem.affine
+        affine_basis = hcat(particular, nullspace)
+        numeric_affine_basis = _to_working_array(F, affine_basis[block.global_positions, :])
+        all(isfinite, numeric_directions) && all(isfinite, numeric_affine_basis) || return nothing
+
+        form_columns = zeros(F, length(block.local_positions), length(weight_positions))
+        for (weight_index, (a, b)) in enumerate(weight_positions)
+            weight_basis = zeros(F, rank, rank)
+            weight_basis[a, b] = one(F)
+            weight_basis[b, a] = one(F)
+            exposed_matrix = numeric_directions * weight_basis * transpose(numeric_directions)
+            for (local_index, (i, j)) in enumerate(block.local_positions)
+                form_columns[local_index, weight_index] =
+                    i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
+            end
+        end
+
+        singular_factor = svd(transpose(numeric_affine_basis) * form_columns)
+        singular_values = singular_factor.S
+        isempty(singular_values) && return nothing
+        scale = max(one(F), maximum(abs, singular_values))
+        rank_tolerance = max(sqrt(eps(F)), F(100) * eps(F)) * scale
+        constraint_rank = count(value -> value > rank_tolerance, singular_values)
+        constraint_rank < length(weight_positions) || return nothing
+        numeric_weight_subspace =
+            transpose(singular_factor.Vt)[:, (constraint_rank + 1):end]
+        identity_target = F[a == b ? one(F) : zero(F) for (a, b) in weight_positions]
+        numeric_coordinates = numeric_weight_subspace \ identity_target
+        all(isfinite, numeric_coordinates) || return nothing
+        numeric_weight_vector = numeric_weight_subspace * numeric_coordinates
+        all(isfinite, numeric_weight_vector) || return nothing
+
+        for tolerance in _facial_reduction_subspace_tolerances(settings, F)
+            weight_matrix = zeros(ExactRational, rank, rank)
+            for (weight_index, (a, b)) in enumerate(weight_positions)
+                value = rationalize(
+                    BigInt,
+                    BigFloat(numeric_weight_vector[weight_index]);
+                    tol = BigFloat(tolerance),
+                )
+                weight_matrix[a, b] = value
+                weight_matrix[b, a] = value
+            end
+            _positive_definite_exact(weight_matrix) || continue
+            exposed_indices, exposed_values =
+                _block_weighted_subspace_form(block, direction_matrix, weight_matrix)
+            _affine_form_violation(problem, exposed_indices, exposed_values) === nothing ||
+                continue
+            return (weight = weight_matrix, tolerance = tolerance)
+        end
+    catch
+        return nothing
+    end
+    return nothing
 end
 
 function _block_weighted_subspace_exposure(
@@ -357,9 +529,11 @@ function _block_weighted_subspace_exposure(
     direction_matrix = hcat(directions...)
     size(direction_matrix, 1) == block.size || return nothing
     rank = size(direction_matrix, 2)
+    work = _weighted_subspace_exposure_work(problem, block, rank)
+    _weighted_subspace_exposure_is_small(work, settings) || return nothing
     weight_positions = _triangle_positions(rank)
     weight_dimension = length(weight_positions)
-    form_columns = zeros(ExactRational, size(problem.A, 2), weight_dimension)
+    form_columns = zeros(ExactRational, length(block.local_positions), weight_dimension)
 
     for (weight_index, (a, b)) in enumerate(weight_positions)
         weight_basis = zeros(ExactRational, rank, rank)
@@ -367,14 +541,15 @@ function _block_weighted_subspace_exposure(
         weight_basis[b, a] = 1 // 1
         exposed_matrix = direction_matrix * weight_basis * transpose(direction_matrix)
         for (local_index, (i, j)) in enumerate(block.local_positions)
-            form_columns[block.global_positions[local_index], weight_index] =
+            form_columns[local_index, weight_index] =
                 i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
         end
     end
 
     particular, nullspace = problem.affine
     affine_basis = hcat(particular, nullspace)
-    vanish_constraints = transpose(affine_basis) * form_columns
+    block_affine_basis = affine_basis[block.global_positions, :]
+    vanish_constraints = transpose(block_affine_basis) * form_columns
     weight_subspace = _nullspace_basis_exact(vanish_constraints)
     size(weight_subspace, 2) == 0 && return nothing
 
@@ -402,15 +577,8 @@ function _block_weighted_subspace_exposure(
         end
         _positive_definite_exact(weight_matrix) || continue
 
-        exposed_matrix = direction_matrix * weight_matrix * transpose(direction_matrix)
-        exposed_indices = Int[]
-        exposed_values = ExactRational[]
-        for (local_index, (i, j)) in enumerate(block.local_positions)
-            value = i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
-            iszero(value) && continue
-            push!(exposed_indices, block.global_positions[local_index])
-            push!(exposed_values, value)
-        end
+        exposed_indices, exposed_values =
+            _block_weighted_subspace_form(block, direction_matrix, weight_matrix)
         _affine_form_violation(problem, exposed_indices, exposed_values) === nothing ||
             continue
         return (weight = weight_matrix, tolerance = tolerance)
@@ -650,21 +818,13 @@ function _certified_pivoted_subspace_directions(
         attempted_tolerances += 1
         proposed_directions += length(candidates)
         _record_directions!(:certified, length(candidates), 0, 0)
-
-        weighted_exposure = _block_weighted_subspace_exposure(
-            problem,
-            block,
-            candidates,
-            opt.settings,
-            F,
-        )
-        if weighted_exposure !== nothing
-            _record_directions!(:certified, 0, length(candidates), 0)
+        if attempted_tolerances == 1 &&
+           !_facial_reduction_row_space_is_small(problem, opt.settings)
+            row_count, variable_count = size(problem.A)
             _log(
                 opt,
-                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
+                "Facial reduction: certifying pivoted $(description) candidates with exact affine tests; skipping dense row-space provenance for large affine system ($(row_count)×$(variable_count))",
             )
-            return candidates
         end
 
         joint_violation = _block_trace_vanish_violation(
@@ -684,22 +844,63 @@ function _certified_pivoted_subspace_directions(
         end
         last_violation = joint_violation
 
-        accepted = Vector{Vector{ExactRational}}()
-        rejected = 0
-        for direction in candidates
-            violation = _block_annihilation_violation(
+        weighted_work = _weighted_subspace_exposure_work(
+            problem,
+            block,
+            length(candidates),
+        )
+        weighted_attempted = false
+        if _weighted_subspace_exposure_is_cheap(weighted_work, opt.settings)
+            _log(
+                opt,
+                "Facial reduction: attempting cheap exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
+            )
+            weighted_attempted = true
+            weighted_exposure = _block_weighted_subspace_exposure(
                 problem,
                 block,
-                direction;
-                cache,
-                block_index,
+                candidates,
+                opt.settings,
+                F,
             )
-            if violation === nothing
-                push!(accepted, direction)
-            else
-                rejected += 1
-                last_violation = violation
+            if weighted_exposure !== nothing
+                _record_directions!(:certified, 0, length(candidates), 0)
+                _log(
+                    opt,
+                    "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
+                )
+                return candidates
             end
+        end
+
+        individual_work = _individual_subspace_certificate_work(
+            problem,
+            block,
+            length(candidates),
+        )
+        accepted = Vector{Vector{ExactRational}}()
+        rejected = 0
+        if _individual_subspace_certificate_is_small(individual_work, opt.settings)
+            for direction in candidates
+                violation = _block_annihilation_violation(
+                    problem,
+                    block,
+                    direction;
+                    cache,
+                    block_index,
+                )
+                if violation === nothing
+                    push!(accepted, direction)
+                else
+                    rejected += 1
+                    last_violation = violation
+                end
+            end
+        else
+            _log(
+                opt,
+                "Facial reduction: skipping individual direction certificates for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(individual_work.affine_dimension), affine_products=$(individual_work.affine_products); limit affine_products=$(opt.settings.facial_reduction_individual_max_affine_products))",
+            )
         end
         _record_directions!(:certified, 0, length(accepted), rejected)
 
@@ -710,6 +911,62 @@ function _certified_pivoted_subspace_directions(
                 "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s); relation_tol=$(_format_metric(tolerance)))",
             )
             return accepted
+        end
+
+        if _numeric_weighted_subspace_exposure_is_small(weighted_work, opt.settings)
+            _log(
+                opt,
+                "Facial reduction: attempting numerical weighted scout for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
+            )
+            numeric_weighted_exposure = _numeric_weighted_subspace_exposure(
+                problem,
+                block,
+                candidates,
+                opt.settings,
+                F,
+            )
+            if numeric_weighted_exposure !== nothing
+                _record_directions!(:certified, 0, length(candidates), 0)
+                _log(
+                    opt,
+                    "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (numerical-to-exact weighted PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(numeric_weighted_exposure.tolerance)))",
+                )
+                return candidates
+            end
+        else
+            _log(
+                opt,
+                "Facial reduction: skipping numerical weighted scout for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products); limits form_entries=$(opt.settings.facial_reduction_numeric_weighted_subspace_max_form_entries), affine_products=$(opt.settings.facial_reduction_numeric_weighted_subspace_max_affine_products))",
+            )
+        end
+
+        if !weighted_attempted
+            if _weighted_subspace_exposure_is_small(weighted_work, opt.settings)
+                _log(
+                    opt,
+                    "Facial reduction: attempting exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
+                )
+                weighted_exposure = _block_weighted_subspace_exposure(
+                    problem,
+                    block,
+                    candidates,
+                    opt.settings,
+                    F,
+                )
+                if weighted_exposure !== nothing
+                    _record_directions!(:certified, 0, length(candidates), 0)
+                    _log(
+                        opt,
+                        "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
+                    )
+                    return candidates
+                end
+            else
+                _log(
+                    opt,
+                    "Facial reduction: skipping exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products); limits form_entries=$(opt.settings.facial_reduction_weighted_subspace_max_form_entries), affine_products=$(opt.settings.facial_reduction_weighted_subspace_max_affine_products))",
+                )
+            end
         end
     end
 
@@ -986,26 +1243,40 @@ end
 function _tentative_batch_problem(
     problem::ProblemData,
     candidates::Vector{<:_TentativeFaceDirection},
+    ;
+    checkpoint::Union{Nothing,Function} = nothing,
+    settings::Settings = Settings(),
 )
+    checkpoint !== nothing && checkpoint("constructing per-block keep bases")
     keep_bases = _tentative_candidate_keep_bases(problem, candidates)
     isempty(keep_bases) && return problem
+    removed_dimensions = sum(
+        problem.blocks[block_index].size - size(keep_basis, 2) for
+        (block_index, keep_basis) in keep_bases
+    )
+    checkpoint !== nothing && checkpoint(
+        "applying tentative face across $(length(keep_bases)) PSD block(s), removing $(removed_dimensions) PSD dimension(s)",
+    )
     return _apply_facial_reduction(
         problem,
         Int[],
         keep_bases;
         certified = false,
+        checkpoint,
+        settings,
     )
 end
 
 function _tentative_greedy_admission(
     problem::ProblemData,
     candidates::Vector{_TentativeFaceDirection{F}},
+    settings::Settings = Settings(),
 ) where {F<:AbstractFloat}
     accepted_candidates = _TentativeFaceDirection{F}[]
     consistent_problem = nothing
     for candidate_item in candidates
         trial_candidates = vcat(accepted_candidates, [candidate_item])
-        trial_problem = _tentative_batch_problem(problem, trial_candidates)
+        trial_problem = _tentative_batch_problem(problem, trial_candidates; settings)
         if trial_problem.affine === nothing
             continue
         end
@@ -1086,18 +1357,48 @@ function _tentative_feasibility_search_problem(
 
     # Prefer the complete batch. It is formed from the original problem so a
     # failed batch never mutates the problem that will be retried.
-    batch_problem = _tentative_batch_problem(problem, unique_candidates)
+    block_count = length(Set(candidate_item.block_index for candidate_item in unique_candidates))
+    _log(
+        opt,
+        "Feasibility search: preparing tentative batch of $(length(unique_candidates)) PSD direction(s) across $(block_count) block(s)",
+    )
+    tentative_checkpoint = stage -> _log(opt, "Feasibility search: tentative batch: $(stage)")
+    batch_problem = _tentative_batch_problem(
+        problem,
+        unique_candidates;
+        checkpoint = tentative_checkpoint,
+        settings = opt.settings,
+    )
     if batch_problem.affine !== nothing
         fallback_problem = nothing
         if length(unique_candidates) > 1
+            _log(
+                opt,
+                "Feasibility search: building optional conservative one-direction fallback",
+            )
+            conservative_checkpoint = stage -> _log(
+                opt,
+                "Feasibility search: conservative fallback: $(stage)",
+            )
             conservative_problem = _tentative_batch_problem(
                 problem,
                 unique_candidates[1:1],
+                checkpoint = conservative_checkpoint,
+                settings = opt.settings,
             )
             if conservative_problem.affine !== nothing &&
                _barrier_dimension(conservative_problem) >
                _barrier_dimension(batch_problem)
                 fallback_problem = conservative_problem
+                _log(
+                    opt,
+                    "Feasibility search: retained the conservative one-direction fallback",
+                )
+            else
+                _log(
+                    opt,
+                    "Feasibility search: discarded the conservative one-direction fallback",
+                )
             end
         end
         _record_directions!(
@@ -1108,16 +1409,21 @@ function _tentative_feasibility_search_problem(
         )
         _log(
             opt,
-            "Feasibility search: tentatively batched $(length(unique_candidates)) PSD direction(s) across $(length(Set(candidate_item.block_index for candidate_item in unique_candidates))) block(s); any recovered point will be checked exactly against the unreduced SDP",
+            "Feasibility search: tentatively batched $(length(unique_candidates)) PSD direction(s) across $(block_count) block(s); any recovered point will be checked exactly against the unreduced SDP",
         )
         return _tentative_search_result(batch_problem, fallback_problem, return_details)
     end
 
     # Deterministic rollback: admit candidates one at a time, always
     # recomputing the combined face from the original problem.
+    _log(
+        opt,
+        "Feasibility search: tentative batch was inconsistent; trying greedy admission",
+    )
     consistent_problem, accepted_candidates = _tentative_greedy_admission(
         problem,
         unique_candidates,
+        opt.settings,
     )
 
     accepted_count = length(accepted_candidates)
@@ -1869,6 +2175,7 @@ function _cached_keep_basis_violation(
     problem::ProblemData,
     block_index::Int,
     keep_basis::Matrix{ExactRational},
+    settings::Settings = Settings(),
 )
     1 <= block_index <= length(problem.blocks) ||
         return "PSD block $(block_index) does not exist"
@@ -1889,7 +2196,7 @@ function _cached_keep_basis_violation(
         problem,
         block,
         directions,
-        Settings(),
+        settings,
         Float64,
     )
     weighted_exposure === nothing || return nothing
@@ -1924,6 +2231,7 @@ end
 function _cached_facial_reduction_violation(
     problem::ProblemData,
     reduction::_CertifiedFacialReduction,
+    settings::Settings = Settings(),
 )
     if isempty(reduction.exposed_scalars) && isempty(reduction.keep_bases)
         return "cached reduction has no exposed scalar or PSD face"
@@ -1937,6 +2245,7 @@ function _cached_facial_reduction_violation(
             problem,
             block_index,
             reduction.keep_bases[block_index],
+            settings,
         )
         violation === nothing || return violation
     end
@@ -1972,7 +2281,7 @@ function _apply_loaded_facial_reductions(
             continue
         end
 
-        violation = _cached_facial_reduction_violation(current, reduction)
+        violation = _cached_facial_reduction_violation(current, reduction, opt.settings)
         if violation !== nothing
             _log(opt, "Facial reduction: cached face did not validate ($(violation))")
             continue
@@ -1987,6 +2296,7 @@ function _apply_loaded_facial_reductions(
             # for this application.  Re-validating inside _apply_facial_reduction
             # duplicates the expensive exact row-space/PSD checks.
             certified = false,
+            settings = opt.settings,
         )
         if reduced_problem.affine === nothing
             _log(
@@ -2336,6 +2646,14 @@ function _facial_reduction_block_directions(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     block = problem.blocks[block_index]
+    exact_directions = _exact_block_nullspace_directions(
+        problem,
+        block;
+        cache,
+        block_index,
+    )
+    isempty(exact_directions) || return exact_directions
+
     symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
     eigen_factor = _facial_reduction_eigen(opt, symmetric_matrix)
     eigenvalues = eigen_factor.values
@@ -2551,7 +2869,8 @@ function _merge_certified_facial_reductions(
         exposed_scalars,
         keep_bases,
     )
-    _cached_facial_reduction_violation(problem, merged) === nothing || return nothing
+    _cached_facial_reduction_violation(problem, merged, opt.settings) === nothing ||
+        return nothing
     return merged
 end
 
@@ -2588,6 +2907,7 @@ function _sieve_facial_reduction_problem(
             # _merge_certified_facial_reductions already validated the merged
             # certificate against the current affine slice.
             certified = false,
+            settings = opt.settings,
         )
         reduced.affine === nothing && break
         old_dimension = _barrier_dimension(current)
@@ -2610,23 +2930,22 @@ function _face_reduction_rows(
     block::BlockStructure,
     keep_basis::Matrix{ExactRational},
     reduced_block::Union{Nothing,BlockStructure},
-    total_dimension::Int,
 )
-    rows = Vector{Vector{ExactRational}}()
+    indices = Vector{Vector{Int}}()
+    values = Vector{Vector{ExactRational}}()
     rhs = ExactRational[]
     if reduced_block === nothing
         for position in block.global_positions
-            row = zeros(ExactRational, total_dimension)
-            row[position] = 1 // 1
-            push!(rows, row)
+            push!(indices, [position])
+            push!(values, ExactRational[1 // 1])
             push!(rhs, 0 // 1)
         end
-        return rows, rhs
+        return _SparseAffineRestrictions(indices, values), rhs
     end
 
     for (old_local_index, (i, j)) in enumerate(block.local_positions)
-        row = zeros(ExactRational, total_dimension)
-        row[block.global_positions[old_local_index]] = 1 // 1
+        row_indices = Int[block.global_positions[old_local_index]]
+        row_values = ExactRational[1 // 1]
         for (new_local_index, (a, b)) in enumerate(reduced_block.local_positions)
             coefficient = if a == b
                 keep_basis[i, a] * keep_basis[j, a]
@@ -2634,13 +2953,15 @@ function _face_reduction_rows(
                 keep_basis[i, a] * keep_basis[j, b] + keep_basis[i, b] * keep_basis[j, a]
             end
             iszero(coefficient) && continue
-            row[reduced_block.global_positions[new_local_index]] -= coefficient
+            push!(row_indices, reduced_block.global_positions[new_local_index])
+            push!(row_values, -coefficient)
         end
-        push!(rows, row)
+        push!(indices, row_indices)
+        push!(values, row_values)
         push!(rhs, 0 // 1)
     end
 
-    return rows, rhs
+    return _SparseAffineRestrictions(indices, values), rhs
 end
 
 function _facial_reduction_oracle_round(
@@ -2796,11 +3117,14 @@ function _apply_facial_reduction(
     keep_bases::Dict{Int,Matrix{ExactRational}},
     ;
     certified::Bool = false,
+    checkpoint::Union{Nothing,Function} = nothing,
+    settings::Settings = Settings(),
 )
     if certified
         violation = _cached_facial_reduction_violation(
             problem,
             _CertifiedFacialReduction("in-memory", exposed_scalars, keep_bases),
+            settings,
         )
         violation === nothing ||
             error("Certified facial reduction failed exact preservation checks: $(violation)")
@@ -2842,44 +3166,52 @@ function _apply_facial_reduction(
     end
 
     total_dimension = next_position - 1
+    checkpoint !== nothing && checkpoint(
+        "face application: rebuilding $(length(problem.blocks)) PSD block(s) in $(total_dimension) variables",
+    )
     A = zeros(ExactRational, size(problem.A, 1), total_dimension)
     if !isempty(problem.A)
         A[:, 1:size(problem.A, 2)] = problem.A
     end
     b = copy(problem.b)
-    extra_rows = Vector{Vector{ExactRational}}()
+    extra_row_indices = Vector{Vector{Int}}()
+    extra_row_values = Vector{Vector{ExactRational}}()
     extra_rhs = ExactRational[]
 
     for position in unique(sort(exposed_scalars))
-        row = zeros(ExactRational, total_dimension)
-        row[position] = 1 // 1
-        push!(extra_rows, row)
+        push!(extra_row_indices, [position])
+        push!(extra_row_values, ExactRational[1 // 1])
         push!(extra_rhs, 0 // 1)
-
     end
 
     for (block_index, block) in enumerate(problem.blocks)
         keep_basis = get(keep_bases, block_index, nothing)
         keep_basis === nothing && continue
-        rows, rhs = _face_reduction_rows(
+        restrictions, rhs = _face_reduction_rows(
             block,
             keep_basis,
             get(block_replacements, block_index, nothing),
-            total_dimension,
         )
-        append!(extra_rows, rows)
+        append!(extra_row_indices, restrictions.indices)
+        append!(extra_row_values, restrictions.values)
         append!(extra_rhs, rhs)
     end
+    extra_restrictions = _SparseAffineRestrictions(extra_row_indices, extra_row_values)
 
-    if !isempty(extra_rows)
-        A_augmented = zeros(ExactRational, size(A, 1) + length(extra_rows), total_dimension)
+    if !isempty(extra_rhs)
+        A_augmented = zeros(ExactRational, size(A, 1) + length(extra_rhs), total_dimension)
         b_augmented = zeros(ExactRational, length(b) + length(extra_rhs))
         if size(A, 1) > 0
             A_augmented[1:size(A, 1), :] = A
             b_augmented[1:length(b)] = b
         end
-        for (offset, row) in enumerate(extra_rows)
-            A_augmented[size(A, 1) + offset, :] = row
+        for offset in eachindex(extra_rhs)
+            for (position, value) in zip(
+                extra_restrictions.indices[offset],
+                extra_restrictions.values[offset],
+            )
+                A_augmented[size(A, 1) + offset, position] = value
+            end
             b_augmented[length(b) + offset] = extra_rhs[offset]
         end
         A = A_augmented
@@ -2889,16 +3221,16 @@ function _apply_facial_reduction(
     positive_scalars = [index for index in problem.positive_scalars if !(index in exposed_scalars)]
     objective_extension = zeros(ExactRational, total_dimension - old_dimension)
 
-    restriction_matrix = if isempty(extra_rows)
-        zeros(ExactRational, 0, total_dimension)
-    else
-        reduce(vcat, (reshape(row, 1, :) for row in extra_rows))
-    end
+    checkpoint !== nothing && checkpoint(
+        "face application: restricting affine parametrization with $(length(extra_rhs)) exact face equation(s)",
+    )
     affine = _extend_and_restrict_affine_system(
         problem.affine,
         total_dimension - old_dimension,
-        restriction_matrix,
+        extra_restrictions,
         extra_rhs,
+        checkpoint = checkpoint,
+        settings = settings,
     )
     old_particular, old_nullspace = problem.affine === nothing ?
         (ExactRational[], zeros(ExactRational, 0, 0)) : problem.affine
@@ -2912,15 +3244,19 @@ function _apply_facial_reduction(
     incremental_valid = affine_representation_complete && affine !== nothing
     if !incremental_valid
         @debug "Facial reduction incremental affine restriction failed; falling back to full exact elimination"
-        affine = _solve_affine_system(A, b)
+        checkpoint !== nothing && checkpoint("face application: incremental restriction unavailable; solving full exact affine system")
+        affine = _solve_affine_system(A, b; checkpoint = checkpoint)
     end
     if size(A, 1) > _FACIAL_REDUCTION_AFFINE_COMPACTION_FACTOR * max(1, size(problem.A, 1))
-        compacted = _independent_affine_equalities(A, b)
+        checkpoint !== nothing && checkpoint("face application: compacting redundant affine equations")
+        compacted = _independent_affine_equalities(A, b; checkpoint = checkpoint)
         if compacted !== nothing
             A, b = compacted
-            affine = _solve_affine_system(A, b)
+            checkpoint !== nothing && checkpoint("face application: solving compacted exact affine system")
+            affine = _solve_affine_system(A, b; checkpoint = checkpoint)
         end
     end
+    checkpoint !== nothing && checkpoint("face application: pruning forced cone faces")
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
     blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
     reduced_problem = ProblemData(
@@ -2940,6 +3276,7 @@ function _apply_facial_reduction(
     new_barrier_dimension = _barrier_dimension(reduced_problem)
     new_barrier_dimension < old_barrier_dimension ||
         error("Facial reduction was applied without decreasing barrier dimension.")
+    checkpoint !== nothing && checkpoint("face application: completed")
     return reduced_problem
 end
 
@@ -3062,6 +3399,7 @@ function _facially_reduce_problem(
         exposed_scalars,
         keep_bases;
         certified = false,
+        settings = opt.settings,
     )
     if reduced_problem.affine === nothing
         message =
@@ -3107,6 +3445,7 @@ function _facially_reduce_search_problem(
             reduction.keep_bases,
             ;
             certified = false,
+            settings = opt.settings,
         )
         if reduced_problem.affine === nothing
             message =

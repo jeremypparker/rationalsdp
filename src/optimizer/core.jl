@@ -235,6 +235,19 @@ Base.@kwdef mutable struct Settings
     facial_reduction_irrational_behavior::Symbol = :error
     facial_reduction_save_file::String = ""
     facial_reduction_load_file::String = ""
+    # Work limits for optional facial-reduction certificates, numerical
+    # scouts, and redundant validation. Zero disables the corresponding
+    # calculation without disabling facial reduction itself.
+    facial_reduction_row_space_max_entries::Int = 250_000
+    facial_reduction_weighted_subspace_max_form_entries::Int = 250_000
+    facial_reduction_weighted_subspace_max_affine_products::Int = 5_000_000
+    facial_reduction_cheap_weighted_subspace_max_weight_dimension::Int = 6
+    facial_reduction_cheap_weighted_subspace_max_form_entries::Int = 25_000
+    facial_reduction_cheap_weighted_subspace_max_affine_products::Int = 500_000
+    facial_reduction_numeric_weighted_subspace_max_form_entries::Int = 1_000_000
+    facial_reduction_numeric_weighted_subspace_max_affine_products::Int = 25_000_000
+    facial_reduction_individual_max_affine_products::Int = 5_000_000
+    facial_reduction_sparse_affine_validation_max_products::Int = 5_000_000
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
     gradient_tolerance::BigFloat = big"1e-24"
@@ -876,6 +889,22 @@ function _validate_settings(settings::Settings)
         throw(ArgumentError("facial_reduction_max_rounds must be nonnegative."))
     settings.facial_reduction_rank_expansion_rounds >= 0 ||
         throw(ArgumentError("facial_reduction_rank_expansion_rounds must be nonnegative."))
+    facial_reduction_work_limits = (
+        :facial_reduction_row_space_max_entries,
+        :facial_reduction_weighted_subspace_max_form_entries,
+        :facial_reduction_weighted_subspace_max_affine_products,
+        :facial_reduction_cheap_weighted_subspace_max_weight_dimension,
+        :facial_reduction_cheap_weighted_subspace_max_form_entries,
+        :facial_reduction_cheap_weighted_subspace_max_affine_products,
+        :facial_reduction_numeric_weighted_subspace_max_form_entries,
+        :facial_reduction_numeric_weighted_subspace_max_affine_products,
+        :facial_reduction_individual_max_affine_products,
+        :facial_reduction_sparse_affine_validation_max_products,
+    )
+    for name in facial_reduction_work_limits
+        getfield(settings, name) >= 0 ||
+            throw(ArgumentError("$(name) must be nonnegative."))
+    end
     settings.phase1_exact_recovery_pivot_log_frequency >= 0 ||
         throw(ArgumentError("phase1_exact_recovery_pivot_log_frequency must be nonnegative."))
     settings.exact_refinement_bisections >= 0 ||

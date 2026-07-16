@@ -252,6 +252,16 @@ The full set of optimizer attributes is:
 - `facial_reduction_irrational_behavior`
 - `facial_reduction_save_file`
 - `facial_reduction_load_file`
+- `facial_reduction_row_space_max_entries`
+- `facial_reduction_weighted_subspace_max_form_entries`
+- `facial_reduction_weighted_subspace_max_affine_products`
+- `facial_reduction_cheap_weighted_subspace_max_weight_dimension`
+- `facial_reduction_cheap_weighted_subspace_max_form_entries`
+- `facial_reduction_cheap_weighted_subspace_max_affine_products`
+- `facial_reduction_numeric_weighted_subspace_max_form_entries`
+- `facial_reduction_numeric_weighted_subspace_max_affine_products`
+- `facial_reduction_individual_max_affine_products`
+- `facial_reduction_sparse_affine_validation_max_products`
 - `feasibility_tolerance`
 - `optimality_gap_tolerance`
 - `gradient_tolerance`
@@ -281,6 +291,26 @@ The full set of optimizer attributes is:
 - `gc_log`
 - `quasiconvex_bisection_iterations`
 - `quasiconvex_skip_facial_reduction_after_clean_endpoint`
+
+The facial-reduction work limits bound optional certificate, scouting, and
+validation calculations whose matrices can become large. They do not relax any
+exact check that is needed for correctness: when a limit is exceeded, the
+solver skips that optional route and continues with the other facial-reduction
+routes. Each limit is a nonnegative integer, and setting one to `0` disables
+the corresponding calculation.
+
+| Attribute | Default | Work estimate bounded |
+| --- | ---: | --- |
+| `facial_reduction_row_space_max_entries` | `250_000` | Entries in the augmented affine row-space matrix used to recover optional provenance multipliers. |
+| `facial_reduction_weighted_subspace_max_form_entries` | `250_000` | Entries in an exact weighted-subspace exposing-form matrix. |
+| `facial_reduction_weighted_subspace_max_affine_products` | `5_000_000` | Exact products needed to test that weighted exposing form on the affine parametrization. |
+| `facial_reduction_cheap_weighted_subspace_max_weight_dimension` | `6` | Independent symmetric weights allowed in the early “cheap” exact attempt. |
+| `facial_reduction_cheap_weighted_subspace_max_form_entries` | `25_000` | Form entries allowed in the early “cheap” exact attempt. |
+| `facial_reduction_cheap_weighted_subspace_max_affine_products` | `500_000` | Affine products allowed in the early “cheap” exact attempt. |
+| `facial_reduction_numeric_weighted_subspace_max_form_entries` | `1_000_000` | Entries in the numerical weighted-subspace scout's form matrix. |
+| `facial_reduction_numeric_weighted_subspace_max_affine_products` | `25_000_000` | Floating-point products estimated for that numerical scout. |
+| `facial_reduction_individual_max_affine_products` | `5_000_000` | Exact products estimated when certifying proposed kernel directions individually. |
+| `facial_reduction_sparse_affine_validation_max_products` | `5_000_000` | Exact products in the redundant post-solve validation of a sparse face restriction. |
 
 Facial-reduction caches can be used to reuse exact faces across related
 instances:
@@ -367,6 +397,18 @@ Slow regression tests:
 
 ```julia
 julia --project=test test/runslowtests.jl
+```
+
+The opt-in extra-slow regressions include the end-to-end `n=2` SAIRS model:
+
+```sh
+RATIONALSDP_EXTRA_SLOW_TESTS=1 julia --project=test test/runslowtests.jl
+```
+
+In PowerShell:
+
+```powershell
+$env:RATIONALSDP_EXTRA_SLOW_TESTS = "1"; julia --project=test test/runslowtests.jl
 ```
 
 Package test entry point:

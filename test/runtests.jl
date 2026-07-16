@@ -33,6 +33,17 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "working_float_type", "BigFloat")
         set_optimizer_attribute(model, "facial_reduction_save_file", "fr-cache.bin")
         set_optimizer_attribute(model, "facial_reduction_load_file", "fr-cache.bin")
+        set_optimizer_attribute(model, "facial_reduction_row_space_max_entries", "1234")
+        set_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_subspace_max_affine_products",
+            5678,
+        )
+        set_optimizer_attribute(
+            model,
+            "facial_reduction_sparse_affine_validation_max_products",
+            9012,
+        )
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
@@ -59,6 +70,15 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "facial_reduction_save_file") == "fr-cache.bin"
         @test get_optimizer_attribute(model, "facial_reduction_load_file") == "fr-cache.bin"
         @test get_optimizer_attribute(model, "facial_reduction_rank_expansion_rounds") == 0
+        @test get_optimizer_attribute(model, "facial_reduction_row_space_max_entries") == 1234
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_subspace_max_affine_products",
+        ) == 5678
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_sparse_affine_validation_max_products",
+        ) == 9012
     end
 
     @testset "Working float type selection" begin
@@ -277,6 +297,23 @@ include("slowtest_helpers.jl")
         error_large = maximum(abs, C_large - expected_large)
         scale_large = max(one(T), maximum(abs, expected_large))
         @test error_large <= T(100) * eps(T) * scale_large
+
+        if Threads.nthreads() > 1
+            # The internal threaded loops must remain usable when mul! itself
+            # is called from an already-threaded region.
+            n_nested = 32
+            A_nested = fill(T(1), n_nested, n_nested)
+            B_nested = fill(T(2), n_nested, n_nested)
+            results = Vector{Tuple{T,T}}(undef, min(Threads.nthreads(), 4))
+            Threads.@threads :dynamic for index in eachindex(results)
+                C_nested = zeros(T, n_nested, n_nested)
+                LinearAlgebra.mul!(C_nested, A_nested, B_nested, true, false)
+                C_scaled = fill(T(3), n_nested, n_nested)
+                LinearAlgebra.mul!(C_scaled, A_nested, B_nested, false, T(2))
+                results[index] = (C_nested[1, 1], C_scaled[1, 1])
+            end
+            @test all(result == (T(2 * n_nested), T(6)) for result in results)
+        end
     end
 
     @testset "Hypatia centering warning filter" begin
@@ -336,6 +373,9 @@ include("slowtest_helpers.jl")
         )
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(phase2_outer_iterations = 0),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_row_space_max_entries = -1),
         )
         @test RationalSDP._validate_settings(RationalSDP.Settings()) === nothing
     end
@@ -460,8 +500,16 @@ include("slowtest_helpers.jl")
             1//1 0//1 1//1
         ]
         b = Rational{BigInt}[3//1, 5//1]
-        affine = RationalSDP._solve_affine_system(A, b)
+        solver_checkpoints = String[]
+        affine = RationalSDP._solve_affine_system(
+            A,
+            b;
+            checkpoint = stage -> push!(solver_checkpoints, stage),
+        )
         @test affine !== nothing
+        @test any(stage -> occursin("building dense", stage), solver_checkpoints)
+        @test any(stage -> occursin("computing exact RREF", stage), solver_checkpoints)
+        @test any(stage -> occursin("interpreting exact RREF", stage), solver_checkpoints)
         particular, nullspace = affine
         @test A * particular == b
         @test A * nullspace == zeros(Rational{BigInt}, size(A, 1), size(nullspace, 2))
@@ -972,6 +1020,17 @@ include("slowtest_helpers.jl")
         @test norm(
             (I - Float64.(exact_projector)) * Float64.(hcat(weighted_certified...)),
         ) < 1.0e-10
+        exact_weight_directions = [
+            collect(view(exposing_range, :, column)) for column in axes(exposing_range, 2)
+        ]
+        numeric_weighted = RationalSDP._numeric_weighted_subspace_exposure(
+            exposing_problem,
+            block,
+            exact_weight_directions,
+            RationalSDP.Settings(),
+            Float64,
+        )
+        @test numeric_weighted !== nothing
         weighted_keep_basis = RationalSDP._orthogonal_complement_basis(
             weighted_certified,
             block.size,
@@ -984,6 +1043,71 @@ include("slowtest_helpers.jl")
         @test RationalSDP._cached_facial_reduction_violation(
             exposing_problem,
             weighted_reduction,
+        ) === nothing
+
+        # The weighted joint certificate is useful for small subspaces, but
+        # must not materialize an enormous exact affine product merely to
+        # decide whether such a certificate exists.
+        oversized_weight_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 10),
+            0//1,
+            zeros(Rational{BigInt}, 10),
+            zeros(Rational{BigInt}, 0, 10),
+            Rational{BigInt}[],
+            (
+                zeros(Rational{BigInt}, 10),
+                zeros(Rational{BigInt}, 10, 70_000),
+            ),
+        )
+        oversized_weight_directions = [
+            Rational{BigInt}[i == j ? 1//1 : 0//1 for i in 1:block.size] for
+            j in 1:block.size
+        ]
+        oversized_weight_work = RationalSDP._weighted_subspace_exposure_work(
+            oversized_weight_problem,
+            block,
+            length(oversized_weight_directions),
+        )
+        default_settings = RationalSDP.Settings()
+        @test oversized_weight_work.affine_products >
+              default_settings.facial_reduction_weighted_subspace_max_affine_products
+        @test !RationalSDP._weighted_subspace_exposure_is_small(
+            oversized_weight_work,
+            default_settings,
+        )
+        oversized_individual_work = RationalSDP._individual_subspace_certificate_work(
+            oversized_weight_problem,
+            block,
+            length(oversized_weight_directions),
+        )
+        @test oversized_individual_work.affine_products >
+              default_settings.facial_reduction_individual_max_affine_products
+        @test !RationalSDP._individual_subspace_certificate_is_small(
+            oversized_individual_work,
+            default_settings,
+        )
+        permissive_settings = RationalSDP.Settings(
+            facial_reduction_weighted_subspace_max_form_entries = typemax(Int),
+            facial_reduction_weighted_subspace_max_affine_products = typemax(Int),
+            facial_reduction_individual_max_affine_products = typemax(Int),
+        )
+        @test RationalSDP._weighted_subspace_exposure_is_small(
+            oversized_weight_work,
+            permissive_settings,
+        )
+        @test RationalSDP._individual_subspace_certificate_is_small(
+            oversized_individual_work,
+            permissive_settings,
+        )
+        @test RationalSDP._block_weighted_subspace_exposure(
+            oversized_weight_problem,
+            block,
+            oversized_weight_directions,
+            RationalSDP.Settings(),
+            Float64,
         ) === nothing
 
         directions = [
@@ -1277,6 +1401,53 @@ include("slowtest_helpers.jl")
             Rational{BigInt}[1//1, 0//1],
             Rational{BigInt}[0//1, 1//1],
         ]
+
+        # Exact affine vanishing is already a complete certificate that an
+        # exposing form belongs to the affine row space.  On large instances,
+        # avoid constructing the dense exact row-space RREF just to recover an
+        # optional multiplier.
+        large_dimension = 600
+        large_block = RationalSDP.BlockStructure(
+            1,
+            Union{Nothing,MOI.VariableIndex}[nothing],
+            [1],
+            [(1, 1)],
+            [1],
+        )
+        large_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [large_block],
+            Int[],
+            zeros(Rational{BigInt}, large_dimension),
+            0//1,
+            zeros(Rational{BigInt}, large_dimension),
+            Matrix{Rational{BigInt}}(I, large_dimension, large_dimension),
+            zeros(Rational{BigInt}, large_dimension),
+            (
+                zeros(Rational{BigInt}, large_dimension),
+                zeros(Rational{BigInt}, large_dimension, 0),
+            ),
+        )
+        large_cache = RationalSDP._FacialReductionExactCache(large_problem)
+        @test !RationalSDP._facial_reduction_row_space_is_small(large_problem)
+        @test RationalSDP._facial_reduction_row_space_is_small(
+            large_problem,
+            RationalSDP.Settings(facial_reduction_row_space_max_entries = 400_000),
+        )
+        @test RationalSDP._block_trace_vanish_violation(
+            large_problem,
+            large_block,
+            [Rational{BigInt}[1//1]];
+            cache = large_cache,
+            block_index = 1,
+        ) === nothing
+        @test large_cache.row_space === nothing
+        @test RationalSDP._row_space_multiplier(
+            large_problem,
+            [1],
+            Rational{BigInt}[1//1];
+            cache = large_cache,
+        ) === nothing
 
         uncertified_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
@@ -1954,6 +2125,30 @@ include("slowtest_helpers.jl")
             end
         end
 
+        # The selected row-space basis need not be symmetric.  Its cached
+        # inverse solves square * coefficients = rhs_selected.
+        A_nonsymmetric = Rational{BigInt}[
+            1 2
+            0 1
+        ]
+        b_nonsymmetric = Rational{BigInt}[0, 0]
+        nonsymmetric_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            RationalSDP.BlockStructure[],
+            Int[],
+            zeros(Rational{BigInt}, 2),
+            0 // 1,
+            zeros(Rational{BigInt}, 2),
+            A_nonsymmetric,
+            b_nonsymmetric,
+            RationalSDP._solve_affine_system(A_nonsymmetric, b_nonsymmetric),
+        )
+        @test RationalSDP._row_space_multiplier(
+            nonsymmetric_problem,
+            [1, 2],
+            Rational{BigInt}[1, 2],
+        ) == Rational{BigInt}[1, 0]
+
         empty_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
             RationalSDP.BlockStructure[],
@@ -1987,18 +2182,75 @@ include("slowtest_helpers.jl")
             0 1 0 0 0 0
         ]
         restriction_rhs = Rational{BigInt}[0, 0, 1]
+        restriction_checkpoints = String[]
         incremental = RationalSDP._extend_and_restrict_affine_system(
             affine0,
             2,
             restrictions,
             restriction_rhs,
+            checkpoint = stage -> push!(restriction_checkpoints, stage),
         )
         @test incremental !== nothing
+        @test any(stage -> occursin("forming dense", stage), restriction_checkpoints)
+        @test any(
+            stage -> occursin("validating restricted affine basis", stage),
+            restriction_checkpoints,
+        )
         p_inc, N_inc = incremental
         p_ext = vcat(affine0[1], zeros(Rational{BigInt}, 2))
         N_ext = zeros(Rational{BigInt}, 6, size(affine0[2], 2) + 2)
         N_ext[1:4, 1:size(affine0[2], 2)] = affine0[2]
         N_ext[5:6, size(affine0[2], 2) + 1:end] = Matrix{Rational{BigInt}}(I, 2, 2)
+        sparse_indices = [
+            [column for column in axes(restrictions, 2) if !iszero(restrictions[row, column])]
+            for row in axes(restrictions, 1)
+        ]
+        sparse_values = [
+            Rational{BigInt}[restrictions[row, column] for column in row_indices] for
+            (row, row_indices) in enumerate(sparse_indices)
+        ]
+        sparse_restrictions = RationalSDP._SparseAffineRestrictions(
+            sparse_indices,
+            sparse_values,
+        )
+        sparse_coordinate_rows, sparse_coordinate_rhs =
+            RationalSDP._sparse_coordinate_restriction_system(
+                affine0,
+                2,
+                sparse_restrictions,
+                restriction_rhs,
+            )
+        @test sparse_coordinate_rows == restrictions * N_ext
+        @test sparse_coordinate_rhs == restriction_rhs - restrictions * p_ext
+        sparse_checkpoints = String[]
+        sparse_incremental = RationalSDP._extend_and_restrict_affine_system(
+            affine0,
+            2,
+            sparse_restrictions,
+            restriction_rhs,
+            checkpoint = stage -> push!(sparse_checkpoints, stage),
+        )
+        @test sparse_incremental !== nothing
+        @test any(stage -> occursin("block-sparse", stage), sparse_checkpoints)
+        @test sparse_incremental[1] == p_inc
+        @test sparse_incremental[2] == N_inc
+        skipped_validation_checkpoints = String[]
+        sparse_without_redundant_validation =
+            RationalSDP._extend_and_restrict_affine_system(
+                affine0,
+                2,
+                sparse_restrictions,
+                restriction_rhs;
+                checkpoint = stage -> push!(skipped_validation_checkpoints, stage),
+                settings = RationalSDP.Settings(
+                    facial_reduction_sparse_affine_validation_max_products = 0,
+                ),
+            )
+        @test sparse_without_redundant_validation == sparse_incremental
+        @test any(
+            stage -> occursin("skipping redundant sparse validation", stage),
+            skipped_validation_checkpoints,
+        )
         full = RationalSDP._solve_affine_system(
             restrictions * N_ext,
             restriction_rhs - restrictions * p_ext,

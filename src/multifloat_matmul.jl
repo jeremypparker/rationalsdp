@@ -76,7 +76,7 @@ function _multifloat_matmul_kernel!(
 ) where {T<:MultiFloat}
     if threaded
         output_indices = CartesianIndices(C)
-        @threads :static for linear_index in eachindex(C)
+        @threads :dynamic for linear_index in eachindex(C)
             @inbounds begin
                 I = output_indices[linear_index]
                 _multifloat_matmul_entry!(C, A, B, I[1], I[2], α, β, beta_mode)
@@ -97,7 +97,7 @@ function _multifloat_scale!(C::StridedMatrix{T}, β::T, threaded::Bool) where {T
         fill!(C, zero(T))
     elseif β != one(T)
         if threaded
-            @threads :static for linear_index in eachindex(C)
+            @threads :dynamic for linear_index in eachindex(C)
                 C[linear_index] *= β
             end
         else

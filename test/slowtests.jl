@@ -163,6 +163,40 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         test_exact_extracted_sdp(model)
     end
 
+    @testset "SIR double-Hopf Lyapunov SOS feasibility" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64x2")
+        set_optimizer_attribute(model, "working_float_type", "Float64x2")
+        set_optimizer_attribute(model, "facial_reduction_float_type", "Float64x4")
+        set_optimizer_attribute(model, "facial_reduction_sieve_transform_max_entries", 500_000)
+
+        @polyvar S I
+
+        lambda = 9//10
+        alpha = 1//10
+        delta = 11//10
+        beta = 1//10
+
+        dSdt = lambda - beta * S * I^2 - alpha * S
+        dIdt = beta * S * I^2 + alpha * S - delta * I
+
+        basisV = monomials([S, I], 0:4)
+        @variable(model, coeffsV[1:length(basisV)])
+        V = dot(basisV, coeffsV)
+        dVdt = differentiate(V, S) * dSdt + differentiate(V, I) * dIdt
+
+        normf = dSdt^2 + dIdt^2
+        domain = @set S >= 0 && I >= 0
+        @constraint(model, dVdt - normf in SOSCone(), domain = domain)
+
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        @test primal_status(model) == MOI.FEASIBLE_POINT
+        test_facial_reduction_statistics(model)
+        test_exact_extracted_sdp(model)
+    end
+
     if _run_extra_slow_tests()
         @testset "SAIRS n=2 Lyapunov SOS feasibility (extra slow)" begin
             model = _sairs_lyapunov_model(2)
@@ -231,10 +265,10 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         instance = build_lorenz_symmetric_period_model(model; da = 2, db = 3, dc = 6, lower_B = 700, upper_B=750)
         optimize!(instance.model)
 
-        @test termination_status(instance.model) == MOI.NUMERICAL_ERROR
+        @test termination_status(instance.model) == MOI.OPTIMAL
         @test primal_status(instance.model) == MOI.FEASIBLE_POINT
         @test occursin(
-            "inconclusive",
+            "Solved by quasi-convex parameter search",
             MOI.get(backend(instance.model), MOI.RawStatusString()),
         )
         @test 700//1 <= value(instance.B) <= 750//1

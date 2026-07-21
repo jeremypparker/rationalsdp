@@ -585,8 +585,12 @@ function _should_attempt_phase1_recovery(
     return residual * 32 <= last_probe_residual
 end
 
-function _hypatia_phase1_syssolver(settings::Settings, ::Type{F}) where {F<:AbstractFloat}
-    choice = _phase1_hypatia_syssolver(settings)
+function _hypatia_phase1_syssolver(
+    settings::Settings,
+    ::Type{F};
+    choice_override::Union{Nothing,Symbol} = nothing,
+) where {F<:AbstractFloat}
+    choice = choice_override === nothing ? _phase1_hypatia_syssolver(settings) : choice_override
     if choice == :auto
         if F == Float64
             return Hypatia.Solvers.SymIndefSparseSystemSolver{F}(), false, false
@@ -892,6 +896,8 @@ function _phase1_hypatia_anchor_once(
     problem::ProblemData,
     ::Type{HF},
     margin_upper::BigFloat,
+    ;
+    syssolver_override::Union{Nothing,Symbol} = nothing,
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         problem.affine === nothing && error("Hypatia Phase I requires affine data.")
@@ -915,7 +921,11 @@ function _phase1_hypatia_anchor_once(
         problem.phase1_nullspace = nothing
         phase1_nullspace = nothing
         _gc_checkpoint!(opt, "before Hypatia load")
-        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
+        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(
+            opt.settings,
+            HF;
+            choice_override = syssolver_override,
+        )
         tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
             ;
@@ -1118,13 +1128,38 @@ function _phase1_hypatia_anchor(
 )
     primary_float_type = _phase1_hypatia_effective_float_type(opt, problem)
     last_attempt = nothing
-    for margin_cap in _phase1_hypatia_margin_caps(problem, opt.settings)
+    margin_caps = _phase1_hypatia_margin_caps(problem, opt.settings)
+    for margin_cap in margin_caps
         attempt = _phase1_hypatia_anchor_once(opt, problem, primary_float_type, margin_cap)
         attempt.anchor !== nothing && return attempt
         if attempt.candidate !== nothing &&
            attempt.reason == :boundary_margin
+            last_attempt = attempt
+            for escalated_type in _precision_escalation_types(
+                primary_float_type,
+                opt.settings.facial_reduction_precision_escalation_max_retries,
+            )
+                _record_facial_reduction_event!(:precision_escalations_attempted)
+                _log(
+                    opt,
+                    "Hypatia Phase I: boundary candidate detected; retrying at $(escalated_type) before facial reduction",
+                )
+                escalated_attempt = _phase1_hypatia_anchor_once(
+                    opt,
+                    problem,
+                    escalated_type,
+                    margin_cap;
+                    syssolver_override = _phase1_hypatia_prefers_sparse_float64(problem) ?
+                                         :symindef_indirect : nothing,
+                )
+                escalated_attempt.anchor !== nothing && return escalated_attempt
+                if escalated_attempt.candidate !== nothing
+                    last_attempt = escalated_attempt
+                    escalated_attempt.reason == :boundary_margin || break
+                end
+            end
             _log(opt, "Hypatia Phase I: boundary candidate detected; trying facial reduction")
-            return attempt
+            return last_attempt
         end
         last_attempt = attempt
     end

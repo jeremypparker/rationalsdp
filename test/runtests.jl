@@ -44,6 +44,14 @@ include("slowtest_helpers.jl")
             "facial_reduction_sparse_affine_validation_max_products",
             9012,
         )
+        set_optimizer_attribute(model, "facial_reduction_sieve_transform_max_entries", "3456")
+        set_optimizer_attribute(model, "facial_reduction_affine_compaction_factor", 7)
+        set_optimizer_attribute(model, "facial_reduction_affine_compaction_max_entries", 8901)
+        set_optimizer_attribute(model, "facial_reduction_subspace_max_charts", 5)
+        set_optimizer_attribute(model, "facial_reduction_projector_recovery", false)
+        set_optimizer_attribute(model, "facial_reduction_precision_escalation_max_retries", 2)
+        set_optimizer_attribute(model, "facial_reduction_tentative_max_directions", 3)
+        set_optimizer_attribute(model, "facial_reduction_affine_lift_chunk_columns", 7)
         @test get_optimizer_attribute(model, "phase1_outer_iterations") == 24
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
@@ -79,6 +87,19 @@ include("slowtest_helpers.jl")
             model,
             "facial_reduction_sparse_affine_validation_max_products",
         ) == 9012
+        @test get_optimizer_attribute(model, "facial_reduction_sieve_transform_max_entries") ==
+              3456
+        @test get_optimizer_attribute(model, "facial_reduction_affine_compaction_factor") == 7
+        @test get_optimizer_attribute(model, "facial_reduction_affine_compaction_max_entries") ==
+              8901
+        @test get_optimizer_attribute(model, "facial_reduction_subspace_max_charts") == 5
+        @test !get_optimizer_attribute(model, "facial_reduction_projector_recovery")
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_precision_escalation_max_retries",
+        ) == 2
+        @test get_optimizer_attribute(model, "facial_reduction_tentative_max_directions") == 3
+        @test get_optimizer_attribute(model, "facial_reduction_affine_lift_chunk_columns") == 7
     end
 
     @testset "Working float type selection" begin
@@ -377,6 +398,21 @@ include("slowtest_helpers.jl")
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(facial_reduction_row_space_max_entries = -1),
         )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_affine_compaction_factor = -1),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_affine_compaction_max_entries = -1),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_subspace_max_charts = 0),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_precision_escalation_max_retries = -1),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_affine_lift_chunk_columns = 0),
+        )
         @test RationalSDP._validate_settings(RationalSDP.Settings()) === nothing
     end
 
@@ -535,6 +571,28 @@ include("slowtest_helpers.jl")
         @test independent_A == Rational{BigInt}[1//1 0//1; 0//1 1//1]
         @test independent_b == Rational{BigInt}[1//1, 3//1]
         @test RationalSDP._independent_affine_equalities(inconsistent_A, inconsistent_b) === nothing
+
+        backend_error = RationalSDP.Nemo.FlintException(
+            RationalSDP.Nemo.FLINT_ERROR,
+            "unable to allocate exact matrix",
+        )
+        wrapped_error = RationalSDP._exact_linear_algebra_error("test RREF", backend_error)
+        @test RationalSDP._is_nemo_flint_exception(backend_error)
+        @test !RationalSDP._is_nemo_flint_exception(ErrorException("not FLINT"))
+        caught_backend_error = try
+            RationalSDP._with_nemo_error("test wrapped operation") do
+                throw(backend_error)
+            end
+            nothing
+        catch err
+            err
+        end
+        @test caught_backend_error isa RationalSDP.ExactLinearAlgebraError
+        @test occursin("test wrapped operation", sprint(showerror, caught_backend_error))
+        wrapped_message = sprint(showerror, wrapped_error)
+        @test occursin("test RREF", wrapped_message)
+        @test occursin("unable to allocate exact matrix", wrapped_message)
+        @test !occursin("namemap", wrapped_message)
 
         augmented = Rational{BigInt}[
             1//2 1//3 5//6
@@ -873,6 +931,12 @@ include("slowtest_helpers.jl")
         @test heuristic !== nothing
         @test heuristic.direction == Rational{BigInt}[1//1, 2//1, 5//1]
 
+        @test RationalSDP._precision_escalation_types(Float64, 3) ==
+              DataType[RationalSDP.Float64x2, RationalSDP.Float64x4, BigFloat]
+        @test RationalSDP._precision_escalation_types(RationalSDP.Float64x3, 2) ==
+              DataType[RationalSDP.Float64x4, BigFloat]
+        @test isempty(RationalSDP._precision_escalation_types(BigFloat, 3))
+
         subspace_basis = Float64[
             1 0
             0 1
@@ -895,6 +959,62 @@ include("slowtest_helpers.jl")
         recovered_matrix = Float64.(hcat(recovered_subspace...))
         subspace_projector = subspace_basis * pinv(subspace_basis)
         @test norm((I - subspace_projector) * recovered_matrix) < 1.0e-10
+
+        chart_data = RationalSDP._rational_subspace_pivot_charts(
+            subspace_basis * irrational_rotation,
+            RationalSDP.Settings(facial_reduction_subspace_max_charts = 8),
+            Float64,
+        )
+        @test chart_data.rank == 2
+        @test 2 <= length(chart_data.charts) <= 8
+
+        high_dynamic_range_basis = Float64[
+            1.0e6 0
+            0 1.0e6
+            1 0
+            0 1
+        ]
+        high_dynamic_range_subspace = high_dynamic_range_basis * irrational_rotation
+        coarse_first_chart = RationalSDP._pivoted_rational_subspace_directions(
+            high_dynamic_range_subspace,
+            RationalSDP.Settings(facial_reduction_subspace_max_charts = 8),
+            Float64;
+            relation_tolerance = 1.0e-4,
+        )
+        high_dynamic_projector = high_dynamic_range_basis * pinv(high_dynamic_range_basis)
+        coarse_first_matrix = Float64.(hcat(coarse_first_chart...))
+        @test norm(
+            coarse_first_matrix * pinv(coarse_first_matrix) - high_dynamic_projector,
+        ) > 1.0e-8
+        chart_candidates = RationalSDP._rational_subspace_candidate_sets(
+            high_dynamic_range_subspace,
+            RationalSDP.Settings(
+                facial_reduction_subspace_max_charts = 8,
+                facial_reduction_projector_recovery = false,
+            ),
+            Float64,
+            1.0e-4,
+        )
+        @test any(
+            begin
+                candidate_matrix = Float64.(hcat(candidate.directions...))
+                norm(candidate_matrix * pinv(candidate_matrix) - high_dynamic_projector) < 1.0e-10
+            end for candidate in chart_candidates
+        )
+        @test allunique(
+            RationalSDP._canonical_rational_subspace_key(candidate.directions) for
+            candidate in chart_candidates
+        )
+
+        projector_directions = RationalSDP._rational_projector_subspace_directions(
+            subspace_basis * irrational_rotation,
+            2,
+            1.0e-10,
+        )
+        @test length(projector_directions) == 2
+        @test norm(
+            (I - subspace_projector) * Float64.(hcat(projector_directions...)),
+        ) < 1.0e-10
 
         block = RationalSDP.BlockStructure(
             4,
@@ -1250,6 +1370,39 @@ include("slowtest_helpers.jl")
                   size(reduced_rank_one_problem.A, 1),
                   size(reduced_nullspace, 2),
               )
+        compaction_checkpoints = String[]
+        compacted_rank_one_problem = RationalSDP._apply_facial_reduction(
+            rank_one_problem,
+            Int[],
+            Dict(1 => keep_basis);
+            checkpoint = stage -> push!(compaction_checkpoints, stage),
+            settings = RationalSDP.Settings(facial_reduction_affine_compaction_factor = 0),
+        )
+        @test size(compacted_rank_one_problem.A, 1) <= size(reduced_rank_one_problem.A, 1)
+        @test any(stage -> occursin("compacting redundant", stage), compaction_checkpoints)
+        @test any(
+            stage -> occursin("retaining existing exact affine parametrization", stage),
+            compaction_checkpoints,
+        )
+        @test !any(stage -> occursin("solving compacted", stage), compaction_checkpoints)
+
+        skipped_compaction_checkpoints = String[]
+        uncompacted_rank_one_problem = RationalSDP._apply_facial_reduction(
+            rank_one_problem,
+            Int[],
+            Dict(1 => keep_basis);
+            checkpoint = stage -> push!(skipped_compaction_checkpoints, stage),
+            settings = RationalSDP.Settings(
+                facial_reduction_affine_compaction_factor = 0,
+                facial_reduction_affine_compaction_max_entries = 1,
+            ),
+        )
+        @test size(uncompacted_rank_one_problem.A, 1) ==
+              size(reduced_rank_one_problem.A, 1)
+        @test any(
+            stage -> occursin("skipping optional affine compaction", stage),
+            skipped_compaction_checkpoints,
+        )
 
         interior_problem = RationalSDP.ProblemData(
             MOI.VariableIndex[],
@@ -1583,6 +1736,30 @@ include("slowtest_helpers.jl")
         VX = value.(X)
         @test VX == Rational{BigInt}[1//1 1//1; 1//1 1//1]
         @test is_psd_exact(VX)
+    end
+
+    @testset "Boundary recovery precision escalation is opt in" begin
+        model = rational_model(Rational{BigInt})
+        set_optimizer_attribute(model, "working_float_type", Float64)
+        set_optimizer_attribute(model, "phase1_hypatia_float_type", Float64)
+        set_optimizer_attribute(model, "facial_reduction_float_type", Float64)
+        set_optimizer_attribute(model, "facial_reduction_precision_escalation_max_retries", 1)
+        @variable(model, X[1:3, 1:3], PSD)
+        for j in 1:3, i in j:3
+            (i == 1 && j == 1) && continue
+            @constraint(model, X[i, j] == X[1, 1])
+        end
+        @objective(model, Min, 0//1)
+        optimize!(model)
+
+        @test termination_status(model) == MOI.OPTIMAL
+        bridge_optimizer = getfield(backend(model), :optimizer)
+        opt = getfield(bridge_optimizer, :model)
+        stats = RationalSDP.facial_reduction_statistics(opt)
+        @test stats.precision_escalations_attempted >= 1
+        VX = value.(X)
+        @test is_psd_exact(VX)
+        @test all(value == VX[1, 1] for value in VX)
     end
 
     @testset "Facial reduction affine lifting stays consistent" begin
@@ -2011,6 +2188,18 @@ include("slowtest_helpers.jl")
                            certificate.multiplier[1:2] == Rational{BigInt}[1, -1],
             transformed,
         )
+        sieve_limited_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_sieve_transform_max_entries = 0,
+        )
+        limited_certificates = RationalSDP._sieve_facial_reduction_certificates(
+            sieve_limited_opt,
+            transformed_problem,
+        )
+        @test all(
+            certificate -> !occursin("transformed", certificate.source),
+            limited_certificates,
+        )
 
         mixed_block = RationalSDP.BlockStructure(
             2,
@@ -2261,6 +2450,31 @@ include("slowtest_helpers.jl")
         @test N_inc == N_ext * N_full_coord
         @test restrictions * p_inc == restriction_rhs
         @test restrictions * N_inc == zeros(Rational{BigInt}, 3, size(N_inc, 2))
+
+        chunk_left = Rational{BigInt}[1 2 3; 4 5 6]
+        chunk_right = Rational{BigInt}[1 0 2 1; 0 1 3 2; 1 1 0 4]
+        @test RationalSDP._nemo_matrix_product_chunked(chunk_left, chunk_right, 2) ==
+              chunk_left * chunk_right
+        lift_stats = RationalSDP.FacialReductionStatistics()
+        bounded_lift_error = try
+            RationalSDP._with_facial_reduction_statistics(lift_stats) do
+                RationalSDP._extend_and_restrict_affine_system(
+                    affine0,
+                    2,
+                    restrictions,
+                    restriction_rhs;
+                    settings = RationalSDP.Settings(
+                        facial_reduction_affine_lift_max_output_entries = 1,
+                    ),
+                )
+            end
+            nothing
+        catch err
+            err
+        end
+        @test bounded_lift_error isa RationalSDP.ExactLinearAlgebraError
+        @test occursin("output entries", sprint(showerror, bounded_lift_error))
+        @test lift_stats.affine_lifts_skipped_by_budget == 1
 
         inconsistent = RationalSDP._extend_and_restrict_affine_system(
             affine0,

@@ -30,11 +30,16 @@ mutable struct FacialReductionStatistics
     facial_reduction_cache_peak_bytes::Int
     certified_reductions_applied::Int
     tentative_restrictions_applied::Int
+    rational_subspace_charts_attempted::Int
+    rational_projectors_attempted::Int
+    precision_escalations_attempted::Int
+    tentative_batches_skipped_by_budget::Int
+    affine_lifts_skipped_by_budget::Int
 end
 
 FacialReductionStatistics() = FacialReductionStatistics(
     0, 0.0, 0, 0, 0.0, 0, Tuple{Int,Int}[], 0.0, 0, 0.0, 0, 0.0,
-    Dict{Int,Int}(), 0.0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0,
+    Dict{Int,Int}(), 0.0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0, 0, 0,
 )
 
 function _facial_reduction_statistics_snapshot(stats::FacialReductionStatistics)
@@ -64,7 +69,27 @@ function _facial_reduction_statistics_snapshot(stats::FacialReductionStatistics)
         facial_reduction_cache_peak_bytes = stats.facial_reduction_cache_peak_bytes,
         certified_reductions_applied = stats.certified_reductions_applied,
         tentative_restrictions_applied = stats.tentative_restrictions_applied,
+        rational_subspace_charts_attempted = stats.rational_subspace_charts_attempted,
+        rational_projectors_attempted = stats.rational_projectors_attempted,
+        precision_escalations_attempted = stats.precision_escalations_attempted,
+        tentative_batches_skipped_by_budget = stats.tentative_batches_skipped_by_budget,
+        affine_lifts_skipped_by_budget = stats.affine_lifts_skipped_by_budget,
     )
+end
+
+function _record_facial_reduction_event!(field::Symbol, count::Int = 1)
+    count >= 0 || error("Facial-reduction event count cannot be negative.")
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    field in (
+        :rational_subspace_charts_attempted,
+        :rational_projectors_attempted,
+        :precision_escalations_attempted,
+        :tentative_batches_skipped_by_budget,
+        :affine_lifts_skipped_by_budget,
+    ) || error("Unknown facial-reduction statistics field $(field).")
+    setfield!(stats, field, getfield(stats, field) + count)
+    return
 end
 
 function _current_facial_reduction_statistics()
@@ -232,12 +257,16 @@ Base.@kwdef mutable struct Settings
     facial_reduction_float_type::DataType = AbstractFloat
     facial_reduction_exposure_tolerance::BigFloat = big"1e-8"
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"
+    facial_reduction_subspace_max_charts::Int = 8
+    facial_reduction_projector_recovery::Bool = true
+    facial_reduction_precision_escalation_max_retries::Int = 0
     facial_reduction_irrational_behavior::Symbol = :error
     facial_reduction_save_file::String = ""
     facial_reduction_load_file::String = ""
     # Work limits for optional facial-reduction certificates, numerical
-    # scouts, and redundant validation. Zero disables the corresponding
-    # calculation without disabling facial reduction itself.
+    # scouts, and redundant validation. Zero disables the max-work routes
+    # without disabling facial reduction itself; a zero compaction factor
+    # compacts whenever extra affine equations are present.
     facial_reduction_row_space_max_entries::Int = 250_000
     facial_reduction_weighted_subspace_max_form_entries::Int = 250_000
     facial_reduction_weighted_subspace_max_affine_products::Int = 5_000_000
@@ -248,6 +277,16 @@ Base.@kwdef mutable struct Settings
     facial_reduction_numeric_weighted_subspace_max_affine_products::Int = 25_000_000
     facial_reduction_individual_max_affine_products::Int = 5_000_000
     facial_reduction_sparse_affine_validation_max_products::Int = 5_000_000
+    facial_reduction_sieve_transform_max_entries::Int = 250_000
+    facial_reduction_affine_compaction_factor::Int = 4
+    facial_reduction_affine_compaction_max_entries::Int = 5_000_000
+    facial_reduction_tentative_max_directions::Int = 8
+    facial_reduction_tentative_max_coordinate_entries::Int = 5_000_000
+    facial_reduction_tentative_max_lift_products::Int = 250_000_000
+    facial_reduction_tentative_max_estimated_bytes::Int = 1_000_000_000
+    facial_reduction_affine_lift_max_output_entries::Int = 5_000_000
+    facial_reduction_affine_lift_max_estimated_bytes::Int = 1_000_000_000
+    facial_reduction_affine_lift_chunk_columns::Int = 32
     feasibility_tolerance::BigFloat = big"1e-22"
     optimality_gap_tolerance::BigFloat = big"1e-16"
     gradient_tolerance::BigFloat = big"1e-24"
@@ -870,6 +909,22 @@ function _facial_reduction_irrational_behavior(settings::Settings)
     return behavior
 end
 
+function _precision_escalation_types(::Type{F}, max_retries::Int) where {F<:AbstractFloat}
+    max_retries >= 0 || error("Precision escalation retries must be nonnegative.")
+    ladder = DataType[Float64, Float64x2, Float64x3, Float64x4, BigFloat]
+    start = findfirst(==(F), ladder)
+    candidates = if start === nothing
+        F === BigFloat ? DataType[] : DataType[BigFloat]
+    else
+        ladder[(start + 1):end]
+    end
+    # Float64x3 rarely provides enough separation from Float64x2 to justify
+    # another conic solve. Keep it available when explicitly configured, but
+    # skip it in automatic escalation from lower precision.
+    F in (Float64, Float64x2) && filter!(!=(Float64x3), candidates)
+    return candidates[1:min(max_retries, length(candidates))]
+end
+
 function _validate_settings(settings::Settings)
     positive_integer_fields = (
         :max_iterations,
@@ -900,6 +955,15 @@ function _validate_settings(settings::Settings)
         :facial_reduction_numeric_weighted_subspace_max_affine_products,
         :facial_reduction_individual_max_affine_products,
         :facial_reduction_sparse_affine_validation_max_products,
+        :facial_reduction_sieve_transform_max_entries,
+        :facial_reduction_affine_compaction_factor,
+        :facial_reduction_affine_compaction_max_entries,
+        :facial_reduction_tentative_max_directions,
+        :facial_reduction_tentative_max_coordinate_entries,
+        :facial_reduction_tentative_max_lift_products,
+        :facial_reduction_tentative_max_estimated_bytes,
+        :facial_reduction_affine_lift_max_output_entries,
+        :facial_reduction_affine_lift_max_estimated_bytes,
     )
     for name in facial_reduction_work_limits
         getfield(settings, name) >= 0 ||
@@ -907,6 +971,12 @@ function _validate_settings(settings::Settings)
     end
     settings.phase1_exact_recovery_pivot_log_frequency >= 0 ||
         throw(ArgumentError("phase1_exact_recovery_pivot_log_frequency must be nonnegative."))
+    settings.facial_reduction_subspace_max_charts > 0 ||
+        throw(ArgumentError("facial_reduction_subspace_max_charts must be positive."))
+    settings.facial_reduction_precision_escalation_max_retries >= 0 ||
+        throw(ArgumentError("facial_reduction_precision_escalation_max_retries must be nonnegative."))
+    settings.facial_reduction_affine_lift_chunk_columns > 0 ||
+        throw(ArgumentError("facial_reduction_affine_lift_chunk_columns must be positive."))
     settings.exact_refinement_bisections >= 0 ||
         throw(ArgumentError("exact_refinement_bisections must be nonnegative."))
 

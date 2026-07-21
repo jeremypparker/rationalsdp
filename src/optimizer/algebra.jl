@@ -1,5 +1,59 @@
 # Exact arithmetic helpers and affine/PSD structure manipulations.
 
+struct ExactLinearAlgebraError <: Exception
+    operation::String
+    backend_type::String
+    backend_message::String
+end
+
+function Base.showerror(io::IO, err::ExactLinearAlgebraError)
+    print(io, "Exact linear algebra failed during ", err.operation)
+    isempty(err.backend_type) || print(io, " (", err.backend_type, ")")
+    isempty(err.backend_message) || print(io, ": ", err.backend_message)
+end
+
+function _exception_type_name(err)
+    T = typeof(err)
+    return string(parentmodule(T), ".", nameof(T))
+end
+
+function _exception_message(err)
+    # Nemo's FlintException contains the useful C-library message in `msg`,
+    # but rendering the exception can itself hit an Enum world-age error in
+    # long-lived REPLs. Read the string field directly when it is available.
+    if hasfield(typeof(err), :msg)
+        message = getfield(err, :msg)
+        message isa AbstractString && return strip(String(message))
+    end
+    try
+        return strip(sprint(showerror, err))
+    catch
+        return ""
+    end
+end
+
+function _exact_linear_algebra_error(operation::AbstractString, err)
+    return ExactLinearAlgebraError(
+        String(operation),
+        _exception_type_name(err),
+        _exception_message(err),
+    )
+end
+
+function _is_nemo_flint_exception(err)
+    T = typeof(err)
+    return parentmodule(T) === Nemo && nameof(T) === :FlintException
+end
+
+function _with_nemo_error(f::Function, operation::AbstractString)
+    try
+        return f()
+    catch err
+        _is_nemo_flint_exception(err) || rethrow()
+        throw(_exact_linear_algebra_error(operation, err))
+    end
+end
+
 _exact_rational(x::ExactRational) = x
 
 function _exact_rational(x::Rational{S}) where {S<:Integer}
@@ -111,26 +165,59 @@ end
 
 # Keep Rational{BigInt} at the MOI and solver-state boundaries, and use Nemo
 # only for the exact matrix kernels where FLINT provides the performance gain.
-_to_nemo_matrix(values::AbstractMatrix{ExactRational}) = Nemo.matrix(Nemo.QQ, values)
+function _to_nemo_matrix(values::AbstractMatrix{ExactRational})
+    return _with_nemo_error("exact rational matrix conversion") do
+        Nemo.matrix(Nemo.QQ, values)
+    end
+end
 
 function _nemo_matrix_product(
     left::AbstractMatrix{ExactRational},
     right::AbstractMatrix{ExactRational},
 )
     size(left, 2) == size(right, 1) || error("Exact matrix product dimensions must match.")
-    return _from_nemo_matrix(_to_nemo_matrix(left) * _to_nemo_matrix(right))
+    product = _with_nemo_error("exact rational matrix multiplication") do
+        _to_nemo_matrix(left) * _to_nemo_matrix(right)
+    end
+    return _from_nemo_matrix(product)
+end
+
+function _nemo_matrix_product_chunked(
+    left::AbstractMatrix{ExactRational},
+    right::AbstractMatrix{ExactRational},
+    chunk_columns::Int,
+)
+    size(left, 2) == size(right, 1) || error("Exact matrix product dimensions must match.")
+    chunk_columns > 0 || error("Exact matrix-product chunk size must be positive.")
+    column_count = size(right, 2)
+    result = Matrix{ExactRational}(undef, size(left, 1), column_count)
+    column_count == 0 && return result
+    left_nemo = _to_nemo_matrix(left)
+    for first_column in 1:chunk_columns:column_count
+        last_column = min(column_count, first_column + chunk_columns - 1)
+        right_chunk = _to_nemo_matrix(view(right, :, first_column:last_column))
+        product_chunk = _with_nemo_error("chunked exact rational matrix multiplication") do
+            left_nemo * right_chunk
+        end
+        result[:, first_column:last_column] = _from_nemo_matrix(product_chunk)
+    end
+    return result
 end
 
 function _from_nemo_rational(value)
-    return ExactRational(BigInt(numerator(value)), BigInt(denominator(value)))
+    return _with_nemo_error("exact rational scalar extraction") do
+        ExactRational(BigInt(numerator(value)), BigInt(denominator(value)))
+    end
 end
 
 function _from_nemo_matrix(values)
-    converted = Matrix{ExactRational}(undef, size(values)...)
-    for column in axes(converted, 2), row in axes(converted, 1)
-        converted[row, column] = _from_nemo_rational(values[row, column])
+    return _with_nemo_error("exact rational matrix extraction") do
+        converted = Matrix{ExactRational}(undef, size(values)...)
+        for column in axes(converted, 2), row in axes(converted, 1)
+            converted[row, column] = _from_nemo_rational(values[row, column])
+        end
+        converted
     end
-    return converted
 end
 
 function _rref_pivots(reduced, variable_count::Int)
@@ -159,7 +246,9 @@ end
 function _exact_rref(aug::Matrix{ExactRational})
     start_time = time_ns()
     try
-        _, reduced = Nemo.rref(_to_nemo_matrix(aug))
+        _, reduced = _with_nemo_error("exact rational RREF") do
+            Nemo.rref(_to_nemo_matrix(aug))
+        end
         return reduced
     finally
         stats = _current_facial_reduction_statistics()
@@ -402,6 +491,7 @@ function _lift_affine_basis_with_nemo(
     added_dimension::Int,
     coordinate_particular::Vector{ExactRational},
     coordinate_nullspace::Matrix{ExactRational},
+    settings::Settings = Settings(),
 )
     old_dimension = length(particular)
     coordinate_dimension = size(nullspace, 2) + added_dimension
@@ -410,25 +500,50 @@ function _lift_affine_basis_with_nemo(
     size(coordinate_nullspace, 1) == coordinate_dimension ||
         error("Affine coordinate nullspace has the wrong row count.")
 
-    extended_particular = vcat(particular, zeros(ExactRational, added_dimension))
-    extended_nullspace = zeros(
-        ExactRational,
-        old_dimension + added_dimension,
-        coordinate_dimension,
-    )
-    size(nullspace, 2) > 0 &&
-        (extended_nullspace[1:old_dimension, 1:size(nullspace, 2)] = nullspace)
-    added_dimension > 0 &&
-        (extended_nullspace[old_dimension + 1:end, size(nullspace, 2) + 1:end] =
-         Matrix{ExactRational}(I, added_dimension, added_dimension))
-
     coordinate_basis = hcat(
         reshape(coordinate_particular, :, 1),
         coordinate_nullspace,
     )
-    lifted_basis = _nemo_matrix_product(extended_nullspace, coordinate_basis)
+    output_entries = BigInt(old_dimension + added_dimension) * size(coordinate_basis, 2)
+    output_limit = settings.facial_reduction_affine_lift_max_output_entries
+    input_entry_count = length(particular) + length(nullspace) + length(coordinate_basis)
+    average_entry_bytes = input_entry_count == 0 ? 32 : max(
+        32,
+        cld(
+            Base.summarysize(particular) + Base.summarysize(nullspace) +
+            Base.summarysize(coordinate_basis),
+            input_entry_count,
+        ),
+    )
+    estimated_bytes = output_entries * average_entry_bytes
+    byte_limit = settings.facial_reduction_affine_lift_max_estimated_bytes
+    if output_limit == 0 || output_entries > output_limit ||
+       byte_limit == 0 || estimated_bytes > byte_limit
+        _record_facial_reduction_event!(:affine_lifts_skipped_by_budget)
+        throw(
+            ExactLinearAlgebraError(
+                "bounded affine basis lift",
+                "RationalSDP work limit",
+                "output entries $(output_entries)/$(output_limit), estimated bytes $(estimated_bytes)/$(byte_limit)",
+            ),
+        )
+    end
+
+    old_coordinate_dimension = size(nullspace, 2)
+    old_coordinate_basis = view(coordinate_basis, 1:old_coordinate_dimension, :)
+    lifted_old_basis = if old_coordinate_dimension == 0
+        zeros(ExactRational, old_dimension, size(coordinate_basis, 2))
+    else
+        _nemo_matrix_product_chunked(
+            nullspace,
+            old_coordinate_basis,
+            settings.facial_reduction_affine_lift_chunk_columns,
+        )
+    end
+    added_basis = view(coordinate_basis, (old_coordinate_dimension + 1):coordinate_dimension, :)
+    lifted_basis = added_dimension == 0 ? lifted_old_basis : vcat(lifted_old_basis, added_basis)
     return (
-        extended_particular + vec(lifted_basis[:, 1]),
+        vcat(particular, zeros(ExactRational, added_dimension)) + vec(lifted_basis[:, 1]),
         Matrix(lifted_basis[:, 2:end]),
     )
 end
@@ -476,6 +591,7 @@ function _extend_and_restrict_affine_system(
         added_dimension,
         coordinate_particular,
         coordinate_nullspace,
+        settings,
     )
     checkpoint !== nothing && checkpoint("affine restriction: validating restricted affine basis")
     validation_products =
@@ -500,45 +616,36 @@ function _extend_and_restrict_affine_system(
     restriction_rhs::Vector{ExactRational},
     ;
     checkpoint::Union{Nothing,Function} = nothing,
+    settings::Settings = Settings(),
 )
     affine === nothing && return nothing
     added_dimension >= 0 || error("Added affine dimension must be nonnegative.")
     size(restriction_rows, 1) == length(restriction_rhs) ||
         error("Affine restriction rows and rhs must match.")
-    particular, nullspace = affine
-    old_dimension = length(particular)
-    size(nullspace, 1) == old_dimension || error("Affine nullspace has the wrong row count.")
-    coordinate_dimension = size(nullspace, 2) + added_dimension
+    old_dimension = length(affine[1])
+    coordinate_dimension = size(affine[2], 2) + added_dimension
     checkpoint !== nothing && checkpoint(
         "affine restriction: extending $(old_dimension) variables by $(added_dimension) face coordinate(s)",
     )
-    extended_particular = vcat(particular, zeros(ExactRational, added_dimension))
-    extended_nullspace = zeros(ExactRational, old_dimension + added_dimension, size(nullspace, 2) + added_dimension)
-    size(nullspace, 2) > 0 && (extended_nullspace[1:old_dimension, 1:size(nullspace, 2)] = nullspace)
-    added_dimension > 0 && (extended_nullspace[old_dimension + 1:end, size(nullspace, 2) + 1:end] = Matrix{ExactRational}(I, added_dimension, added_dimension))
-
     checkpoint !== nothing && checkpoint(
         "affine restriction: forming dense $(size(restriction_rows, 1))-by-$(coordinate_dimension) coordinate system from $(size(restriction_rows, 1)) face equation(s)",
     )
-    coordinate_rows = restriction_rows * extended_nullspace
-    coordinate_rhs = restriction_rhs - restriction_rows * extended_particular
-    checkpoint !== nothing && checkpoint("affine restriction: solving coordinate system exactly")
-    coordinate_affine = _solve_affine_system(
-        coordinate_rows,
-        coordinate_rhs;
+    indices = [
+        [column for column in axes(restriction_rows, 2) if !iszero(restriction_rows[row, column])]
+        for row in axes(restriction_rows, 1)
+    ]
+    values = [
+        ExactRational[restriction_rows[row, column] for column in row_indices] for
+        (row, row_indices) in enumerate(indices)
+    ]
+    return _extend_and_restrict_affine_system(
+        affine,
+        added_dimension,
+        _SparseAffineRestrictions(indices, values),
+        restriction_rhs;
         checkpoint,
+        settings,
     )
-    coordinate_affine === nothing && return nothing
-    coordinate_particular, coordinate_nullspace = coordinate_affine
-    checkpoint !== nothing && checkpoint("affine restriction: lifting restricted affine basis")
-    result = (
-        extended_particular + extended_nullspace * coordinate_particular,
-        extended_nullspace * coordinate_nullspace,
-    )
-    checkpoint !== nothing && checkpoint("affine restriction: validating restricted affine basis")
-    _assert_affine_invariant(restriction_rows, restriction_rhs, result)
-    checkpoint !== nothing && checkpoint("affine restriction: completed")
-    return result
 end
 
 function _coordinate_equality_rows(dimension::Int, indices::Vector{Int})
@@ -1001,7 +1108,9 @@ function _nullspace_basis_exact(matrix::Matrix{ExactRational})
     size(matrix, 1) == 0 &&
         return Matrix{ExactRational}(I, column_count, column_count)
     column_count == 0 && return zeros(ExactRational, 0, 0)
-    _, nullspace = Nemo.nullspace(_to_nemo_matrix(matrix))
+    _, nullspace = _with_nemo_error("exact rational nullspace") do
+        Nemo.nullspace(_to_nemo_matrix(matrix))
+    end
     return _from_nemo_matrix(nullspace)
 end
 

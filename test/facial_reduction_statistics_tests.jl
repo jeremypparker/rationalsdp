@@ -67,6 +67,11 @@
               stats.certified_directions_accepted
         @test stats.tentative_directions_proposed >=
               stats.tentative_directions_accepted
+        @test stats.rational_subspace_charts_attempted >= 0
+        @test stats.rational_projectors_attempted >= 0
+        @test stats.precision_escalations_attempted >= 0
+        @test stats.tentative_batches_skipped_by_budget >= 0
+        @test stats.affine_lifts_skipped_by_budget >= 0
         @test all(removed > 0 for removed in stats.cone_dimension_removed_per_round)
         @test termination_status(model) == MOI.OPTIMAL
     end
@@ -153,6 +158,47 @@
         reduced = RationalSDP._tentative_batch_problem(problem, directions)
         @test reduced.affine !== nothing
         @test RationalSDP._barrier_dimension(reduced) == 4
+    end
+
+    @testset "oversized tentative batches admit one direction incrementally" begin
+        problem = synthetic_face_problem([3, 3])
+        settings = RationalSDP.Settings(
+            facial_reduction_tentative_max_directions = 1,
+            facial_reduction_tentative_max_coordinate_entries = typemax(Int),
+            facial_reduction_tentative_max_lift_products = typemax(Int),
+            facial_reduction_tentative_max_estimated_bytes = typemax(Int),
+            facial_reduction_affine_lift_max_output_entries = typemax(Int),
+            facial_reduction_affine_lift_max_estimated_bytes = typemax(Int),
+        )
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_tentative_max_directions = 1,
+            facial_reduction_tentative_max_coordinate_entries = typemax(Int),
+            facial_reduction_tentative_max_lift_products = typemax(Int),
+            facial_reduction_tentative_max_estimated_bytes = typemax(Int),
+            facial_reduction_affine_lift_max_output_entries = typemax(Int),
+            facial_reduction_affine_lift_max_estimated_bytes = typemax(Int),
+        )
+        directions = [
+            RationalSDP._TentativeFaceDirection{Float64}(1, Rational{BigInt}[0, 1, 0], 0.0, 0.0, 0.0),
+            RationalSDP._TentativeFaceDirection{Float64}(2, Rational{BigInt}[0, 1, 0], 0.0, 0.0, 0.0),
+        ]
+        work = RationalSDP._tentative_batch_work(problem, directions)
+        @test !RationalSDP._tentative_batch_within_budget(work, settings)
+
+        stats = RationalSDP.FacialReductionStatistics()
+        reduced = RationalSDP._with_facial_reduction_statistics(stats) do
+            RationalSDP._tentative_feasibility_search_problem(
+                opt,
+                problem,
+                vcat(Float64[1, 0, 0, 0, 0, 0], Float64[1, 0, 0, 0, 0, 0]),
+                Float64,
+            )
+        end
+        @test reduced !== nothing
+        @test RationalSDP._barrier_dimension(reduced) == 5
+        @test stats.tentative_batches_skipped_by_budget == 1
+        @test stats.tentative_directions_accepted == 1
     end
 
     @testset "jointly inconsistent tentative restrictions roll back greedily" begin

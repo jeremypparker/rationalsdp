@@ -249,6 +249,9 @@ The full set of optimizer attributes is:
 - `facial_reduction_float_type`
 - `facial_reduction_exposure_tolerance`
 - `facial_reduction_rank_tolerance`
+- `facial_reduction_subspace_max_charts`
+- `facial_reduction_projector_recovery`
+- `facial_reduction_precision_escalation_max_retries`
 - `facial_reduction_irrational_behavior`
 - `facial_reduction_save_file`
 - `facial_reduction_load_file`
@@ -262,6 +265,16 @@ The full set of optimizer attributes is:
 - `facial_reduction_numeric_weighted_subspace_max_affine_products`
 - `facial_reduction_individual_max_affine_products`
 - `facial_reduction_sparse_affine_validation_max_products`
+- `facial_reduction_sieve_transform_max_entries`
+- `facial_reduction_affine_compaction_factor`
+- `facial_reduction_affine_compaction_max_entries`
+- `facial_reduction_tentative_max_directions`
+- `facial_reduction_tentative_max_coordinate_entries`
+- `facial_reduction_tentative_max_lift_products`
+- `facial_reduction_tentative_max_estimated_bytes`
+- `facial_reduction_affine_lift_max_output_entries`
+- `facial_reduction_affine_lift_max_estimated_bytes`
+- `facial_reduction_affine_lift_chunk_columns`
 - `feasibility_tolerance`
 - `optimality_gap_tolerance`
 - `gradient_tolerance`
@@ -296,8 +309,20 @@ The facial-reduction work limits bound optional certificate, scouting, and
 validation calculations whose matrices can become large. They do not relax any
 exact check that is needed for correctness: when a limit is exceeded, the
 solver skips that optional route and continues with the other facial-reduction
-routes. Each limit is a nonnegative integer, and setting one to `0` disables
-the corresponding calculation.
+routes. The work limits are nonnegative integers; setting a max-entry/product
+limit to `0` disables that optional route. The compaction factor is also
+nonnegative, with `0` requesting compaction whenever extra affine equations
+are present.
+
+Boundary-kernel recovery is joint and basis invariant. RationalSDP tries up to
+`facial_reduction_subspace_max_charts` well-conditioned pivot charts, converts
+each exact candidate span to a canonical row-reduced key, and certifies each
+distinct span at most once. With `facial_reduction_projector_recovery=true`, an
+exact symmetric idempotent rationalization of the numerical orthogonal
+projector is also tried. `facial_reduction_precision_escalation_max_retries`
+controls an opt-in precision ladder for Phase I and the exposing-vector oracle;
+each oracle precision also tries a numerically different system solver. The
+default `0` preserves a single numerical solve.
 
 | Attribute | Default | Work estimate bounded |
 | --- | ---: | --- |
@@ -311,6 +336,22 @@ the corresponding calculation.
 | `facial_reduction_numeric_weighted_subspace_max_affine_products` | `25_000_000` | Floating-point products estimated for that numerical scout. |
 | `facial_reduction_individual_max_affine_products` | `5_000_000` | Exact products estimated when certifying proposed kernel directions individually. |
 | `facial_reduction_sparse_affine_validation_max_products` | `5_000_000` | Exact products in the redundant post-solve validation of a sparse face restriction. |
+| `facial_reduction_sieve_transform_max_entries` | `250_000` | Entries in the affine system before the Sieve skips transformed-row provenance. |
+| `facial_reduction_affine_compaction_factor` | `4` | Number of original affine equations allowed before redundant-equation compaction is attempted. |
+| `facial_reduction_affine_compaction_max_entries` | `5_000_000` | Entries in the augmented exact affine matrix eligible for optional redundant-equation compaction; `0` disables compaction. |
+| `facial_reduction_tentative_max_directions` | `8` | Numerically proposed PSD kernel directions admitted in one tentative batch. |
+| `facial_reduction_tentative_max_coordinate_entries` | `5_000_000` | Entries in the exact coordinate restriction system for a tentative face. |
+| `facial_reduction_tentative_max_lift_products` | `250_000_000` | Estimated exact products needed to lift a tentative affine basis. |
+| `facial_reduction_tentative_max_estimated_bytes` | `1_000_000_000` | Estimated retained bytes for a lifted tentative affine basis. |
+| `facial_reduction_affine_lift_max_output_entries` | `5_000_000` | Rational entries retained by an exact affine-basis lift; `0` disables optional lifting. |
+| `facial_reduction_affine_lift_max_estimated_bytes` | `1_000_000_000` | Estimated retained bytes for any exact affine-basis lift, using current rational coefficient sizes. |
+| `facial_reduction_affine_lift_chunk_columns` | `32` | Columns per Nemo multiplication chunk during exact affine lifting. |
+
+When a complete tentative batch exceeds any budget, RationalSDP does not build
+it. It tries the best single direction that fits, reruns Phase I on that
+restricted problem, and recomputes the remaining numerical kernels. Exact
+affine lifting exploits the identity block for newly introduced face
+coordinates and never materializes the old extended-nullspace matrix.
 
 Facial-reduction caches can be used to reuse exact faces across related
 instances:

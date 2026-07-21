@@ -74,7 +74,9 @@ function _nemo_product_nonzero(product)
 end
 
 function _nemo_quadratic_value(matrix, direction_column)
-    return (transpose(direction_column) * matrix * direction_column)[1, 1]
+    return _with_nemo_error("exact rational quadratic form") do
+        (transpose(direction_column) * matrix * direction_column)[1, 1]
+    end
 end
 
 function _normalize_rational_direction(direction::Vector{ExactRational})
@@ -587,6 +589,113 @@ function _block_weighted_subspace_exposure(
     return nothing
 end
 
+function _multiblock_weighted_subspace_exposure(
+    problem::ProblemData,
+    directions_by_block::Dict{Int,Vector{Vector{ExactRational}}},
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    isempty(directions_by_block) && return nothing
+    problem.affine === nothing && return nothing
+
+    block_indices = sort(collect(keys(directions_by_block)))
+    direction_matrices = Dict{Int,Matrix{ExactRational}}()
+    weight_positions_by_block = Dict{Int,Vector{Tuple{Int,Int}}}()
+    total_weight_dimension = 0
+    total_form_entries = BigInt(0)
+    for block_index in block_indices
+        1 <= block_index <= length(problem.blocks) || return nothing
+        directions = _linearly_independent_directions(directions_by_block[block_index])
+        isempty(directions) && return nothing
+        direction_matrix = hcat(directions...)
+        block = problem.blocks[block_index]
+        size(direction_matrix, 1) == block.size || return nothing
+        direction_matrices[block_index] = direction_matrix
+        weight_positions = _triangle_positions(size(direction_matrix, 2))
+        weight_positions_by_block[block_index] = weight_positions
+        total_weight_dimension += length(weight_positions)
+        total_form_entries += BigInt(length(block.local_positions)) * length(weight_positions)
+    end
+
+    affine_dimension = 1 + size(problem.affine[2], 2)
+    total_form_entries <= settings.facial_reduction_weighted_subspace_max_form_entries ||
+        return nothing
+    BigInt(affine_dimension) * total_form_entries <=
+        settings.facial_reduction_weighted_subspace_max_affine_products || return nothing
+
+    form_columns = zeros(
+        ExactRational,
+        length(problem.objective_vector_raw),
+        total_weight_dimension,
+    )
+    identity_target = zeros(ExactRational, total_weight_dimension)
+    weight_ranges = Dict{Int,UnitRange{Int}}()
+    next_weight = 1
+    for block_index in block_indices
+        block = problem.blocks[block_index]
+        direction_matrix = direction_matrices[block_index]
+        weight_positions = weight_positions_by_block[block_index]
+        weight_range = next_weight:(next_weight + length(weight_positions) - 1)
+        weight_ranges[block_index] = weight_range
+        for (local_weight_index, (a, b)) in enumerate(weight_positions)
+            global_weight_index = weight_range[local_weight_index]
+            weight_basis = zeros(ExactRational, size(direction_matrix, 2), size(direction_matrix, 2))
+            weight_basis[a, b] = 1 // 1
+            weight_basis[b, a] = 1 // 1
+            indices, values =
+                _block_weighted_subspace_form(block, direction_matrix, weight_basis)
+            form_columns[indices, global_weight_index] = values
+            a == b && (identity_target[global_weight_index] = 1 // 1)
+        end
+        next_weight = last(weight_range) + 1
+    end
+
+    particular, nullspace = problem.affine
+    affine_basis = hcat(particular, nullspace)
+    vanish_constraints = transpose(affine_basis) * form_columns
+    weight_subspace = _nullspace_basis_exact(vanish_constraints)
+    size(weight_subspace, 2) == 0 && return nothing
+
+    numeric_weight_subspace = _to_working_array(F, weight_subspace)
+    numeric_coordinates = try
+        numeric_weight_subspace \ _to_working_array(F, identity_target)
+    catch
+        return nothing
+    end
+    all(isfinite, numeric_coordinates) || return nothing
+
+    for tolerance in _facial_reduction_subspace_tolerances(settings, F)
+        rational_coordinates = ExactRational[
+            rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
+            value in numeric_coordinates
+        ]
+        weight_vector = weight_subspace * rational_coordinates
+        weights = Dict{Int,Matrix{ExactRational}}()
+        all_positive_definite = true
+        for block_index in block_indices
+            weight_positions = weight_positions_by_block[block_index]
+            weight_range = weight_ranges[block_index]
+            rank = size(direction_matrices[block_index], 2)
+            weight_matrix = zeros(ExactRational, rank, rank)
+            for (local_weight_index, (a, b)) in enumerate(weight_positions)
+                value = weight_vector[weight_range[local_weight_index]]
+                weight_matrix[a, b] = value
+                weight_matrix[b, a] = value
+            end
+            if !_positive_definite_exact(weight_matrix)
+                all_positive_definite = false
+                break
+            end
+            weights[block_index] = weight_matrix
+        end
+        all_positive_definite || continue
+        all(iszero, transpose(affine_basis) * (form_columns * weight_vector)) || continue
+        return (weights = weights, tolerance = tolerance)
+    end
+
+    return nothing
+end
+
 function _block_face_direction_certificate(
     problem::ProblemData,
     block::BlockStructure,
@@ -692,21 +801,20 @@ function _heuristic_kernel_direction(
     return nothing
 end
 
-function _pivoted_rational_subspace_directions(
+function _rational_subspace_pivot_charts(
     subspace::AbstractMatrix{F},
     settings::Settings,
-    ::Type{F};
-    relation_tolerance = nothing,
+    ::Type{F},
 ) where {F<:AbstractFloat}
     dimension, column_count = size(subspace)
-    (dimension == 0 || column_count == 0) && return Vector{ExactRational}[]
-    all(isfinite, subspace) || return Vector{ExactRational}[]
+    (dimension == 0 || column_count == 0) && return (rank = 0, charts = Vector{Vector{Int}}())
+    all(isfinite, subspace) || return (rank = 0, charts = Vector{Vector{Int}}())
 
     subspace_matrix = Matrix{F}(subspace)
     row_space_matrix = Matrix(transpose(subspace_matrix))
     qr_factor = qr(row_space_matrix, ColumnNorm())
     diagonal = abs.(diag(qr_factor.R))
-    isempty(diagonal) && return Vector{ExactRational}[]
+    isempty(diagonal) && return (rank = 0, charts = Vector{Vector{Int}}())
 
     scale = max(one(F), maximum(abs, subspace_matrix), maximum(diagonal))
     rank_tolerance = max(
@@ -715,16 +823,80 @@ function _pivoted_rational_subspace_directions(
         F(100) * eps(F),
     )
     rank = count(value -> value > rank_tolerance, diagonal)
-    rank == 0 && return Vector{ExactRational}[]
+    rank == 0 && return (rank = 0, charts = Vector{Vector{Int}}())
 
-    pivot_indices = collect(qr_factor.p[1:rank])
-    pivot_set = Set(pivot_indices)
+    pivot_order = collect(qr_factor.p)
+    pivot_indices = pivot_order[1:rank]
+    charts = Vector{Vector{Int}}([copy(pivot_indices)])
+    chart_keys = Set{Tuple{Vararg{Int}}}([Tuple(sort(pivot_indices))])
+    column_norms = [norm(view(row_space_matrix, :, column)) for column in axes(row_space_matrix, 2)]
+    normalized_reversed = copy(row_space_matrix[:, end:-1:1])
+    for column in axes(normalized_reversed, 2)
+        original_column = dimension - column + 1
+        column_norms[original_column] > zero(F) &&
+            (normalized_reversed[:, column] ./= column_norms[original_column])
+    end
+    normalized_qr = qr(normalized_reversed, ColumnNorm())
+    normalized_chart = [dimension - index + 1 for index in normalized_qr.p[1:rank]]
+    normalized_key = Tuple(sort(normalized_chart))
+    normalized_singular_values = svdvals(row_space_matrix[:, normalized_chart])
+    if length(charts) < settings.facial_reduction_subspace_max_charts &&
+       !(normalized_key in chart_keys) &&
+       length(normalized_singular_values) == rank &&
+       minimum(normalized_singular_values) > rank_tolerance
+        push!(charts, normalized_chart)
+        push!(chart_keys, normalized_key)
+    end
+    alternatives = Tuple{F,Vector{Int}}[]
+    for pivot_offset in 1:rank
+        for replacement in pivot_order[(rank + 1):end]
+            trial = copy(pivot_indices)
+            trial[pivot_offset] = replacement
+            key = Tuple(sort(trial))
+            key in chart_keys && continue
+            chart_matrix = row_space_matrix[:, trial]
+            singular_values = svdvals(chart_matrix)
+            length(singular_values) == rank || continue
+            minimum(singular_values) > rank_tolerance || continue
+            condition_number = maximum(singular_values) / minimum(singular_values)
+            push!(alternatives, (condition_number, trial))
+            push!(chart_keys, key)
+        end
+    end
+    sort!(alternatives; by = item -> (item[1], Tuple(item[2])))
+    for (_, chart) in alternatives
+        length(charts) >= settings.facial_reduction_subspace_max_charts && break
+        push!(charts, chart)
+    end
+    return (rank = rank, charts = charts)
+end
+
+function _pivoted_rational_subspace_directions(
+    subspace::AbstractMatrix{F},
+    settings::Settings,
+    ::Type{F};
+    relation_tolerance = nothing,
+    pivot_indices::Union{Nothing,Vector{Int}} = nothing,
+) where {F<:AbstractFloat}
+    dimension, column_count = size(subspace)
+    (dimension == 0 || column_count == 0) && return Vector{ExactRational}[]
+    all(isfinite, subspace) || return Vector{ExactRational}[]
+
+    chart_data = _rational_subspace_pivot_charts(subspace, settings, F)
+    rank = chart_data.rank
+    rank == 0 && return Vector{ExactRational}[]
+    chosen_pivots = pivot_indices === nothing ? first(chart_data.charts) : pivot_indices
+    length(chosen_pivots) == rank || return Vector{ExactRational}[]
+
+    subspace_matrix = Matrix{F}(subspace)
+    row_space_matrix = Matrix(transpose(subspace_matrix))
+    pivot_set = Set(chosen_pivots)
     remaining_indices = [index for index in 1:dimension if !(index in pivot_set)]
 
     relations = if isempty(remaining_indices)
         zeros(F, rank, 0)
     else
-        row_space_matrix[:, pivot_indices] \ row_space_matrix[:, remaining_indices]
+        row_space_matrix[:, chosen_pivots] \ row_space_matrix[:, remaining_indices]
     end
 
     tolerances = _facial_reduction_subspace_tolerances(
@@ -743,7 +915,7 @@ function _pivoted_rational_subspace_directions(
         directions = Vector{Vector{ExactRational}}()
         for pivot_offset in 1:rank
             direction = zeros(ExactRational, dimension)
-            direction[pivot_indices[pivot_offset]] = 1 // 1
+            direction[chosen_pivots[pivot_offset]] = 1 // 1
             for (remaining_offset, remaining_index) in enumerate(remaining_indices)
                 direction[remaining_index] = rational_relations[pivot_offset, remaining_offset]
             end
@@ -757,6 +929,86 @@ function _pivoted_rational_subspace_directions(
     end
 
     return Vector{ExactRational}[]
+end
+
+function _canonical_rational_subspace_key(directions::Vector{Vector{ExactRational}})
+    isempty(directions) && return ()
+    row_basis = Matrix(transpose(hcat(directions...)))
+    reduced, _ = _rref(hcat(row_basis, zeros(ExactRational, size(row_basis, 1))))
+    return Tuple(vec(reduced[:, 1:size(row_basis, 2)]))
+end
+
+function _rational_projector_subspace_directions(
+    subspace::AbstractMatrix{F},
+    rank::Int,
+    tolerance::F,
+) where {F<:AbstractFloat}
+    rank > 0 || return Vector{ExactRational}[]
+    size(subspace, 1) >= rank || return Vector{ExactRational}[]
+    orthogonal_basis = try
+        Matrix(qr(Matrix{F}(subspace)).Q[:, 1:rank])
+    catch
+        return Vector{ExactRational}[]
+    end
+    numeric_projector = orthogonal_basis * transpose(orthogonal_basis)
+    dimension = size(numeric_projector, 1)
+    projector = zeros(ExactRational, dimension, dimension)
+    for j in 1:dimension
+        for i in 1:j
+            numeric_value = (numeric_projector[i, j] + numeric_projector[j, i]) / 2
+            value = rationalize(BigInt, BigFloat(numeric_value); tol = BigFloat(tolerance))
+            projector[i, j] = value
+            projector[j, i] = value
+        end
+    end
+    projector * projector == projector || return Vector{ExactRational}[]
+    directions = [
+        _normalize_rational_direction(collect(view(projector, :, column))) for
+        column in axes(projector, 2) if any(!iszero, view(projector, :, column))
+    ]
+    directions = _linearly_independent_directions(directions)
+    length(directions) == rank || return Vector{ExactRational}[]
+    return directions
+end
+
+function _rational_subspace_candidate_sets(
+    subspace::AbstractMatrix{F},
+    settings::Settings,
+    ::Type{F},
+    tolerance::F,
+) where {F<:AbstractFloat}
+    chart_data = _rational_subspace_pivot_charts(subspace, settings, F)
+    chart_data.rank == 0 && return NamedTuple[]
+    candidate_sets = NamedTuple[]
+    seen = Set{Any}()
+    for (chart_index, pivots) in enumerate(chart_data.charts)
+        _record_facial_reduction_event!(:rational_subspace_charts_attempted)
+        directions = _pivoted_rational_subspace_directions(
+            subspace,
+            settings,
+            F;
+            relation_tolerance = tolerance,
+            pivot_indices = pivots,
+        )
+        isempty(directions) && continue
+        key = _canonical_rational_subspace_key(directions)
+        key in seen && continue
+        push!(seen, key)
+        push!(candidate_sets, (directions = directions, method = "pivot chart $(chart_index)"))
+    end
+    if settings.facial_reduction_projector_recovery
+        _record_facial_reduction_event!(:rational_projectors_attempted)
+        directions = _rational_projector_subspace_directions(
+            subspace,
+            chart_data.rank,
+            tolerance,
+        )
+        if !isempty(directions)
+            key = _canonical_rational_subspace_key(directions)
+            key in seen || push!(candidate_sets, (directions = directions, method = "rational projector"))
+        end
+    end
+    return candidate_sets
 end
 
 function _facial_reduction_subspace_tolerances(
@@ -807,15 +1059,21 @@ function _certified_pivoted_subspace_directions(
     attempted_tolerances = 0
     proposed_directions = 0
     last_violation = nothing
+    seen_subspaces = Set{Any}()
     for tolerance in _facial_reduction_subspace_tolerances(opt.settings, F)
-        candidates = _pivoted_rational_subspace_directions(
+        candidate_sets = _rational_subspace_candidate_sets(
             subspace,
             opt.settings,
-            F;
-            relation_tolerance = tolerance,
+            F,
+            tolerance,
         )
-        isempty(candidates) && continue
+        isempty(candidate_sets) && continue
         attempted_tolerances += 1
+        for candidate_set in candidate_sets
+        candidates = candidate_set.directions
+        subspace_key = _canonical_rational_subspace_key(candidates)
+        subspace_key in seen_subspaces && continue
+        push!(seen_subspaces, subspace_key)
         proposed_directions += length(candidates)
         _record_directions!(:certified, length(candidates), 0, 0)
         if attempted_tolerances == 1 &&
@@ -969,11 +1227,12 @@ function _certified_pivoted_subspace_directions(
             end
         end
     end
+    end
 
     proposed_directions == 0 && return Vector{ExactRational}[]
     _log(
         opt,
-        "Facial reduction: rejected pivoted $(description) candidates for PSD block $(block_index) across $(attempted_tolerances) relation tolerance(s); no exact subspace certificate for $(proposed_directions) proposed direction(s) ($(last_violation))",
+        "Facial reduction: rejected joint $(description) candidates for PSD block $(block_index) across $(attempted_tolerances) relation tolerance(s); no exact subspace certificate for $(proposed_directions) deduplicated proposed direction(s) ($(last_violation))",
     )
     return Vector{ExactRational}[]
 end
@@ -1002,7 +1261,9 @@ function _exact_block_nullspace_directions(
         cache.block_exact_directions[block_index] = Vector{Vector{ExactRational}}()
         return cache.block_exact_directions[block_index]
     end
-    basis = Nemo.identity_matrix(Nemo.QQ, block.size)
+    basis = _with_nemo_error("exact block-nullspace initialization") do
+        Nemo.identity_matrix(Nemo.QQ, block.size)
+    end
     matrices = Nemo.QQMatrix[
         _to_nemo_matrix(_vector_to_matrix(particular, block)),
     ]
@@ -1010,8 +1271,15 @@ function _exact_block_nullspace_directions(
         push!(matrices, _to_nemo_matrix(_vector_to_matrix(view(nullspace, :, column), block)))
     end
     for matrix in matrices
-        _, kernel = Nemo.nullspace(matrix * basis)
-        basis = basis * kernel
+        image = _with_nemo_error("exact block-nullspace matrix multiplication") do
+            matrix * basis
+        end
+        _, kernel = _with_nemo_error("exact block-nullspace computation") do
+            Nemo.nullspace(image)
+        end
+        basis = _with_nemo_error("exact block-nullspace basis update") do
+            basis * kernel
+        end
         size(basis, 2) == 0 && break
     end
 
@@ -1240,6 +1508,68 @@ function _tentative_candidate_keep_bases(
     return keep_bases
 end
 
+function _tentative_batch_work(
+    problem::ProblemData,
+    candidates::Vector{<:_TentativeFaceDirection},
+)
+    keep_bases = _tentative_candidate_keep_bases(problem, candidates)
+    added_dimension = 0
+    restriction_rows = 0
+    for (block_index, keep_basis) in keep_bases
+        reduced_dimension = size(keep_basis, 2)
+        added_dimension += reduced_dimension * (reduced_dimension + 1) ÷ 2
+        restriction_rows += length(problem.blocks[block_index].local_positions)
+    end
+    affine_dimension = problem.affine === nothing ? 0 : size(problem.affine[2], 2)
+    coordinate_dimension = affine_dimension + added_dimension
+    estimated_free_dimension = max(0, coordinate_dimension - restriction_rows)
+    coordinate_entries = BigInt(restriction_rows) * (coordinate_dimension + 1)
+    lift_products = BigInt(length(problem.objective_vector_raw)) * affine_dimension *
+                    (estimated_free_dimension + 1)
+    output_entries = BigInt(length(problem.objective_vector_raw) + added_dimension) *
+                     (estimated_free_dimension + 1)
+    affine_entry_count = if problem.affine === nothing
+        0
+    else
+        length(problem.affine[1]) + length(problem.affine[2])
+    end
+    average_entry_bytes = if affine_entry_count == 0
+        32
+    else
+        max(32, cld(Base.summarysize(problem.affine), affine_entry_count))
+    end
+    estimated_bytes = output_entries * average_entry_bytes
+    return (
+        keep_bases = keep_bases,
+        directions = length(candidates),
+        restriction_rows = restriction_rows,
+        coordinate_dimension = coordinate_dimension,
+        coordinate_entries = coordinate_entries,
+        lift_products = lift_products,
+        output_entries = output_entries,
+        estimated_bytes = estimated_bytes,
+    )
+end
+
+function _tentative_batch_within_budget(work, settings::Settings)
+    return work.directions <= settings.facial_reduction_tentative_max_directions &&
+           work.coordinate_entries <=
+           settings.facial_reduction_tentative_max_coordinate_entries &&
+           work.lift_products <= settings.facial_reduction_tentative_max_lift_products &&
+           work.estimated_bytes <= settings.facial_reduction_tentative_max_estimated_bytes &&
+           work.output_entries <= settings.facial_reduction_affine_lift_max_output_entries &&
+           work.estimated_bytes <= settings.facial_reduction_affine_lift_max_estimated_bytes
+end
+
+function _tentative_batch_work_summary(work, settings::Settings)
+    return "directions=$(work.directions)/$(settings.facial_reduction_tentative_max_directions), " *
+           "coordinate_entries=$(work.coordinate_entries)/$(settings.facial_reduction_tentative_max_coordinate_entries), " *
+           "lift_products=$(work.lift_products)/$(settings.facial_reduction_tentative_max_lift_products), " *
+           "estimated_bytes=$(work.estimated_bytes)/$(settings.facial_reduction_tentative_max_estimated_bytes), " *
+           "output_entries=$(work.output_entries)/$(settings.facial_reduction_affine_lift_max_output_entries), " *
+           "affine_lift_bytes=$(work.estimated_bytes)/$(settings.facial_reduction_affine_lift_max_estimated_bytes)"
+end
+
 function _tentative_batch_problem(
     problem::ProblemData,
     candidates::Vector{<:_TentativeFaceDirection},
@@ -1276,6 +1606,10 @@ function _tentative_greedy_admission(
     consistent_problem = nothing
     for candidate_item in candidates
         trial_candidates = vcat(accepted_candidates, [candidate_item])
+        _tentative_batch_within_budget(
+            _tentative_batch_work(problem, trial_candidates),
+            settings,
+        ) || continue
         trial_problem = _tentative_batch_problem(problem, trial_candidates; settings)
         if trial_problem.affine === nothing
             continue
@@ -1362,6 +1696,41 @@ function _tentative_feasibility_search_problem(
         opt,
         "Feasibility search: preparing tentative batch of $(length(unique_candidates)) PSD direction(s) across $(block_count) block(s)",
     )
+    batch_work = _tentative_batch_work(problem, unique_candidates)
+    if !_tentative_batch_within_budget(batch_work, opt.settings)
+        _record_facial_reduction_event!(:tentative_batches_skipped_by_budget)
+        _log(
+            opt,
+            "Feasibility search: complete tentative batch exceeds work budget ($(_tentative_batch_work_summary(batch_work, opt.settings))); trying one direction before recomputing the numerical face",
+        )
+        for candidate_item in unique_candidates
+            incremental_candidates = [candidate_item]
+            incremental_work = _tentative_batch_work(problem, incremental_candidates)
+            _tentative_batch_within_budget(incremental_work, opt.settings) || continue
+            checkpoint = stage -> _log(opt, "Feasibility search: incremental tentative face: $(stage)")
+            incremental_problem = _tentative_batch_problem(
+                problem,
+                incremental_candidates;
+                checkpoint,
+                settings = opt.settings,
+            )
+            incremental_problem.affine === nothing && continue
+            _record_directions!(
+                :tentative,
+                length(candidates),
+                1,
+                length(candidates) - 1,
+            )
+            _log(
+                opt,
+                "Feasibility search: admitted one budgeted tentative direction from PSD block $(candidate_item.block_index); remaining kernels will be recomputed on the restricted problem",
+            )
+            return _tentative_search_result(incremental_problem, nothing, return_details)
+        end
+        _record_directions!(:tentative, length(candidates), 0, length(candidates))
+        _log(opt, "Feasibility search: no tentative direction fits the configured exact-work budget")
+        return _tentative_search_result(nothing, nothing, return_details)
+    end
     tentative_checkpoint = stage -> _log(opt, "Feasibility search: tentative batch: $(stage)")
     batch_problem = _tentative_batch_problem(
         problem,
@@ -1637,6 +2006,7 @@ function _facial_reduction_oracle_attempt(
     ::Type{HF},
     ;
     normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
+    syssolver_override::Union{Nothing,Symbol} = nothing,
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         oracle_start_time = time_ns()
@@ -1660,7 +2030,11 @@ function _facial_reduction_oracle_attempt(
             record_oracle()
             return nothing
         end
-        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(opt.settings, HF)
+        syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(
+            opt.settings,
+            HF;
+            choice_override = syssolver_override,
+        )
         tolerance_kwargs = _phase1_hypatia_tolerance_kwargs(opt.settings, HF)
         solver = Hypatia.Solvers.Solver{HF}(
             ;
@@ -1679,9 +2053,15 @@ function _facial_reduction_oracle_attempt(
                 Hypatia.Solvers.solve(solver)
             end
         catch err
+            failure = if err isa SingularException
+                "singular numerical system"
+            else
+                summary = _exception_message(err)
+                isempty(summary) ? _exception_type_name(err) : summary
+            end
             _log(
                 opt,
-                "Facial reduction oracle unavailable: $(typeof(err))",
+                "Facial reduction oracle unavailable: $(failure)",
             )
             record_oracle()
             return nothing
@@ -1742,7 +2122,10 @@ function _facial_reduction_slack(
     s = if isempty(y)
         zeros(ExactRational, size(problem.A, 2))
     else
-        vec(_from_nemo_matrix(_facial_reduction_A_transpose!(cache, problem) * y_nemo))
+        product = _with_nemo_error("exact facial-reduction slack multiplication") do
+            _facial_reduction_A_transpose!(cache, problem) * y_nemo
+        end
+        vec(_from_nemo_matrix(product))
     end
     scalar_slack = Dict{Int,ExactRational}()
     for index in problem.positive_scalars
@@ -1764,7 +2147,12 @@ function _facial_reduction_oracle_tolerances(
     if isempty(tolerances) || coarse > first(tolerances)
         pushfirst!(tolerances, coarse)
     end
-    return unique(tolerances)
+    append!(
+        tolerances,
+        F[F(1.0e-3), F(1.0e-4), F(1.0e-5), F(1.0e-6), F(1.0e-7)],
+    )
+    filter!(tolerance -> tolerance > zero(F), tolerances)
+    return sort!(unique(tolerances); rev = true)
 end
 
 function _facial_reduction_oracle_equalities(
@@ -1811,6 +2199,100 @@ function _dual_slack_has_exact_certificate(
     return _solve_affine_system(certificate_matrix, certificate_rhs) !== nothing
 end
 
+function _exact_exposing_slack_from_stable_projective_entries(
+    opt::Optimizer,
+    problem::ProblemData,
+    numeric_slack::AbstractVector{F},
+    ::Type{F},
+    source::AbstractString,
+) where {F<:AbstractFloat}
+    pivot = argmax(index -> abs(numeric_slack[index]), eachindex(numeric_slack))
+    pivot_value = numeric_slack[pivot]
+    iszero(pivot_value) && return nothing
+    projective_slack = numeric_slack ./ pivot_value
+    tolerances = _facial_reduction_oracle_tolerances(opt.settings, F)
+    length(tolerances) >= 2 || return nothing
+    rounded = [
+        ExactRational[
+            rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
+            value in projective_slack
+        ] for tolerance in tolerances
+    ]
+
+    numeric_A_transpose = transpose(_to_working_array(F, problem.A))
+    numeric_y = try
+        numeric_A_transpose \ projective_slack
+    catch
+        return nothing
+    end
+    all(isfinite, numeric_y) || return nothing
+
+    for tolerance_index in 1:(length(tolerances) - 1)
+        coarse = rounded[tolerance_index]
+        fine = rounded[tolerance_index + 1]
+        stable_positions = [
+            index for index in eachindex(coarse) if coarse[index] == fine[index]
+        ]
+        pivot in stable_positions || push!(stable_positions, pivot)
+        length(stable_positions) >= 2 || continue
+
+        equality_rows = Vector{Vector{ExactRational}}([copy(problem.b)])
+        equality_rhs = ExactRational[0 // 1]
+        for position in stable_positions
+            push!(equality_rows, collect(problem.A[:, position]))
+            push!(equality_rhs, position == pivot ? 1 // 1 : coarse[position])
+        end
+        equalities = _independent_affine_equalities(
+            Matrix(transpose(hcat(equality_rows...))),
+            equality_rhs,
+        )
+        equalities === nothing && continue
+        equality_matrix, independent_rhs = equalities
+        affine = _solve_affine_system(Matrix(equality_matrix), independent_rhs)
+        affine === nothing && continue
+        particular, nullspace = affine
+        numeric_coordinates = if size(nullspace, 2) == 0
+            F[]
+        else
+            _to_working_array(F, nullspace) \
+                (numeric_y - _to_working_array(F, particular))
+        end
+        all(isfinite, numeric_coordinates) || continue
+
+        for coordinate_tolerance in tolerances
+            y = if isempty(numeric_coordinates)
+                particular
+            else
+                rational_coordinates = ExactRational[
+                    rationalize(
+                        BigInt,
+                        BigFloat(value);
+                        tol = BigFloat(coordinate_tolerance),
+                    ) for value in numeric_coordinates
+                ]
+                particular + nullspace * rational_coordinates
+            end
+            s, scalar_slack, block_slack = _facial_reduction_slack(problem, y)
+            s[pivot] == 1 // 1 || continue
+            iszero(dot(problem.b, y)) || continue
+            all(index -> iszero(s[index]), _facial_reduction_free_positions(problem)) ||
+                continue
+            all(value -> value >= 0 // 1, values(scalar_slack)) || continue
+            all(matrix -> _positive_semidefinite_exact(matrix), values(block_slack)) || continue
+            _slack_has_exposure(scalar_slack, block_slack) || continue
+            _log(
+                opt,
+                "Facial reduction: recovered exact exposing slack from $(source) " *
+                "using $(length(stable_positions)) stable projective entries " *
+                "(entry_tol=$(_format_metric(tolerances[tolerance_index])), " *
+                "coordinate_tol=$(_format_metric(coordinate_tolerance)))",
+            )
+            return scalar_slack, block_slack
+        end
+    end
+    return nothing
+end
+
 function _exact_exposing_slack_from_numeric_slack(
     opt::Optimizer,
     problem::ProblemData,
@@ -1822,11 +2304,28 @@ function _exact_exposing_slack_from_numeric_slack(
     all(isfinite, numeric_slack) || return nothing
 
     free_positions = _facial_reduction_free_positions(problem)
+    pivot = argmax(index -> abs(numeric_slack[index]), eachindex(numeric_slack))
+    pivot_value = numeric_slack[pivot]
     for tolerance in _facial_reduction_oracle_tolerances(opt.settings, F)
-        slack = ExactRational[
+        candidates = Tuple{String,Vector{ExactRational}}[]
+        if !iszero(pivot_value)
+            projective_slack = ExactRational[
+                rationalize(
+                    BigInt,
+                    BigFloat(value / pivot_value);
+                    tol = BigFloat(tolerance),
+                ) for value in numeric_slack
+            ]
+            projective_slack[pivot] = 1 // 1
+            push!(candidates, ("projective", projective_slack))
+        end
+        direct_slack = ExactRational[
             rationalize(BigInt, BigFloat(value); tol = BigFloat(tolerance)) for
             value in numeric_slack
         ]
+        push!(candidates, ("direct", direct_slack))
+
+        for (recovery_mode, slack) in candidates
         all(index -> iszero(slack[index]), free_positions) || continue
 
         scalar_slack = Dict{Int,ExactRational}()
@@ -1845,10 +2344,21 @@ function _exact_exposing_slack_from_numeric_slack(
 
         _log(
             opt,
-            "Facial reduction: recovered exact exposing slack from $(source) (tol=$(_format_metric(tolerance)))",
+            "Facial reduction: recovered exact exposing slack from $(source) " *
+            "($(recovery_mode), tol=$(_format_metric(tolerance)))",
         )
         return scalar_slack, block_slack
+        end
     end
+
+    stable_recovery = _exact_exposing_slack_from_stable_projective_entries(
+        opt,
+        problem,
+        numeric_slack,
+        F,
+        source,
+    )
+    stable_recovery === nothing || return stable_recovery
 
     return nothing
 end
@@ -1951,9 +2461,6 @@ struct _SieveRowCertificate
     row::Vector{ExactRational}
     reduction::_CertifiedFacialReduction
 end
-
-const _SIEVE_TRANSFORM_MAX_ENTRIES = 250_000
-const _FACIAL_REDUCTION_AFFINE_COMPACTION_FACTOR = 4
 
 const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
 const _FACIAL_REDUCTION_CACHE_VERSION = 1
@@ -2529,7 +3036,8 @@ function _sieve_facial_reduction_certificates(
         end
     end
 
-    if row_count * (size(problem.A, 2) + 1) > _SIEVE_TRANSFORM_MAX_ENTRIES
+    if BigInt(row_count) * (size(problem.A, 2) + 1) >
+       opt.settings.facial_reduction_sieve_transform_max_entries
         _log(
             opt,
             "Facial reduction Sieve: skipping transformed-row provenance for " *
@@ -2604,6 +3112,323 @@ function _facial_reduction_oracle_float_type(opt::Optimizer, problem::ProblemDat
     return configured_type
 end
 
+function _rational_boundary_kernel_candidate_sets(
+    opt::Optimizer,
+    block_matrix::Matrix{F},
+    ::Type{F},
+) where {F<:AbstractFloat}
+    symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
+    eigen_factor = _facial_reduction_eigen(opt, symmetric_matrix)
+    exposure_tolerance = max(
+        _to_working_float(F, opt.settings.facial_reduction_exposure_tolerance),
+        F(100) * eps(F),
+    )
+    kernel_indices = [
+        index for (index, value) in enumerate(eigen_factor.values) if
+        abs(value) <= exposure_tolerance
+    ]
+    isempty(kernel_indices) && return NamedTuple[]
+
+    kernel_subspace = Matrix(eigen_factor.vectors[:, kernel_indices])
+    candidate_sets = NamedTuple[]
+    seen = Set{Any}()
+    for tolerance in _facial_reduction_subspace_tolerances(opt.settings, F)
+        for candidate_set in _rational_subspace_candidate_sets(
+            kernel_subspace,
+            opt.settings,
+            F,
+            tolerance,
+        )
+            directions = _linearly_independent_directions(candidate_set.directions)
+            length(directions) == length(kernel_indices) || continue
+            key = _canonical_rational_subspace_key(directions)
+            key in seen && continue
+            push!(seen, key)
+            push!(candidate_sets, (
+                directions = directions,
+                method = candidate_set.method,
+                tolerance = tolerance,
+            ))
+        end
+    end
+    return candidate_sets
+end
+
+function _numeric_joint_boundary_exposing_slack(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence::_FacialReductionEvidence{F},
+    ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+) where {F<:AbstractFloat}
+    problem.affine === nothing && return nothing
+    exposure_tolerance = max(
+        _to_working_float(F, opt.settings.facial_reduction_exposure_tolerance),
+        F(100) * eps(F),
+    )
+    block_indices = Int[]
+    direction_matrices = Matrix{F}[]
+    weight_positions_by_block = Vector{Vector{Tuple{Int,Int}}}()
+    total_weight_dimension = 0
+    for (block_index, block) in enumerate(problem.blocks)
+        block_matrix = _vector_to_matrix(evidence.vector, block)
+        eigen_factor = _facial_reduction_eigen(
+            opt,
+            Symmetric((block_matrix + transpose(block_matrix)) / 2),
+        )
+        kernel_indices = [
+            index for (index, value) in enumerate(eigen_factor.values) if
+            abs(value) <= exposure_tolerance
+        ]
+        isempty(kernel_indices) && continue
+        directions = Matrix(eigen_factor.vectors[:, kernel_indices])
+        weight_positions = _triangle_positions(length(kernel_indices))
+        push!(block_indices, block_index)
+        push!(direction_matrices, directions)
+        push!(weight_positions_by_block, weight_positions)
+        total_weight_dimension += length(weight_positions)
+    end
+    length(block_indices) >= 2 || return nothing
+
+    variable_count = length(problem.objective_vector_raw)
+    form_columns = zeros(F, variable_count, total_weight_dimension)
+    identity_target = zeros(F, total_weight_dimension)
+    weight_ranges = UnitRange{Int}[]
+    next_weight = 1
+    for offset in eachindex(block_indices)
+        block = problem.blocks[block_indices[offset]]
+        directions = direction_matrices[offset]
+        weight_positions = weight_positions_by_block[offset]
+        weight_range = next_weight:(next_weight + length(weight_positions) - 1)
+        push!(weight_ranges, weight_range)
+        for (local_weight_index, (a, b)) in enumerate(weight_positions)
+            global_weight_index = weight_range[local_weight_index]
+            weight_basis = zeros(F, size(directions, 2), size(directions, 2))
+            weight_basis[a, b] = one(F)
+            weight_basis[b, a] = one(F)
+            exposed_matrix = directions * weight_basis * transpose(directions)
+            for (local_index, (i, j)) in enumerate(block.local_positions)
+                form_columns[block.global_positions[local_index], global_weight_index] =
+                    i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
+            end
+            a == b && (identity_target[global_weight_index] = one(F))
+        end
+        next_weight = last(weight_range) + 1
+    end
+
+    particular, nullspace = problem.affine
+    affine_basis = _to_working_array(F, hcat(particular, nullspace))
+    vanish_constraints = transpose(affine_basis) * form_columns
+    singular_factor = try
+        svd(vanish_constraints)
+    catch
+        return nothing
+    end
+    singular_values = singular_factor.S
+    scale = max(one(F), isempty(singular_values) ? zero(F) : maximum(abs, singular_values))
+    rank_tolerance = max(
+        sqrt(eps(F)),
+        F(1000) * exposure_tolerance,
+        F(1.0e-8),
+    ) * scale
+    constraint_rank = count(value -> value > rank_tolerance, singular_values)
+    if constraint_rank >= total_weight_dimension
+        _log(
+            opt,
+            "Facial reduction: joint numerical scout found no approximate weighted " *
+            "nullspace ($(total_weight_dimension) weight variable(s), tol=$(_format_metric(rank_tolerance)))",
+        )
+        return nothing
+    end
+    weight_subspace = transpose(singular_factor.Vt)[:, (constraint_rank + 1):end]
+    coordinates = try
+        weight_subspace \ identity_target
+    catch
+        return nothing
+    end
+    all(isfinite, coordinates) || return nothing
+    weight_vector = weight_subspace * coordinates
+
+    for offset in eachindex(block_indices)
+        weight_positions = weight_positions_by_block[offset]
+        weight_range = weight_ranges[offset]
+        rank = size(direction_matrices[offset], 2)
+        weight_matrix = zeros(F, rank, rank)
+        for (local_weight_index, (a, b)) in enumerate(weight_positions)
+            value = weight_vector[weight_range[local_weight_index]]
+            weight_matrix[a, b] = value
+            weight_matrix[b, a] = value
+        end
+        eigenvalues = try
+            eigvals(Symmetric(weight_matrix))
+        catch
+            return nothing
+        end
+        if minimum(eigenvalues) <= rank_tolerance
+            _log(
+                opt,
+                "Facial reduction: joint numerical scout weight for PSD block " *
+                "$(block_indices[offset]) was not positive definite " *
+                "(min_eig=$(_format_metric(minimum(eigenvalues))))",
+            )
+            return nothing
+        end
+    end
+
+    numeric_slack = form_columns * weight_vector
+    numeric_A_transpose = transpose(_to_working_array(F, problem.A))
+    y = try
+        numeric_A_transpose \ numeric_slack
+    catch
+        return nothing
+    end
+    all(isfinite, y) || return nothing
+    trace_row = _facial_reduction_trace_row(problem)
+    normalization = dot(_to_working_array(F, trace_row), y)
+    abs(normalization) > rank_tolerance || return nothing
+    y ./= normalization
+
+    exact_slack = _exact_facial_reduction_oracle_slack(
+        opt,
+        problem,
+        collect(y),
+        F;
+        cache,
+        normalization_row = trace_row,
+    )
+    if exact_slack === nothing
+        _log(
+            opt,
+            "Facial reduction: joint numerical scout found a coupled PSD slack but " *
+            "could not recover it exactly",
+        )
+        return nothing
+    end
+    _log(
+        opt,
+        "Facial reduction: recovered an exact joint exposing slack by numerically " *
+        "coupling $(length(block_indices)) boundary PSD subspaces",
+    )
+    return exact_slack
+end
+
+function _certify_joint_boundary_primal_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    evidence::_FacialReductionEvidence{F},
+    ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+) where {F<:AbstractFloat}
+    numeric_exact_slack = _numeric_joint_boundary_exposing_slack(
+        opt,
+        problem,
+        evidence,
+        F;
+        cache,
+    )
+    if numeric_exact_slack !== nothing
+        scalar_slack_exact, block_slack_exact = numeric_exact_slack
+        reduction = _certified_reduction_from_exact_slack(
+            opt,
+            problem,
+            scalar_slack_exact,
+            block_slack_exact,
+            "$(evidence.source) joint numerical scout",
+        )
+        reduction === nothing || return reduction
+    end
+
+    candidate_blocks = Int[]
+    candidates_by_block = Vector{Vector{NamedTuple}}()
+    for (block_index, block) in enumerate(problem.blocks)
+        block_matrix = _vector_to_matrix(evidence.vector, block)
+        candidate_sets = _rational_boundary_kernel_candidate_sets(opt, block_matrix, F)
+        isempty(candidate_sets) && continue
+        push!(candidate_blocks, block_index)
+        push!(candidates_by_block, candidate_sets)
+    end
+    length(candidate_blocks) >= 2 || return nothing
+
+    max_combinations = max(1, opt.settings.facial_reduction_subspace_max_charts^2)
+    attempted = 0
+    aligned_combinations = Tuple[]
+    common_tolerances = reduce(
+        intersect,
+        [Set(candidate.tolerance for candidate in block_candidates) for
+         block_candidates in candidates_by_block],
+    )
+    for tolerance in sort!(collect(common_tolerances); rev = true)
+        aligned = Tuple(
+            first(candidate for candidate in block_candidates if candidate.tolerance == tolerance) for
+            block_candidates in candidates_by_block
+        )
+        push!(aligned_combinations, aligned)
+    end
+    combinations = Iterators.flatten((
+        aligned_combinations,
+        Iterators.product(candidates_by_block...),
+    ))
+    seen_combinations = Set{Any}()
+    for combination in combinations
+        combination_key = Tuple(
+            _canonical_rational_subspace_key(candidate.directions) for candidate in combination
+        )
+        combination_key in seen_combinations && continue
+        push!(seen_combinations, combination_key)
+        attempted += 1
+        attempted > max_combinations && break
+        directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}(
+            block_index => combination[offset].directions for
+            (offset, block_index) in enumerate(candidate_blocks)
+        )
+        exposure = _multiblock_weighted_subspace_exposure(
+            problem,
+            directions_by_block,
+            opt.settings,
+            F,
+        )
+        exposure === nothing && continue
+
+        keep_bases = Dict{Int,Matrix{ExactRational}}()
+        for block_index in candidate_blocks
+            directions = directions_by_block[block_index]
+            keep_basis = _orthogonal_complement_basis(
+                directions,
+                problem.blocks[block_index].size,
+            )
+            size(keep_basis, 2) == problem.blocks[block_index].size && continue
+            keep_bases[block_index] = keep_basis
+        end
+        isempty(keep_bases) && continue
+        _record_directions!(
+            :certified,
+            sum(length, values(directions_by_block)),
+            sum(length, values(directions_by_block)),
+            0,
+        )
+        _log(
+            opt,
+            "Facial reduction: recovered a joint exact exposing certificate from " *
+            "$(evidence.source) across $(length(keep_bases)) PSD blocks " *
+            "(weight_tol=$(_format_metric(exposure.tolerance)))",
+        )
+        return _CertifiedFacialReduction(
+            "$(evidence.source) joint PSD certificate",
+            Int[],
+            keep_bases,
+        )
+    end
+    attempted > 0 && _log(
+        opt,
+        "Facial reduction: no joint exact exposing certificate recovered from " *
+        "$(evidence.source) across $(length(candidate_blocks)) candidate PSD blocks " *
+        "after $(min(attempted, max_combinations)) candidate combination(s)",
+    )
+    return nothing
+end
+
 function _certify_boundary_primal_evidence(
     opt::Optimizer,
     problem::ProblemData,
@@ -2612,6 +3437,16 @@ function _certify_boundary_primal_evidence(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
+    joint_reduction = _certify_joint_boundary_primal_evidence(
+        opt,
+        problem,
+        evidence,
+        F,
+        ;
+        cache,
+    )
+    joint_reduction === nothing || return joint_reduction
+
     keep_bases = Dict{Int,Matrix{ExactRational}}()
 
     for (block_index, block) in enumerate(problem.blocks)
@@ -2973,25 +3808,63 @@ function _facial_reduction_oracle_round(
     normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
     source::AbstractString = "oracle",
 ) where {HF<:AbstractFloat}
-    oracle_point = _facial_reduction_oracle_attempt(
-        opt,
-        problem,
-        HF;
-        normalization_row,
+    float_types = DataType[HF]
+    append!(
+        float_types,
+        _precision_escalation_types(
+            HF,
+            opt.settings.facial_reduction_precision_escalation_max_retries,
+        ),
     )
-    oracle_point === nothing && return nothing
-
-    evidence = _FacialReductionEvidence(:oracle_point, String(source), oracle_point)
-    reduction = _certify_oracle_point_evidence(
-        opt,
-        problem,
-        evidence,
-        HF;
-        cache,
-        normalization_row,
-    )
-    reduction === nothing && return nothing
-    return reduction
+    configured_solver = _phase1_hypatia_syssolver(opt.settings)
+    for (precision_index, oracle_float_type) in enumerate(float_types)
+        precision_index > 1 && begin
+            _record_facial_reduction_event!(:precision_escalations_attempted)
+            _log(opt, "Facial reduction oracle: retrying at $(oracle_float_type)")
+        end
+        alternate_solver = if oracle_float_type == Float64 &&
+                              _phase1_hypatia_prefers_sparse_float64(problem)
+            :symindef_indirect
+        else
+            :qrchol_dense
+        end
+        solver_overrides = Union{Nothing,Symbol}[nothing]
+        if opt.settings.facial_reduction_precision_escalation_max_retries > 0 &&
+           configured_solver != alternate_solver
+            push!(solver_overrides, alternate_solver)
+        end
+        for (solver_index, solver_override) in enumerate(solver_overrides)
+            solver_index > 1 && _log(
+                opt,
+                "Facial reduction oracle: retrying $(oracle_float_type) with $(solver_override) system solver",
+            )
+            oracle_point = _facial_reduction_oracle_attempt(
+                opt,
+                problem,
+                oracle_float_type;
+                normalization_row,
+                syssolver_override = solver_override,
+            )
+            oracle_point === nothing && continue
+            evidence_source = solver_override === nothing ? String(source) :
+                              "$(source) ($(solver_override))"
+            evidence = _FacialReductionEvidence(
+                :oracle_point,
+                evidence_source,
+                oracle_point,
+            )
+            reduction = _certify_oracle_point_evidence(
+                opt,
+                problem,
+                evidence,
+                oracle_float_type;
+                cache,
+                normalization_row,
+            )
+            reduction === nothing || return reduction
+        end
+    end
+    return nothing
 end
 
 function _cheap_facial_reduction_evidence(
@@ -3038,6 +3911,7 @@ function _certified_facial_reduction_from_initial_evidence(
         )
         reduction === nothing || push!(reductions, reduction)
     end
+    length(reductions) == 1 && return first(reductions)
     return _merge_certified_facial_reductions(opt, problem, reductions)
 end
 
@@ -3247,14 +4121,39 @@ function _apply_facial_reduction(
         checkpoint !== nothing && checkpoint("face application: incremental restriction unavailable; solving full exact affine system")
         affine = _solve_affine_system(A, b; checkpoint = checkpoint)
     end
-    if size(A, 1) > _FACIAL_REDUCTION_AFFINE_COMPACTION_FACTOR * max(1, size(problem.A, 1))
+    compaction_requested = size(A, 1) >
+                           BigInt(settings.facial_reduction_affine_compaction_factor) *
+                           max(1, size(problem.A, 1))
+    compaction_entries = BigInt(size(A, 1)) * (size(A, 2) + 1)
+    compaction_allowed = settings.facial_reduction_affine_compaction_max_entries > 0 &&
+                         compaction_entries <=
+                         settings.facial_reduction_affine_compaction_max_entries
+    if compaction_requested && compaction_allowed
         checkpoint !== nothing && checkpoint("face application: compacting redundant affine equations")
-        compacted = _independent_affine_equalities(A, b; checkpoint = checkpoint)
+        compacted = try
+            _independent_affine_equalities(A, b; checkpoint = checkpoint)
+        catch err
+            err isa ExactLinearAlgebraError || rethrow()
+            checkpoint !== nothing && checkpoint(
+                "face application: affine compaction unavailable ($(_exception_message(err))); retaining un-compacted exact system",
+            )
+            nothing
+        end
         if compacted !== nothing
             A, b = compacted
-            checkpoint !== nothing && checkpoint("face application: solving compacted exact affine system")
-            affine = _solve_affine_system(A, b; checkpoint = checkpoint)
+            # Compaction is an exact row operation on [A b], so it does not
+            # change the affine slice. The parametrization computed above is
+            # still complete; solving the RREF output again only duplicates
+            # a large exact elimination and can cause severe coefficient and
+            # memory growth.
+            checkpoint !== nothing && checkpoint(
+                "face application: retaining existing exact affine parametrization after compaction",
+            )
         end
+    elseif compaction_requested
+        checkpoint !== nothing && checkpoint(
+            "face application: skipping optional affine compaction ($(compaction_entries) entries; limit $(settings.facial_reduction_affine_compaction_max_entries))",
+        )
     end
     checkpoint !== nothing && checkpoint("face application: pruning forced cone faces")
     positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
@@ -3434,19 +4333,45 @@ function _facially_reduce_search_problem(
     reduction = try
         _facial_reduction_round(opt, problem, candidate, phase1_dual_slack, F)
     catch err
-        _is_inexact_facial_reduction_error(err) || rethrow()
-        _log(opt, "Facial reduction: exact recovery of the candidate face was impossible")
-        nothing
+        if _is_inexact_facial_reduction_error(err)
+            _log(opt, "Facial reduction: exact recovery of the candidate face was impossible")
+            nothing
+        elseif err isa ExactLinearAlgebraError
+            _log(
+                opt,
+                "Facial reduction: optional exact preprocessing unavailable ($(_exception_message(err))); continuing with the original SDP",
+            )
+            return (
+                problem = problem,
+                tentative = false,
+                fallback_problem = nothing,
+            )
+        else
+            rethrow()
+        end
     end
     if reduction !== nothing
-        reduced_problem = _apply_facial_reduction(
-            problem,
-            reduction.exposed_scalars,
-            reduction.keep_bases,
-            ;
-            certified = false,
-            settings = opt.settings,
-        )
+        reduced_problem = try
+            _apply_facial_reduction(
+                problem,
+                reduction.exposed_scalars,
+                reduction.keep_bases,
+                ;
+                certified = false,
+                settings = opt.settings,
+            )
+        catch err
+            err isa ExactLinearAlgebraError || rethrow()
+            _log(
+                opt,
+                "Facial reduction: exact face application unavailable ($(_exception_message(err))); continuing with the original SDP",
+            )
+            return (
+                problem = problem,
+                tentative = false,
+                fallback_problem = nothing,
+            )
+        end
         if reduced_problem.affine === nothing
             message =
                 "Facial reduction found a PSD block on the cone boundary, " *
@@ -3473,13 +4398,26 @@ function _facially_reduce_search_problem(
             fallback_problem = nothing,
         )
     end
-    tentative_result = _tentative_feasibility_search_problem(
-        opt,
-        problem,
-        candidate,
-        F;
-        return_details = true,
-    )
+    tentative_result = try
+        _tentative_feasibility_search_problem(
+            opt,
+            problem,
+            candidate,
+            F;
+            return_details = true,
+        )
+    catch err
+        err isa ExactLinearAlgebraError || rethrow()
+        _log(
+            opt,
+            "Feasibility search: optional tentative face preprocessing unavailable ($(_exception_message(err))); continuing with the original SDP",
+        )
+        return (
+            problem = problem,
+            tentative = false,
+            fallback_problem = nothing,
+        )
+    end
     tentative_problem = tentative_result.problem
     if tentative_problem !== nothing
         _record_reduction_round!(

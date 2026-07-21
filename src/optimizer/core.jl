@@ -35,11 +35,14 @@ mutable struct FacialReductionStatistics
     precision_escalations_attempted::Int
     tentative_batches_skipped_by_budget::Int
     affine_lifts_skipped_by_budget::Int
+    recovery_path_attempts::Dict{Symbol,Int}
+    recovery_path_successes::Dict{Symbol,Int}
 end
 
 FacialReductionStatistics() = FacialReductionStatistics(
     0, 0.0, 0, 0, 0.0, 0, Tuple{Int,Int}[], 0.0, 0, 0.0, 0, 0.0,
     Dict{Int,Int}(), 0.0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    Dict{Symbol,Int}(), Dict{Symbol,Int}(),
 )
 
 function _facial_reduction_statistics_snapshot(stats::FacialReductionStatistics)
@@ -74,7 +77,17 @@ function _facial_reduction_statistics_snapshot(stats::FacialReductionStatistics)
         precision_escalations_attempted = stats.precision_escalations_attempted,
         tentative_batches_skipped_by_budget = stats.tentative_batches_skipped_by_budget,
         affine_lifts_skipped_by_budget = stats.affine_lifts_skipped_by_budget,
+        recovery_path_attempts = copy(stats.recovery_path_attempts),
+        recovery_path_successes = copy(stats.recovery_path_successes),
     )
+end
+
+function _record_facial_reduction_path!(path::Symbol; success::Bool = false)
+    stats = _current_facial_reduction_statistics()
+    stats isa FacialReductionStatistics || return
+    counts = success ? stats.recovery_path_successes : stats.recovery_path_attempts
+    counts[path] = get(counts, path, 0) + 1
+    return
 end
 
 function _record_facial_reduction_event!(field::Symbol, count::Int = 1)
@@ -259,6 +272,11 @@ Base.@kwdef mutable struct Settings
     facial_reduction_rank_tolerance::BigFloat = big"1e-8"
     facial_reduction_subspace_max_charts::Int = 8
     facial_reduction_projector_recovery::Bool = true
+    # Coupled multi-block and stable partial rational reconstruction are
+    # default-on fallbacks, but are attempted only after the established
+    # initial-evidence and exposing-vector oracle routes have failed.
+    facial_reduction_multiblock_recovery::Bool = true
+    facial_reduction_stable_projective_recovery::Bool = true
     facial_reduction_precision_escalation_max_retries::Int = 0
     facial_reduction_irrational_behavior::Symbol = :error
     facial_reduction_save_file::String = ""

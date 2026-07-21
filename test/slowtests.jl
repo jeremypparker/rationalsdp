@@ -59,6 +59,26 @@ function _sairs_lyapunov_model(n::Int)
 end
 
 _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")) in ("1", "true", "yes")
+_report_facial_reduction_paths() =
+    lowercase(get(ENV, "RATIONALSDP_REPORT_FACIAL_REDUCTION_PATHS", "")) in ("1", "true", "yes")
+
+function _format_recovery_path_counts(counts)
+    entries = sort!(collect(counts); by = first)
+    return isempty(entries) ? "none" : join(("$(path)=$(count)" for (path, count) in entries), ",")
+end
+
+function _optimize_slow_test!(label::AbstractString, model)
+    elapsed = @elapsed optimize!(model)
+    if _report_facial_reduction_paths()
+        stats = facial_reduction_stats(model)
+        println(
+            "RATIONALSDP_SLOW_PATH\t$(label)\tseconds=$(round(elapsed; digits = 3))" *
+            "\tattempts=$(_format_recovery_path_counts(stats.recovery_path_attempts))" *
+            "\tsuccesses=$(_format_recovery_path_counts(stats.recovery_path_successes))",
+        )
+    end
+    return nothing
+end
 
 @testset "RationalSDP slow regressions" begin
     @testset "Working float type selection with BigFloat solve" begin
@@ -81,7 +101,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         @variable(model, X[1:1, 1:1], PSD)
         @constraint(model, X[1, 1] == 1//1)
         @objective(model, Min, 0//1)
-        optimize!(model)
+        _optimize_slow_test!("working-float-bigfloat", model)
         @test termination_status(model) == MOI.OPTIMAL
         @test value(X[1, 1]) == 1//1
     end
@@ -106,7 +126,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         @variable(model, B)
         @constraint(model, coefficients(B - x[3]^2 - LV - basis_b' * Q * basis_b) .== 0)
         @objective(model, Min, B)
-        optimize!(model)
+        _optimize_slow_test!("sextic-lorenz", model)
 
         @test termination_status(model) == MOI.ITERATION_LIMIT
         @test value(B) > 729//1
@@ -155,41 +175,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         normf = sum(dSdt[i]^2 + dAdt[i]^2 + dIdt[i]^2 for i in 1:n)
 
         @constraint(model, dVdt - normf in SOSCone())
-        optimize!(model)
-
-        @test termination_status(model) == MOI.OPTIMAL
-        @test primal_status(model) == MOI.FEASIBLE_POINT
-        test_facial_reduction_statistics(model)
-        test_exact_extracted_sdp(model)
-    end
-
-    @testset "SIR double-Hopf Lyapunov SOS feasibility" begin
-        model = rational_model(Rational{BigInt})
-        set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64x2")
-        set_optimizer_attribute(model, "working_float_type", "Float64x2")
-        set_optimizer_attribute(model, "facial_reduction_float_type", "Float64x4")
-        set_optimizer_attribute(model, "facial_reduction_sieve_transform_max_entries", 500_000)
-
-        @polyvar S I
-
-        lambda = 9//10
-        alpha = 1//10
-        delta = 11//10
-        beta = 1//10
-
-        dSdt = lambda - beta * S * I^2 - alpha * S
-        dIdt = beta * S * I^2 + alpha * S - delta * I
-
-        basisV = monomials([S, I], 0:4)
-        @variable(model, coeffsV[1:length(basisV)])
-        V = dot(basisV, coeffsV)
-        dVdt = differentiate(V, S) * dSdt + differentiate(V, I) * dIdt
-
-        normf = dSdt^2 + dIdt^2
-        domain = @set S >= 0 && I >= 0
-        @constraint(model, dVdt - normf in SOSCone(), domain = domain)
-
-        optimize!(model)
+        _optimize_slow_test!("sairs-n1", model)
 
         @test termination_status(model) == MOI.OPTIMAL
         @test primal_status(model) == MOI.FEASIBLE_POINT
@@ -198,9 +184,43 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
     end
 
     if _run_extra_slow_tests()
+        @testset "SIR double-Hopf Lyapunov SOS feasibility (extra slow)" begin
+            model = rational_model(Rational{BigInt})
+            set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64x2")
+            set_optimizer_attribute(model, "working_float_type", "Float64x2")
+            set_optimizer_attribute(model, "facial_reduction_float_type", "Float64x2")
+            set_optimizer_attribute(model, "facial_reduction_sieve_transform_max_entries", 500_000)
+
+            @polyvar S I
+
+            lambda = 9//10
+            alpha = 1//10
+            delta = 11//10
+            beta = 1//10
+
+            dSdt = lambda - beta * S * I^2 - alpha * S
+            dIdt = beta * S * I^2 + alpha * S - delta * I
+
+            basisV = monomials([S, I], 0:4)
+            @variable(model, coeffsV[1:length(basisV)])
+            V = dot(basisV, coeffsV)
+            dVdt = differentiate(V, S) * dSdt + differentiate(V, I) * dIdt
+
+            normf = dSdt^2 + dIdt^2
+            domain = @set S >= 0 && I >= 0
+            @constraint(model, dVdt - normf in SOSCone(), domain = domain)
+
+            _optimize_slow_test!("sir-double-hopf", model)
+
+            @test termination_status(model) == MOI.OPTIMAL
+            @test primal_status(model) == MOI.FEASIBLE_POINT
+            test_facial_reduction_statistics(model)
+            test_exact_extracted_sdp(model)
+        end
+
         @testset "SAIRS n=2 Lyapunov SOS feasibility (extra slow)" begin
             model = _sairs_lyapunov_model(2)
-            optimize!(model)
+            _optimize_slow_test!("sairs-n2", model)
 
             @test termination_status(model) == MOI.OPTIMAL
             @test primal_status(model) == MOI.FEASIBLE_POINT
@@ -234,7 +254,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
                 model;
                 basis_even_no_s_builder = explicit_basis_even_no_s_singular,
             )
-            optimize!(instance.model)
+            _optimize_slow_test!("kse", instance.model)
             test_kse_certificate(instance)
             @test isfile(cache_file)
             @test !isempty(RationalSDP._read_facial_reduction_cache(cache_file))
@@ -249,7 +269,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
                 cached_model;
                 basis_even_no_s_builder = explicit_basis_even_no_s_singular,
             )
-            optimize!(cached_instance.model)
+            _optimize_slow_test!("kse-cached", cached_instance.model)
             test_kse_certificate(cached_instance)
         finally
             rm(cache_file; force = true)
@@ -263,14 +283,12 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 8)
 
         instance = build_lorenz_symmetric_period_model(model; da = 2, db = 3, dc = 6, lower_B = 700, upper_B=750)
-        optimize!(instance.model)
+        _optimize_slow_test!("lorenz-quasiconvex", instance.model)
 
         @test termination_status(instance.model) == MOI.OPTIMAL
         @test primal_status(instance.model) == MOI.FEASIBLE_POINT
-        @test occursin(
-            "Solved by quasi-convex parameter search",
-            MOI.get(backend(instance.model), MOI.RawStatusString()),
-        )
+        @test MOI.get(backend(instance.model), MOI.RawStatusString()) ==
+              "Solved by quasi-convex parameter search"
         @test 700//1 <= value(instance.B) <= 750//1
         @test is_psd_exact(value.(instance.Q))
         @test is_psd_exact(value.(instance.Pe))
@@ -325,7 +343,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         positive_cref = @constraint(model, positive_poly >= 0, SOSCone(), domain = D)
         decay_cref = @constraint(model, decay_poly >= 0, SOSCone(), domain = D)
 
-        optimize!(model)
+        _optimize_slow_test!("sirs-log-domain", model)
 
         @test termination_status(model) == MOI.OPTIMAL
         test_facial_reduction_statistics(model)
@@ -382,7 +400,7 @@ _run_extra_slow_tests() = lowercase(get(ENV, "RATIONALSDP_EXTRA_SLOW_TESTS", "")
         @constraint(model, objective_marker == 0//1)
         @objective(model, Min, objective_marker)
 
-        optimize!(model)
+        _optimize_slow_test!("sis-log-domain", model)
 
         @test termination_status(model) == MOI.OTHER_LIMIT
         test_facial_reduction_statistics(model)

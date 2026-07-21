@@ -72,6 +72,8 @@
         @test stats.precision_escalations_attempted >= 0
         @test stats.tentative_batches_skipped_by_budget >= 0
         @test stats.affine_lifts_skipped_by_budget >= 0
+        @test all(value >= 0 for value in values(stats.recovery_path_attempts))
+        @test all(value >= 0 for value in values(stats.recovery_path_successes))
         @test all(removed > 0 for removed in stats.cone_dimension_removed_per_round)
         @test termination_status(model) == MOI.OPTIMAL
     end

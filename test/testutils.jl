@@ -162,5 +162,7 @@ function test_facial_reduction_statistics(model::JuMP.GenericModel)
     @test all(value > 0 for value in stats.cone_dimension_removed_per_round)
     @test stats.affine_cache_peak_bytes >= 0
     @test stats.facial_reduction_cache_peak_bytes >= 0
+    @test all(value >= 0 for value in values(stats.recovery_path_attempts))
+    @test all(value >= 0 for value in values(stats.recovery_path_successes))
     return stats
 end

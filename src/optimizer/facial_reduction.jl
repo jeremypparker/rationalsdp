@@ -2351,15 +2351,6 @@ function _exact_exposing_slack_from_numeric_slack(
         end
     end
 
-    stable_recovery = _exact_exposing_slack_from_stable_projective_entries(
-        opt,
-        problem,
-        numeric_slack,
-        F,
-        source,
-    )
-    stable_recovery === nothing || return stable_recovery
-
     return nothing
 end
 
@@ -3437,16 +3428,6 @@ function _certify_boundary_primal_evidence(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
-    joint_reduction = _certify_joint_boundary_primal_evidence(
-        opt,
-        problem,
-        evidence,
-        F,
-        ;
-        cache,
-    )
-    joint_reduction === nothing || return joint_reduction
-
     keep_bases = Dict{Int,Matrix{ExactRational}}()
 
     for (block_index, block) in enumerate(problem.blocks)
@@ -3633,13 +3614,25 @@ function _certify_facial_reduction_evidence(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
-    evidence.kind == :dual_slack &&
-        return _certify_dual_slack_evidence(opt, problem, evidence, F; cache)
-    evidence.kind == :boundary_primal &&
-        return _certify_boundary_primal_evidence(opt, problem, evidence, F; cache)
-    evidence.kind == :oracle_point &&
-        return _certify_oracle_point_evidence(opt, problem, evidence, F; cache)
-    error("Unhandled facial reduction evidence kind $(evidence.kind).")
+    path = if evidence.kind == :dual_slack
+        :phase1_dual_slack
+    elseif evidence.kind == :boundary_primal
+        :phase1_boundary_primal
+    elseif evidence.kind == :oracle_point
+        :oracle
+    else
+        error("Unhandled facial reduction evidence kind $(evidence.kind).")
+    end
+    _record_facial_reduction_path!(path)
+    reduction = if evidence.kind == :dual_slack
+        _certify_dual_slack_evidence(opt, problem, evidence, F; cache)
+    elseif evidence.kind == :boundary_primal
+        _certify_boundary_primal_evidence(opt, problem, evidence, F; cache)
+    else
+        _certify_oracle_point_evidence(opt, problem, evidence, F; cache)
+    end
+    reduction === nothing || _record_facial_reduction_path!(path; success = true)
+    return reduction
 end
 
 function _first_certified_facial_reduction(
@@ -3731,6 +3724,7 @@ function _sieve_facial_reduction_problem(
     current = problem
     pass_limit = max(1, _barrier_dimension(problem) + 1)
     for pass_index in 1:pass_limit
+        _record_facial_reduction_path!(:sieve)
         cache = _FacialReductionExactCache(current)
         result = _sieve_facial_reduction_pass(opt, current; cache)
         result === nothing && break
@@ -3748,6 +3742,7 @@ function _sieve_facial_reduction_problem(
         old_dimension = _barrier_dimension(current)
         new_dimension = _barrier_dimension(reduced)
         new_dimension < old_dimension || break
+        _record_facial_reduction_path!(:sieve; success = true)
         _record_reduction_round!(old_dimension, new_dimension; tentative = false)
         _record_successful_facial_reduction!(opt, current, reduction)
         _log(
@@ -3808,6 +3803,7 @@ function _facial_reduction_oracle_round(
     normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
     source::AbstractString = "oracle",
 ) where {HF<:AbstractFloat}
+    _record_facial_reduction_path!(:oracle)
     float_types = DataType[HF]
     append!(
         float_types,
@@ -3861,7 +3857,10 @@ function _facial_reduction_oracle_round(
                 cache,
                 normalization_row,
             )
-            reduction === nothing || return reduction
+            if reduction !== nothing
+                _record_facial_reduction_path!(:oracle; success = true)
+                return reduction
+            end
         end
     end
     return nothing
@@ -3913,6 +3912,63 @@ function _certified_facial_reduction_from_initial_evidence(
     end
     length(reductions) == 1 && return first(reductions)
     return _merge_certified_facial_reductions(opt, problem, reductions)
+end
+
+function _advanced_facial_reduction_from_initial_evidence(
+    opt::Optimizer,
+    problem::ProblemData,
+    candidate::Vector{F},
+    phase1_dual_slack::Union{Nothing,Vector{F}},
+    ::Type{F},
+    ;
+    cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+) where {F<:AbstractFloat}
+    if opt.settings.facial_reduction_stable_projective_recovery &&
+       phase1_dual_slack !== nothing
+        _record_facial_reduction_path!(:stable_projective)
+        exact_slack = _exact_exposing_slack_from_stable_projective_entries(
+            opt,
+            problem,
+            phase1_dual_slack,
+            F,
+            "Phase I cone dual",
+        )
+        if exact_slack !== nothing
+            scalar_slack, block_slack = exact_slack
+            reduction = _certified_reduction_from_exact_slack(
+                opt,
+                problem,
+                scalar_slack,
+                block_slack,
+                "Phase I cone dual stable projective fallback",
+            )
+            if reduction !== nothing
+                _record_facial_reduction_path!(:stable_projective; success = true)
+                return reduction
+            end
+        end
+    end
+
+    if opt.settings.facial_reduction_multiblock_recovery
+        _record_facial_reduction_path!(:joint_multiblock)
+        evidence = _FacialReductionEvidence(
+            :boundary_primal,
+            "Phase I boundary point",
+            candidate,
+        )
+        reduction = _certify_joint_boundary_primal_evidence(
+            opt,
+            problem,
+            evidence,
+            F;
+            cache,
+        )
+        if reduction !== nothing
+            _record_facial_reduction_path!(:joint_multiblock; success = true)
+            return reduction
+        end
+    end
+    return nothing
 end
 
 function _facial_reduction_target_trace_row(
@@ -4235,6 +4291,21 @@ function _facial_reduction_round(
             cache,
         )
     end
+    if reduction === nothing
+        _log(
+            opt,
+            "Facial reduction: established recovery and oracle found no exact face; " *
+            "trying stronger exact-recovery fallbacks",
+        )
+        reduction = _advanced_facial_reduction_from_initial_evidence(
+            opt,
+            problem,
+            candidate,
+            phase1_dual_slack,
+            F;
+            cache,
+        )
+    end
     reduction === nothing && return nothing
     rank_expansion || return reduction
     return _facial_reduction_round_with_rank_expansion(
@@ -4398,6 +4469,7 @@ function _facially_reduce_search_problem(
             fallback_problem = nothing,
         )
     end
+    _record_facial_reduction_path!(:tentative_restriction)
     tentative_result = try
         _tentative_feasibility_search_problem(
             opt,
@@ -4420,6 +4492,7 @@ function _facially_reduce_search_problem(
     end
     tentative_problem = tentative_result.problem
     if tentative_problem !== nothing
+        _record_facial_reduction_path!(:tentative_restriction; success = true)
         _record_reduction_round!(
             _barrier_dimension(problem),
             _barrier_dimension(tentative_problem);

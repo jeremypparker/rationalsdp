@@ -38,6 +38,77 @@
         )
     end
 
+    @testset "Phase-I candidate diagnostics are passive" begin
+        problem = synthetic_face_problem([3])
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            phase1_candidate_diagnostics = true,
+            facial_reduction_exposure_tolerance = big"2e-9",
+        )
+        stats = RationalSDP.FacialReductionStatistics()
+        candidate = Float64[1, 0, 0, 0, 0, 0]
+        original_tolerance = opt.settings.facial_reduction_exposure_tolerance
+        RationalSDP._with_facial_reduction_statistics(stats) do
+            RationalSDP._log_phase1_candidate_diagnostics(
+                opt,
+                problem,
+                candidate,
+                0.0,
+                0.0,
+                Float64,
+            )
+        end
+        @test stats.psd_eigendecompositions_by_block_size == Dict(3 => 1)
+        @test stats.rational_subspace_charts_attempted == 0
+        @test stats.rational_projectors_attempted == 0
+        @test stats.exact_row_space_checks == 0
+        @test stats.exact_certificate_checks == 0
+        @test opt.settings.facial_reduction_exposure_tolerance == original_tolerance
+    end
+
+    @testset "precision recovery selects stable system solvers" begin
+        small_problem = synthetic_face_problem([3])
+        large_problem = synthetic_face_problem([32])
+        @test RationalSDP._phase1_precision_escalation_syssolver(
+            small_problem,
+            Float64,
+        ) === nothing
+        @test RationalSDP._phase1_precision_escalation_syssolver(
+            large_problem,
+            Float64,
+        ) == :symindef_indirect
+        @test RationalSDP._phase1_precision_escalation_syssolver(
+            large_problem,
+            RationalSDP.Float64x4,
+        ) == :qrchol_dense
+        settings = RationalSDP.Settings()
+        @test settings.facial_reduction_precision_escalation_max_retries == 0
+        @test settings.facial_reduction_oracle_precision_escalation_max_retries == 1
+        @test RationalSDP._precision_escalation_types(
+            RationalSDP.Float64x2,
+            settings.facial_reduction_oracle_precision_escalation_max_retries,
+        ) == DataType[RationalSDP.Float64x4]
+        @test RationalSDP._facial_reduction_oracle_solver_overrides(
+            settings,
+            large_problem,
+            RationalSDP.Float64x4,
+        ) == Union{Nothing,Symbol}[nothing, :qrchol_dense]
+        qr_settings = RationalSDP.Settings(phase1_hypatia_syssolver = :qrchol_dense)
+        @test RationalSDP._facial_reduction_oracle_solver_overrides(
+            qr_settings,
+            large_problem,
+            RationalSDP.Float64x4,
+        ) == Union{Nothing,Symbol}[nothing]
+        oracle_qr_settings = RationalSDP.Settings(
+            facial_reduction_oracle_syssolver = :qrchol_dense,
+        )
+        @test RationalSDP._facial_reduction_oracle_solver_overrides(
+            oracle_qr_settings,
+            large_problem,
+            RationalSDP.Float64x4,
+        ) == Union{Nothing,Symbol}[:qrchol_dense, nothing]
+    end
+
     @testset "statistics are exposed for a solve" begin
         model = rational_model(Rational{BigInt})
         set_optimizer_attribute(model, "working_float_type", Float64)

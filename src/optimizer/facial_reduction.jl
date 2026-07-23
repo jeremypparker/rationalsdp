@@ -1838,39 +1838,6 @@ function _phase1_threshold_summary(eigenvalues, ::Type{F}) where {F<:AbstractFlo
     return join(parts, ", ")
 end
 
-function _diagnose_phase1_candidate_kernel!(
-    opt::Optimizer,
-    problem::ProblemData,
-    block_index::Int,
-    block_matrix::Matrix{F},
-    ::Type{F},
-) where {F<:AbstractFloat}
-    old_tolerance = opt.settings.facial_reduction_exposure_tolerance
-    try
-        for threshold in _PHASE1_DIAGNOSTIC_THRESHOLDS
-            opt.settings.facial_reduction_exposure_tolerance = threshold
-            directions = try
-                _candidate_kernel_directions(opt, problem, block_index, block_matrix, F)
-            catch err
-                _log(
-                    opt,
-                    "Phase I diagnostics: block $(block_index) loose kernel tol=$(_format_metric(_to_working_float(F, threshold))) raised $(typeof(err))",
-                )
-                continue
-            end
-            isempty(directions) && continue
-            _log(
-                opt,
-                "Phase I diagnostics: block $(block_index) loose kernel tol=$(_format_metric(_to_working_float(F, threshold))) recovered $(length(directions)) rationalized candidate-kernel direction(s)",
-            )
-            break
-        end
-    finally
-        opt.settings.facial_reduction_exposure_tolerance = old_tolerance
-    end
-    return
-end
-
 function _log_phase1_candidate_diagnostics(
     opt::Optimizer,
     problem::ProblemData,
@@ -1897,14 +1864,12 @@ function _log_phase1_candidate_diagnostics(
 
     for (block_index, block) in enumerate(problem.blocks)
         block_matrix = _vector_to_matrix(candidate, block)
-        symmetric_matrix = Symmetric((block_matrix + transpose(block_matrix)) / 2)
         eigenvalues = _facial_reduction_eigvals(opt, block_matrix)
         isempty(eigenvalues) && continue
         _log(
             opt,
             "Phase I candidate diagnostics: block $(block_index) size=$(block.size), min_eig=$(_format_metric(minimum(eigenvalues))), max_eig=$(_format_metric(maximum(eigenvalues))), negative=$(count(value -> value < zero(F), eigenvalues)), $(_phase1_threshold_summary(eigenvalues, F))",
         )
-        _diagnose_phase1_candidate_kernel!(opt, problem, block_index, block_matrix, F)
     end
     return
 end
@@ -2007,8 +1972,11 @@ function _facial_reduction_oracle_attempt(
     ;
     normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
     syssolver_override::Union{Nothing,Symbol} = nothing,
+    return_details::Bool = false,
 ) where {HF<:AbstractFloat}
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
+        attempt_result(candidate, retry_recommended) = return_details ?
+            (candidate = candidate, retry_recommended = retry_recommended) : candidate
         oracle_start_time = time_ns()
         oracle_recorded = false
         record_oracle(iterations::Integer = 0) = begin
@@ -2028,7 +1996,7 @@ function _facial_reduction_oracle_attempt(
         if model === nothing
             _log(opt, "Facial reduction oracle unavailable: exact normalization equalities are inconsistent")
             record_oracle()
-            return nothing
+            return attempt_result(nothing, false)
         end
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(
             opt.settings,
@@ -2064,7 +2032,7 @@ function _facial_reduction_oracle_attempt(
                 "Facial reduction oracle unavailable: $(failure)",
             )
             record_oracle()
-            return nothing
+            return attempt_result(nothing, true)
         end
         elapsed_sec = (time_ns() - start_time) / 1.0e9
         status = Hypatia.Solvers.get_status(solver)
@@ -2074,7 +2042,7 @@ function _facial_reduction_oracle_attempt(
                 "Facial reduction oracle: status=$(status), time=$(@sprintf("%.2f", elapsed_sec))s",
             )
             record_oracle(Hypatia.Solvers.get_num_iters(solver))
-            return nothing
+            return attempt_result(nothing, false)
         end
         candidate = try
             vec(collect(Hypatia.Solvers.get_x(solver)))
@@ -2083,11 +2051,11 @@ function _facial_reduction_oracle_attempt(
         end
         if candidate === nothing
             record_oracle(Hypatia.Solvers.get_num_iters(solver))
-            return nothing
+            return attempt_result(nothing, true)
         end
         if !all(isfinite, candidate)
             record_oracle(Hypatia.Solvers.get_num_iters(solver))
-            return nothing
+            return attempt_result(nothing, true)
         end
         slow_progress_note =
             status == Hypatia.Solvers.SlowProgress ? "; trying current iterate" : ""
@@ -2096,7 +2064,7 @@ function _facial_reduction_oracle_attempt(
             "Facial reduction oracle: status=$(status), iter=$(Hypatia.Solvers.get_num_iters(solver)), time=$(@sprintf("%.2f", elapsed_sec))s$(slow_progress_note)",
         )
         record_oracle(Hypatia.Solvers.get_num_iters(solver))
-        return candidate
+        return attempt_result(candidate, false)
     end)
 end
 
@@ -2601,14 +2569,63 @@ function _facial_reduction_record(
     )
 end
 
+function _facial_reductions_same_face(
+    problem::ProblemData,
+    left::_CertifiedFacialReduction,
+    right::_CertifiedFacialReduction,
+)
+    Set(left.exposed_scalars) == Set(right.exposed_scalars) || return false
+    for (block_index, block) in enumerate(problem.blocks)
+        left_basis = get(
+            left.keep_bases,
+            block_index,
+            Matrix{ExactRational}(I, block.size, block.size),
+        )
+        right_basis = get(
+            right.keep_bases,
+            block_index,
+            Matrix{ExactRational}(I, block.size, block.size),
+        )
+        size(left_basis) == size(right_basis) || return false
+        _exact_column_rank(hcat(left_basis, right_basis)) == size(left_basis, 2) ||
+            return false
+    end
+    return true
+end
+
 function _record_successful_facial_reduction!(
     opt::Optimizer,
     problem::ProblemData,
     reduction::_CertifiedFacialReduction,
+    ;
+    supersedes::Union{Nothing,_CertifiedFacialReduction} = nothing,
 )
     save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
     save_path === nothing && return
-    push!(opt.facial_reduction_save_records, _facial_reduction_record(problem, reduction))
+    target = supersedes === nothing ? reduction : supersedes
+    replace_indices = Int[]
+    for (record_index, record) in enumerate(opt.facial_reduction_save_records)
+        record isa NamedTuple || continue
+        (:signature in keys(record)) || continue
+        _facial_reduction_signature_matches(problem, record.signature) || continue
+        cached = try
+            _cached_facial_reduction(record)
+        catch
+            nothing
+        end
+        cached === nothing && continue
+        _facial_reductions_same_face(problem, cached, target) || continue
+        push!(replace_indices, record_index)
+    end
+    new_record = _facial_reduction_record(problem, reduction)
+    if isempty(replace_indices)
+        push!(opt.facial_reduction_save_records, new_record)
+    else
+        opt.facial_reduction_save_records[first(replace_indices)] = new_record
+        for record_index in Iterators.reverse(replace_indices[2:end])
+            deleteat!(opt.facial_reduction_save_records, record_index)
+        end
+    end
     _record_approximate_cache_memory!(:facial_reduction, opt.facial_reduction_save_records)
     full_path = _write_facial_reduction_cache(
         save_path,
@@ -2616,7 +2633,7 @@ function _record_successful_facial_reduction!(
     )
     _log(
         opt,
-        "Facial reduction: saved $(length(opt.facial_reduction_save_records)) reduction record(s) to $(full_path)",
+        "Facial reduction: checkpointed $(length(opt.facial_reduction_save_records)) reduction record(s) to $(full_path)",
     )
     return
 end
@@ -2669,11 +2686,10 @@ function _cached_scalar_face_violation(problem::ProblemData, position::Int)
     return nothing
 end
 
-function _cached_keep_basis_violation(
+function _cached_keep_basis_structure_violation(
     problem::ProblemData,
     block_index::Int,
     keep_basis::Matrix{ExactRational},
-    settings::Settings = Settings(),
 )
     1 <= block_index <= length(problem.blocks) ||
         return "PSD block $(block_index) does not exist"
@@ -2684,7 +2700,20 @@ function _cached_keep_basis_violation(
         return "PSD block $(block_index) cache basis does not reduce the block"
     _exact_column_rank(keep_basis) == size(keep_basis, 2) ||
         return "PSD block $(block_index) cache basis columns are linearly dependent"
+    return nothing
+end
 
+function _cached_keep_basis_violation(
+    problem::ProblemData,
+    block_index::Int,
+    keep_basis::Matrix{ExactRational},
+    settings::Settings = Settings(),
+)
+    structure_violation =
+        _cached_keep_basis_structure_violation(problem, block_index, keep_basis)
+    structure_violation === nothing || return structure_violation
+
+    block = problem.blocks[block_index]
     removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
     directions = [
         collect(view(removed_directions, :, column)) for
@@ -2738,6 +2767,30 @@ function _cached_facial_reduction_violation(
         violation = _cached_scalar_face_violation(problem, position)
         violation === nothing || return violation
     end
+
+    directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}()
+    for block_index in sort(collect(keys(reduction.keep_bases)))
+        keep_basis = reduction.keep_bases[block_index]
+        violation =
+            _cached_keep_basis_structure_violation(problem, block_index, keep_basis)
+        violation === nothing || return violation
+        removed_directions = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
+        directions_by_block[block_index] = [
+            collect(view(removed_directions, :, column)) for
+            column in axes(removed_directions, 2)
+        ]
+    end
+
+    if length(directions_by_block) > 1
+        joint_exposure = _multiblock_weighted_subspace_exposure(
+            problem,
+            directions_by_block,
+            settings,
+            Float64,
+        )
+        joint_exposure === nothing || return nothing
+    end
+
     for block_index in sort(collect(keys(reduction.keep_bases)))
         violation = _cached_keep_basis_violation(
             problem,
@@ -2783,6 +2836,21 @@ function _apply_loaded_facial_reductions(
         if violation !== nothing
             _log(opt, "Facial reduction: cached face did not validate ($(violation))")
             continue
+        end
+
+        if opt.settings.facial_reduction &&
+           opt.settings.facial_reduction_rank_expansion_rounds > 0
+            _log(
+                opt,
+                "Facial reduction: using cached face as the seed for rank expansion before application",
+            )
+            reduction = _facial_reduction_round_with_rank_expansion(
+                opt,
+                current,
+                reduction,
+                _facial_reduction_oracle_float_type(opt, current);
+                cache = _FacialReductionExactCache(current),
+            )
         end
 
         reduced_problem = _apply_facial_reduction(
@@ -3794,6 +3862,27 @@ function _face_reduction_rows(
     return _SparseAffineRestrictions(indices, values), rhs
 end
 
+function _facial_reduction_oracle_solver_overrides(
+    settings::Settings,
+    problem::ProblemData,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    phase1_solver = _phase1_hypatia_syssolver(settings)
+    oracle_solver = _facial_reduction_oracle_syssolver(settings)
+    stable_solver = if F === Float64 && _phase1_hypatia_prefers_sparse_float64(problem)
+        :symindef_indirect
+    else
+        :qrchol_dense
+    end
+    primary_override = oracle_solver == :auto ? nothing : oracle_solver
+    primary_solver = oracle_solver == :auto ? phase1_solver : oracle_solver
+    fallback_override = oracle_solver == :auto ? stable_solver : nothing
+    fallback_solver = oracle_solver == :auto ? stable_solver : phase1_solver
+    solver_overrides = Union{Nothing,Symbol}[primary_override]
+    primary_solver == fallback_solver || push!(solver_overrides, fallback_override)
+    return solver_overrides
+end
+
 function _facial_reduction_oracle_round(
     opt::Optimizer,
     problem::ProblemData,
@@ -3805,42 +3894,52 @@ function _facial_reduction_oracle_round(
 ) where {HF<:AbstractFloat}
     _record_facial_reduction_path!(:oracle)
     float_types = DataType[HF]
+    oracle_precision_retries = max(
+        opt.settings.facial_reduction_oracle_precision_escalation_max_retries,
+        opt.settings.facial_reduction_precision_escalation_max_retries,
+    )
     append!(
         float_types,
         _precision_escalation_types(
             HF,
-            opt.settings.facial_reduction_precision_escalation_max_retries,
+            oracle_precision_retries,
         ),
     )
-    configured_solver = _phase1_hypatia_syssolver(opt.settings)
     for (precision_index, oracle_float_type) in enumerate(float_types)
         precision_index > 1 && begin
             _record_facial_reduction_event!(:precision_escalations_attempted)
             _log(opt, "Facial reduction oracle: retrying at $(oracle_float_type)")
         end
-        alternate_solver = if oracle_float_type == Float64 &&
-                              _phase1_hypatia_prefers_sparse_float64(problem)
-            :symindef_indirect
-        else
-            :qrchol_dense
-        end
-        solver_overrides = Union{Nothing,Symbol}[nothing]
-        if opt.settings.facial_reduction_precision_escalation_max_retries > 0 &&
-           configured_solver != alternate_solver
-            push!(solver_overrides, alternate_solver)
-        end
+        solver_overrides = _facial_reduction_oracle_solver_overrides(
+            opt.settings,
+            problem,
+            oracle_float_type,
+        )
+        precision_retry_recommended = false
         for (solver_index, solver_override) in enumerate(solver_overrides)
-            solver_index > 1 && _log(
-                opt,
-                "Facial reduction oracle: retrying $(oracle_float_type) with $(solver_override) system solver",
-            )
-            oracle_point = _facial_reduction_oracle_attempt(
+            solver_label = solver_override === nothing ?
+                           _phase1_hypatia_syssolver(opt.settings) : solver_override
+            if solver_index == 1 && solver_override !== nothing
+                _log(
+                    opt,
+                    "Facial reduction oracle: using preferred $(solver_label) system solver",
+                )
+            elseif solver_index > 1
+                _log(
+                    opt,
+                    "Facial reduction oracle: retrying $(oracle_float_type) with $(solver_label) system solver",
+                )
+            end
+            oracle_attempt = _facial_reduction_oracle_attempt(
                 opt,
                 problem,
                 oracle_float_type;
                 normalization_row,
                 syssolver_override = solver_override,
+                return_details = true,
             )
+            oracle_point = oracle_attempt.candidate
+            precision_retry_recommended |= oracle_attempt.retry_recommended
             oracle_point === nothing && continue
             evidence_source = solver_override === nothing ? String(source) :
                               "$(source) ($(solver_override))"
@@ -3849,18 +3948,39 @@ function _facial_reduction_oracle_round(
                 evidence_source,
                 oracle_point,
             )
-            reduction = _certify_oracle_point_evidence(
-                opt,
-                problem,
-                evidence,
-                oracle_float_type;
-                cache,
-                normalization_row,
-            )
+            reduction = try
+                _certify_oracle_point_evidence(
+                    opt,
+                    problem,
+                    evidence,
+                    oracle_float_type;
+                    cache,
+                    normalization_row,
+                )
+            catch err
+                if _is_inexact_facial_reduction_error(err)
+                    _log(
+                        opt,
+                        "Facial reduction oracle: $(oracle_float_type) candidate could not be certified exactly; continuing with other system solvers and recovery paths",
+                    )
+                    precision_retry_recommended = true
+                    nothing
+                else
+                    rethrow()
+                end
+            end
             if reduction !== nothing
                 _record_facial_reduction_path!(:oracle; success = true)
                 return reduction
             end
+            precision_retry_recommended = true
+        end
+        if precision_index < length(float_types) && !precision_retry_recommended
+            _log(
+                opt,
+                "Facial reduction oracle: higher precision is unnecessary after a completed numerical oracle solve",
+            )
+            break
         end
     end
     return nothing
@@ -4007,6 +4127,7 @@ function _facial_reduction_round_with_rank_expansion(
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
     current = reduction
+    _record_successful_facial_reduction!(opt, problem, current)
     for expansion_round in 1:opt.settings.facial_reduction_rank_expansion_rounds
         normalization_row = _facial_reduction_target_trace_row(problem, current)
         any(!iszero, normalization_row) || break
@@ -4036,7 +4157,14 @@ function _facial_reduction_round_with_rank_expansion(
             init = 0,
         ) + length(merged.exposed_scalars)
         new_removed > old_removed || break
+        previous = current
         current = merged
+        _record_successful_facial_reduction!(
+            opt,
+            problem,
+            current;
+            supersedes = previous,
+        )
     end
     return current
 end

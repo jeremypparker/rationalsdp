@@ -667,6 +667,16 @@ function _phase1_hypatia_effective_float_type(opt::Optimizer, problem::ProblemDa
     return configured_type
 end
 
+function _phase1_precision_escalation_syssolver(
+    problem::ProblemData,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    if F === Float64 && _phase1_hypatia_prefers_sparse_float64(problem)
+        return :symindef_indirect
+    end
+    return F === Float64 ? nothing : :qrchol_dense
+end
+
 function _build_hypatia_phase1_model(
     problem::ProblemData,
     settings::Settings,
@@ -1149,8 +1159,10 @@ function _phase1_hypatia_anchor(
                     problem,
                     escalated_type,
                     margin_cap;
-                    syssolver_override = _phase1_hypatia_prefers_sparse_float64(problem) ?
-                                         :symindef_indirect : nothing,
+                    syssolver_override = _phase1_precision_escalation_syssolver(
+                        problem,
+                        escalated_type,
+                    ),
                 )
                 escalated_attempt.anchor !== nothing && return escalated_attempt
                 if escalated_attempt.candidate !== nothing

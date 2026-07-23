@@ -277,6 +277,13 @@ Base.@kwdef mutable struct Settings
     # initial-evidence and exposing-vector oracle routes have failed.
     facial_reduction_multiblock_recovery::Bool = true
     facial_reduction_stable_projective_recovery::Bool = true
+    # `:auto` tries the Phase-I system solver first and then a stable oracle
+    # fallback.  An explicit choice is tried first without changing Phase I.
+    facial_reduction_oracle_syssolver::Symbol = :auto
+    # Oracle recovery is independent of Phase-I precision escalation.  The
+    # configured precision and system solver are still tried first; this only
+    # controls higher-precision retries after those attempts fail.
+    facial_reduction_oracle_precision_escalation_max_retries::Int = 1
     facial_reduction_precision_escalation_max_retries::Int = 0
     facial_reduction_irrational_behavior::Symbol = :error
     facial_reduction_save_file::String = ""
@@ -897,6 +904,24 @@ function _phase1_hypatia_syssolver(settings::Settings)
     return syssolver
 end
 
+function _facial_reduction_oracle_syssolver(settings::Settings)
+    syssolver = settings.facial_reduction_oracle_syssolver
+    syssolver in (
+        :auto,
+        :symindef_sparse,
+        :symindef_dense,
+        :symindef_indirect,
+        :qrchol_dense,
+        :naive_dense,
+        :naiveelim_dense,
+    ) || error(
+        "facial_reduction_oracle_syssolver must be one of " *
+        ":auto, :symindef_sparse, :symindef_dense, :symindef_indirect, " *
+        ":qrchol_dense, :naive_dense, :naiveelim_dense.",
+    )
+    return syssolver
+end
+
 function _phase1_hypatia_target_margin(settings::Settings)
     target = settings.phase1_hypatia_target_margin
     target >= 0 || error("phase1_hypatia_target_margin must be nonnegative.")
@@ -993,6 +1018,8 @@ function _validate_settings(settings::Settings)
         throw(ArgumentError("facial_reduction_subspace_max_charts must be positive."))
     settings.facial_reduction_precision_escalation_max_retries >= 0 ||
         throw(ArgumentError("facial_reduction_precision_escalation_max_retries must be nonnegative."))
+    settings.facial_reduction_oracle_precision_escalation_max_retries >= 0 ||
+        throw(ArgumentError("facial_reduction_oracle_precision_escalation_max_retries must be nonnegative."))
     settings.facial_reduction_affine_lift_chunk_columns > 0 ||
         throw(ArgumentError("facial_reduction_affine_lift_chunk_columns must be positive."))
     settings.exact_refinement_bisections >= 0 ||
@@ -1002,6 +1029,7 @@ function _validate_settings(settings::Settings)
     _phase1_backend(settings)
     _phase1_hypatia_float_type(settings)
     _phase1_hypatia_syssolver(settings)
+    _facial_reduction_oracle_syssolver(settings)
     _phase1_hypatia_target_margin(settings)
     _phase1_hypatia_boundary_margin_fraction(settings)
     _facial_reduction_float_type(settings)

@@ -135,15 +135,22 @@ The cheap evidence pass tries, in order:
 - kernel directions from the Phase I boundary point
 
 If those do not certify a reducing face, RationalSDP launches a separate
-Hypatia exposing-vector oracle. By default this oracle uses the same Hypatia
-float type, system solver, iteration limit, and tolerance settings as Phase I;
-`facial_reduction_float_type` can still override the oracle float type.
+Hypatia exposing-vector oracle. By default this oracle first uses the Phase-I
+system solver, then tries a stable alternate solver when recovery is
+inconclusive. `facial_reduction_oracle_syssolver` can prefer a solver for the
+oracle without changing Phase I, while `facial_reduction_float_type` can
+override the oracle float type. An uncertifiable numerical oracle candidate no
+longer blocks the alternate solver or configured higher-precision retries.
 
 When both cheap evidence sources certify faces, their exact kernel and scalar
 exposures are merged before the reduced problem is built. After each certified
 reduction, a bounded rank-expansion oracle pass can search for another exposing
 slack normalized on the residual face; control its number of rounds with
-`facial_reduction_rank_expansion_rounds` (default `0`). Fixed-parameter
+`facial_reduction_rank_expansion_rounds` (default `0`). A validated cached face
+seeds this expansion before it is applied, so all new directions are accumulated
+on the cache record's original formulation. When a save file is configured,
+each stronger merged face is checkpointed atomically and replaces the weaker
+record that it extends. Fixed-parameter
 quasiconvex probes deliberately use the conservative evidence path so that
 inconclusive numerical probes do not change the bisection result.
 
@@ -251,6 +258,10 @@ The full set of optimizer attributes is:
 - `facial_reduction_rank_tolerance`
 - `facial_reduction_subspace_max_charts`
 - `facial_reduction_projector_recovery`
+- `facial_reduction_multiblock_recovery`
+- `facial_reduction_stable_projective_recovery`
+- `facial_reduction_oracle_syssolver`
+- `facial_reduction_oracle_precision_escalation_max_retries`
 - `facial_reduction_precision_escalation_max_retries`
 - `facial_reduction_irrational_behavior`
 - `facial_reduction_save_file`
@@ -320,9 +331,15 @@ each exact candidate span to a canonical row-reduced key, and certifies each
 distinct span at most once. With `facial_reduction_projector_recovery=true`, an
 exact symmetric idempotent rationalization of the numerical orthogonal
 projector is also tried. `facial_reduction_precision_escalation_max_retries`
-controls an opt-in precision ladder for Phase I and the exposing-vector oracle;
-each oracle precision also tries a numerically different system solver. The
-default `0` preserves a single numerical solve.
+controls the opt-in Phase-I precision ladder and, for compatibility, can raise
+the oracle retry budget. The independent
+`facial_reduction_oracle_precision_escalation_max_retries` defaults to `1`.
+The oracle tries the configured system solver first, then a numerically
+different solver. It escalates precision when the available solver attempts
+fail to produce an exactly certifiable face; a completed conic solve with no
+face does not by itself make the whole recovery pipeline successful.
+Higher-precision Phase-I retries use dense QR-Cholesky linear algebra instead
+of the Float64 indirect solver.
 
 | Attribute | Default | Work estimate bounded |
 | --- | ---: | --- |
@@ -382,7 +399,9 @@ scalar types are also accepted, for example `Float64x2`, `Float64x3`, and
 Hypatia Phase I tolerance attributes use negative values to leave Hypatia's
 own defaults unchanged. The diagnostic attributes are off by default; enable
 `phase1_candidate_diagnostics` or `phase1_exact_recovery_diagnostics` when a
-model reaches a numerical boundary point but exact recovery fails. The
+model reaches a numerical boundary point but exact recovery fails.
+`phase1_candidate_diagnostics` reports scalar margins and PSD spectra only; it
+does not rationalize kernel directions or run exact certificate checks. The
 separate facial-reduction oracle reuses the Phase I Hypatia settings by
 default. The `recovery_tolerance_shrink` setting controls how aggressively
 exact recovery tightens rationalization tolerances between attempts.

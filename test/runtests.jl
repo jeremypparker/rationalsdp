@@ -13,6 +13,7 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "phase1_backend", "native")
         set_optimizer_attribute(model, "phase1_hypatia_float_type", "Float64")
         set_optimizer_attribute(model, "phase1_hypatia_syssolver", "qrchol_dense")
+        set_optimizer_attribute(model, "facial_reduction_oracle_syssolver", "symindef_dense")
         set_optimizer_attribute(model, "phase1_hypatia_target_margin", "0.02")
         set_optimizer_attribute(model, "phase1_hypatia_margin_upper", "1e-4")
         set_optimizer_attribute(model, "phase1_hypatia_min_margin_upper", "1e-8")
@@ -49,6 +50,11 @@ include("slowtest_helpers.jl")
         set_optimizer_attribute(model, "facial_reduction_affine_compaction_max_entries", 8901)
         set_optimizer_attribute(model, "facial_reduction_subspace_max_charts", 5)
         set_optimizer_attribute(model, "facial_reduction_projector_recovery", false)
+        set_optimizer_attribute(
+            model,
+            "facial_reduction_oracle_precision_escalation_max_retries",
+            3,
+        )
         set_optimizer_attribute(model, "facial_reduction_precision_escalation_max_retries", 2)
         set_optimizer_attribute(model, "facial_reduction_tentative_max_directions", 3)
         set_optimizer_attribute(model, "facial_reduction_affine_lift_chunk_columns", 7)
@@ -56,6 +62,8 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_backend") == :native
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == Float64
         @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :qrchol_dense
+        @test get_optimizer_attribute(model, "facial_reduction_oracle_syssolver") ==
+              :symindef_dense
         @test get_optimizer_attribute(model, "phase1_hypatia_target_margin") == big"0.02"
         @test get_optimizer_attribute(model, "phase1_hypatia_margin_upper") == big"1e-4"
         @test get_optimizer_attribute(model, "phase1_hypatia_min_margin_upper") == big"1e-8"
@@ -96,6 +104,10 @@ include("slowtest_helpers.jl")
         @test !get_optimizer_attribute(model, "facial_reduction_projector_recovery")
         @test get_optimizer_attribute(
             model,
+            "facial_reduction_oracle_precision_escalation_max_retries",
+        ) == 3
+        @test get_optimizer_attribute(
+            model,
             "facial_reduction_precision_escalation_max_retries",
         ) == 2
         @test get_optimizer_attribute(model, "facial_reduction_tentative_max_directions") == 3
@@ -108,6 +120,7 @@ include("slowtest_helpers.jl")
         @test get_optimizer_attribute(model, "phase1_backend") == :hypatia
         @test get_optimizer_attribute(model, "phase1_hypatia_float_type") == RationalSDP.Float64x2
         @test get_optimizer_attribute(model, "phase1_hypatia_syssolver") == :auto
+        @test get_optimizer_attribute(model, "facial_reduction_oracle_syssolver") == :auto
         @test get_optimizer_attribute(model, "facial_reduction_float_type") == RationalSDP.Float64x2
 
         set_optimizer_attribute(model, "working_float_type", Float64)
@@ -389,6 +402,9 @@ include("slowtest_helpers.jl")
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(inner_log_frequency = 0),
         )
+        @test_throws ErrorException RationalSDP._validate_settings(
+            RationalSDP.Settings(facial_reduction_oracle_syssolver = :invalid),
+        )
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(line_search_shrink = big"1.0"),
         )
@@ -409,6 +425,11 @@ include("slowtest_helpers.jl")
         )
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(facial_reduction_precision_escalation_max_retries = -1),
+        )
+        @test_throws ArgumentError RationalSDP._validate_settings(
+            RationalSDP.Settings(
+                facial_reduction_oracle_precision_escalation_max_retries = -1,
+            ),
         )
         @test_throws ArgumentError RationalSDP._validate_settings(
             RationalSDP.Settings(facial_reduction_affine_lift_chunk_columns = 0),
@@ -1879,6 +1900,49 @@ include("slowtest_helpers.jl")
         end
     end
 
+    @testset "Facial reduction cache validates joint multiblock faces" begin
+        blocks = [
+            RationalSDP.BlockStructure(
+                1,
+                Union{Nothing,MOI.VariableIndex}[nothing],
+                [position],
+                [(1, 1)],
+                [position],
+            ) for position in 1:2
+        ]
+        A = reshape(Rational{BigInt}[1//1, 1//1], 1, 2)
+        b = Rational{BigInt}[0//1]
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            blocks,
+            Int[],
+            zeros(Rational{BigInt}, 2),
+            0//1,
+            zeros(Rational{BigInt}, 2),
+            A,
+            b,
+            RationalSDP._solve_affine_system(A, b),
+        )
+        empty_keep_basis = zeros(Rational{BigInt}, 1, 0)
+        reduction = RationalSDP._CertifiedFacialReduction(
+            "joint cache regression",
+            Int[],
+            Dict(1 => empty_keep_basis, 2 => empty_keep_basis),
+        )
+
+        @test RationalSDP._cached_keep_basis_violation(
+            problem,
+            1,
+            empty_keep_basis,
+        ) !== nothing
+        @test RationalSDP._cached_keep_basis_violation(
+            problem,
+            2,
+            empty_keep_basis,
+        ) !== nothing
+        @test RationalSDP._cached_facial_reduction_violation(problem, reduction) === nothing
+    end
+
     @testset "Facial reduction oracle fallback exposes scalar faces" begin
         block = RationalSDP.BlockStructure(
             1,
@@ -2100,6 +2164,40 @@ include("slowtest_helpers.jl")
         @test expanded !== nothing
         @test size(expanded.keep_bases[1], 2) == 1
         @test RationalSDP._cached_facial_reduction_violation(problem, expanded) === nothing
+
+        cache_file = tempname()
+        try
+            save_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+                verbose = false,
+                facial_reduction_save_file = cache_file,
+            )
+            RationalSDP._prepare_facial_reduction_cache!(save_opt)
+            RationalSDP._record_successful_facial_reduction!(save_opt, problem, first)
+
+            load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+                verbose = false,
+                facial_reduction_float_type = Float64,
+                facial_reduction_rank_expansion_rounds = 1,
+                facial_reduction_save_file = cache_file,
+                facial_reduction_load_file = cache_file,
+            )
+            RationalSDP._prepare_facial_reduction_cache!(load_opt)
+            loaded = RationalSDP._apply_loaded_facial_reductions(
+                load_opt,
+                problem;
+                return_details = true,
+            )
+            @test loaded.applied == 1
+            @test [reduced_block.size for reduced_block in loaded.problem.blocks] == [1]
+
+            checkpointed_records = RationalSDP._read_facial_reduction_cache(cache_file)
+            @test length(checkpointed_records) == 1
+            checkpointed = RationalSDP._cached_facial_reduction(only(checkpointed_records))
+            @test checkpointed !== nothing
+            @test size(checkpointed.keep_bases[1], 2) == 1
+        finally
+            rm(cache_file; force = true)
+        end
     end
 
     @testset "Sieve exact affine-row certificates" begin

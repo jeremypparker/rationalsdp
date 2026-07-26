@@ -187,7 +187,8 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
         particular, nullspace = problem.affine
         barrier_dim = _barrier_dimension(problem)
         if barrier_dim == 0 && size(nullspace, 2) == 0
-            feasibility = _exact_primal_feasibility(original_problem, particular)
+            original_point = _lift_original_solution(problem, particular)
+            feasibility = _exact_primal_feasibility(original_problem, original_point)
             feasibility.ok || begin
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
@@ -195,9 +196,9 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
                 opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
                 return
             end
-            objective_value = _exact_objective_value(problem, particular)
+            objective_value = _exact_objective_value(original_problem, original_point)
             for (index, variable) in enumerate(problem.original_variables)
-                opt.variable_primal[variable] = _to_output_type(T, particular[index])
+                opt.variable_primal[variable] = _to_output_type(T, original_point[index])
             end
             opt.objective_value = _to_output_type(T, objective_value)
             opt.termination_status = MOI.OPTIMAL
@@ -218,7 +219,8 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
                 _log(opt, "unbounded on affine nullspace")
                 return
             end
-            feasibility = _exact_primal_feasibility(original_problem, particular)
+            original_point = _lift_original_solution(problem, particular)
+            feasibility = _exact_primal_feasibility(original_problem, original_point)
             feasibility.ok || begin
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
@@ -226,9 +228,9 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
                 opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
                 return
             end
-            objective_value = _exact_objective_value(problem, particular)
+            objective_value = _exact_objective_value(original_problem, original_point)
             for (index, variable) in enumerate(problem.original_variables)
-                opt.variable_primal[variable] = _to_output_type(T, particular[index])
+                opt.variable_primal[variable] = _to_output_type(T, original_point[index])
             end
             opt.objective_value = _to_output_type(T, objective_value)
             opt.termination_status = MOI.OPTIMAL
@@ -345,7 +347,8 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             end
         end
 
-        feasibility = _exact_primal_feasibility(original_problem, x_exact)
+        original_point = _lift_original_solution(problem, x_exact)
+        feasibility = _exact_primal_feasibility(original_problem, original_point)
         if !feasibility.ok
             opt.termination_status = MOI.NUMERICAL_ERROR
             opt.primal_status = MOI.NO_SOLUTION
@@ -355,11 +358,11 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             return
         end
 
-        objective_value = _exact_objective_value(problem, x_exact)
+        objective_value = _exact_objective_value(original_problem, original_point)
         for (index, variable) in enumerate(problem.original_variables)
-            opt.variable_primal[variable] = _to_output_type(T, x_exact[index])
+            opt.variable_primal[variable] = _to_output_type(T, original_point[index])
         end
-        _populate_constraint_results!(opt, problem, x_exact)
+        _populate_constraint_results!(opt, original_problem, original_point)
         opt.objective_value = _to_output_type(T, objective_value)
         opt.primal_status = MOI.FEASIBLE_POINT
         opt.dual_status = MOI.NO_SOLUTION

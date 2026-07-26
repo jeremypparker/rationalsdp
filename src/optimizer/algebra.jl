@@ -669,19 +669,26 @@ end
 function _independent_nullspace_columns(
     nullspace::Matrix{ExactRational},
     active_positions::Vector{Int},
-)
+    ::Type{F},
+) where {F<:AbstractFloat}
     size(nullspace, 2) == 0 && return nullspace
     isempty(active_positions) && return zeros(ExactRational, size(nullspace, 1), 0)
 
     reduced = nullspace[active_positions, :]
-    numeric_reduced = Matrix{Float64}(undef, size(reduced))
+    numeric_reduced = Matrix{F}(undef, size(reduced))
     for column in axes(reduced, 2), row in axes(reduced, 1)
-        numeric_reduced[row, column] = Float64(reduced[row, column])
+        numeric_reduced[row, column] = F(reduced[row, column])
+    end
+    for column in axes(numeric_reduced, 2)
+        column_scale = norm(view(numeric_reduced, :, column))
+        iszero(column_scale) && continue
+        view(numeric_reduced, :, column) ./= column_scale
     end
     factorization = qr(numeric_reduced, ColumnNorm())
     diagonal = abs.(diag(factorization.R))
     rank_tolerance =
-        isempty(diagonal) ? 0.0 : maximum(diagonal) * max(size(numeric_reduced)...) * eps(Float64)
+        isempty(diagonal) ? zero(F) :
+        maximum(diagonal) * F(max(size(numeric_reduced)...)) * eps(F)
     rank = count(value -> value > rank_tolerance, diagonal)
     pivots = isempty(diagonal) ? Int[] : sort(factorization.p[1:rank])
     isempty(pivots) && return zeros(ExactRational, size(nullspace, 1), 0)
@@ -692,7 +699,8 @@ function _compute_phase1_nullspace(
     blocks::Vector{BlockStructure},
     positive_scalars::Vector{Int},
     affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
-)
+    ::Type{F},
+) where {F<:AbstractFloat}
     affine === nothing && return nothing
     _, nullspace = affine
 
@@ -702,17 +710,19 @@ function _compute_phase1_nullspace(
         append!(active_positions, block.global_positions)
     end
     active_positions = unique(sort(active_positions))
-    return _independent_nullspace_columns(nullspace, active_positions)
+    return _independent_nullspace_columns(nullspace, active_positions, F)
 end
 
-function _phase1_nullspace(problem::ProblemData)
+function _phase1_nullspace(problem::ProblemData, ::Type{F}) where {F<:AbstractFloat}
     problem.affine === nothing && error("Phase I nullspace requested without affine data.")
-    if problem.phase1_nullspace === nothing
+    if problem.phase1_nullspace === nothing || problem.phase1_nullspace_float_type !== F
         problem.phase1_nullspace = _compute_phase1_nullspace(
             problem.blocks,
             problem.positive_scalars,
             problem.affine,
+            F,
         )
+        problem.phase1_nullspace_float_type = F
     end
     return problem.phase1_nullspace
 end
@@ -725,10 +735,14 @@ function _phase2_relevant_positions(problem::ProblemData)
     return unique(sort(positions))
 end
 
-function _phase2_nullspace(problem::ProblemData)
+function _phase2_nullspace(problem::ProblemData, ::Type{F}) where {F<:AbstractFloat}
     problem.affine === nothing && error("Phase II nullspace requested without affine data.")
     _, nullspace = problem.affine
-    return _independent_nullspace_columns(nullspace, _phase2_relevant_positions(problem))
+    return _independent_nullspace_columns(
+        nullspace,
+        _phase2_relevant_positions(problem),
+        F,
+    )
 end
 
 function ProblemData(
@@ -736,7 +750,50 @@ function ProblemData(
     blocks::Vector{BlockStructure},
     positive_scalars::Vector{Int},
     objective_vector_raw::Vector{ExactRational},
-    objective_constant_raw::ExactRational,
+    objective_constant_raw,
+    objective_vector_min::Vector{ExactRational},
+    A::Matrix{ExactRational},
+    b::Vector{ExactRational},
+    affine::Union{Nothing,Tuple{Vector{ExactRational},Matrix{ExactRational}}},
+    phase1_nullspace::Union{Nothing,Matrix{ExactRational}},
+    scalar_constraint_rows::Dict{Any,Vector{Int}},
+    psd_constraint_blocks::Dict{Any,Int},
+)
+    dimension = length(objective_vector_raw)
+    identity_lift = sparse(
+        1:dimension,
+        1:dimension,
+        fill(one(ExactRational), dimension),
+        dimension,
+        dimension,
+    )
+    return ProblemData(
+        original_variables,
+        blocks,
+        positive_scalars,
+        objective_vector_raw,
+        _exact_rational(objective_constant_raw),
+        objective_vector_min,
+        A,
+        b,
+        affine,
+        phase1_nullspace,
+        scalar_constraint_rows,
+        psd_constraint_blocks,
+        identity_lift,
+        nothing,
+        collect(1:dimension),
+        identity_lift,
+        nothing,
+    )
+end
+
+function ProblemData(
+    original_variables::Vector{MOI.VariableIndex},
+    blocks::Vector{BlockStructure},
+    positive_scalars::Vector{Int},
+    objective_vector_raw::Vector{ExactRational},
+    objective_constant_raw,
     objective_vector_min::Vector{ExactRational},
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
@@ -747,7 +804,7 @@ function ProblemData(
         blocks,
         positive_scalars,
         objective_vector_raw,
-        objective_constant_raw,
+        _exact_rational(objective_constant_raw),
         objective_vector_min,
         A,
         b,
@@ -756,6 +813,15 @@ function ProblemData(
         Dict{Any,Vector{Int}}(),
         Dict{Any,Int}(),
     )
+end
+
+function _lift_original_solution(
+    problem::ProblemData,
+    point::AbstractVector{ExactRational},
+)
+    length(point) == size(problem.solution_lift, 2) ||
+        error("Compact solution vector has the wrong dimension.")
+    return Vector{ExactRational}(problem.solution_lift * point)
 end
 
 function ProblemData(

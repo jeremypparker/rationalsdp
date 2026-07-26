@@ -371,6 +371,11 @@ mutable struct ProblemData
     phase1_nullspace::Union{Nothing,Matrix{ExactRational}}
     scalar_constraint_rows::Dict{Any,Vector{Int}}
     psd_constraint_blocks::Dict{Any,Int}
+    solution_lift::SparseMatrixCSC{ExactRational,Int}
+    legacy_facial_reduction_signature::Any
+    legacy_position_map::Vector{Int}
+    legacy_coordinate_lift::SparseMatrixCSC{ExactRational,Int}
+    phase1_nullspace_float_type::Union{Nothing,DataType}
 end
 
 struct NumericBlock

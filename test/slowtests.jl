@@ -402,14 +402,11 @@ end
 
         _optimize_slow_test!("sis-log-domain", model)
 
-        @test termination_status(model) == MOI.OTHER_LIMIT
+        @test termination_status(model) == MOI.OPTIMAL
         test_facial_reduction_statistics(model)
         @test primal_status(model) == MOI.FEASIBLE_POINT
         @test objective_value(model) == 0//1
-        @test occursin(
-            "optimality for the original SDP is not established",
-            MOI.get(backend(model), MOI.RawStatusString()),
-        )
+        @test MOI.get(backend(model), MOI.RawStatusString()) == "Solved"
         @test iszero(value(V)(i => 0, n => 0, l => 0, m => 0))
         test_exact_extracted_sdp(model)
     end

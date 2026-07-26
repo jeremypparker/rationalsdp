@@ -2412,7 +2412,14 @@ struct _CertifiedFacialReduction
     source::String
     exposed_scalars::Vector{Int}
     keep_bases::Dict{Int,Matrix{ExactRational}}
+    exposing_slack::Union{Nothing,Vector{ExactRational}}
 end
+
+_CertifiedFacialReduction(
+    source::AbstractString,
+    exposed_scalars::Vector{Int},
+    keep_bases::Dict{Int,Matrix{ExactRational}},
+) = _CertifiedFacialReduction(String(source), exposed_scalars, keep_bases, nothing)
 
 struct _SieveRowCertificate
     source::String
@@ -2422,7 +2429,8 @@ struct _SieveRowCertificate
 end
 
 const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
-const _FACIAL_REDUCTION_CACHE_VERSION = 1
+const _FACIAL_REDUCTION_CACHE_VERSION = 2
+const _FACIAL_REDUCTION_CACHE_READABLE_VERSIONS = (1, _FACIAL_REDUCTION_CACHE_VERSION)
 
 function _facial_reduction_cache_path(path::AbstractString)
     stripped = strip(path)
@@ -2434,7 +2442,7 @@ function _facial_reduction_cache_records(payload)
         throw(ArgumentError("Facial reduction cache is not a RationalSDP cache payload."))
     (:magic in keys(payload) && payload.magic == _FACIAL_REDUCTION_CACHE_MAGIC) ||
         throw(ArgumentError("Facial reduction cache has an unrecognized file header."))
-    (:version in keys(payload) && payload.version == _FACIAL_REDUCTION_CACHE_VERSION) ||
+    (:version in keys(payload) && payload.version in _FACIAL_REDUCTION_CACHE_READABLE_VERSIONS) ||
         throw(ArgumentError("Unsupported facial reduction cache version."))
     (:records in keys(payload) && payload.records isa AbstractVector) ||
         throw(ArgumentError("Facial reduction cache is missing its record list."))
@@ -2533,24 +2541,42 @@ function _facial_reduction_problem_signature(problem::ProblemData)
     )
 end
 
-function _facial_reduction_signature_matches(problem::ProblemData, signature)
+function _facial_reduction_signature_matches_signature(candidate, signature)
     signature isa NamedTuple || return false
     required = (:dimension, :equation_count, :positive_scalars, :blocks)
     all(name -> name in keys(signature), required) || return false
-    signature.dimension == length(problem.objective_vector_raw) || return false
-    signature.equation_count == size(problem.A, 1) || return false
-    collect(signature.positive_scalars) == problem.positive_scalars || return false
-    length(signature.blocks) == length(problem.blocks) || return false
-    for (block, block_signature) in zip(problem.blocks, signature.blocks)
+    signature.dimension == candidate.dimension || return false
+    signature.equation_count == candidate.equation_count || return false
+    collect(signature.positive_scalars) == collect(candidate.positive_scalars) || return false
+    length(signature.blocks) == length(candidate.blocks) || return false
+    for (candidate_block, block_signature) in zip(candidate.blocks, signature.blocks)
         block_signature isa NamedTuple || return false
         block_required = (:size, :global_positions, :local_positions, :diagonal_positions)
         all(name -> name in keys(block_signature), block_required) || return false
-        block_signature.size == block.size || return false
-        collect(block_signature.global_positions) == block.global_positions || return false
-        collect(block_signature.local_positions) == block.local_positions || return false
-        collect(block_signature.diagonal_positions) == block.diagonal_positions || return false
+        block_signature.size == candidate_block.size || return false
+        collect(block_signature.global_positions) ==
+            collect(candidate_block.global_positions) || return false
+        collect(block_signature.local_positions) ==
+            collect(candidate_block.local_positions) || return false
+        collect(block_signature.diagonal_positions) ==
+            collect(candidate_block.diagonal_positions) || return false
     end
     return true
+end
+
+function _facial_reduction_signature_matches(problem::ProblemData, signature)
+    return _facial_reduction_signature_matches_signature(
+        _facial_reduction_problem_signature(problem),
+        signature,
+    )
+end
+
+function _facial_reduction_signature_match_kind(problem::ProblemData, signature)
+    _facial_reduction_signature_matches(problem, signature) && return :current
+    legacy = problem.legacy_facial_reduction_signature
+    legacy === nothing && return :none
+    return _facial_reduction_signature_matches_signature(legacy, signature) ?
+           :legacy : :none
 end
 
 function _facial_reduction_record(
@@ -2566,6 +2592,8 @@ function _facial_reduction_record(
         source = reduction.source,
         exposed_scalars = copy(reduction.exposed_scalars),
         keep_bases = keep_bases,
+        exposing_slack =
+            reduction.exposing_slack === nothing ? nothing : copy(reduction.exposing_slack),
     )
 end
 
@@ -2602,6 +2630,16 @@ function _record_successful_facial_reduction!(
 )
     save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
     save_path === nothing && return
+    if reduction.exposing_slack === nothing
+        upgraded = _with_exact_exposing_slack(problem, reduction, opt.settings)
+        if upgraded !== nothing
+            reduction = upgraded
+            _log(
+                opt,
+                "Facial reduction: attached a composable exact exposing slack before checkpointing",
+            )
+        end
+    end
     target = supersedes === nothing ? reduction : supersedes
     replace_indices = Int[]
     for (record_index, record) in enumerate(opt.facial_reduction_save_records)
@@ -2662,13 +2700,221 @@ function _cached_facial_reduction(record)
         haskey(keep_bases, block_index) && return nothing
         keep_bases[block_index] = _exact_matrix_from_cache(item.basis)
     end
-    return _CertifiedFacialReduction(String(record.source), exposed_scalars, keep_bases)
+    exposing_slack = if :exposing_slack in keys(record) && record.exposing_slack !== nothing
+        ExactRational[_exact_rational(value) for value in record.exposing_slack]
+    else
+        nothing
+    end
+    return _CertifiedFacialReduction(
+        String(record.source),
+        exposed_scalars,
+        keep_bases,
+        exposing_slack,
+    )
+end
+
+function _remap_legacy_cached_reduction(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    mapped_scalars = Int[]
+    for legacy_position in reduction.exposed_scalars
+        1 <= legacy_position <= length(problem.legacy_position_map) || return nothing
+        current_position = problem.legacy_position_map[legacy_position]
+        current_position > 0 || return nothing
+        push!(mapped_scalars, current_position)
+    end
+    mapped_slack = if reduction.exposing_slack === nothing
+        nothing
+    else
+        length(reduction.exposing_slack) == size(problem.legacy_coordinate_lift, 1) ||
+            return nothing
+        Vector{ExactRational}(
+            transpose(problem.legacy_coordinate_lift) * reduction.exposing_slack,
+        )
+    end
+    # A cached exposing slack is a covector in the old expanded coordinates.
+    # Pull it back through the exact legacy-coordinate lift so coupled
+    # certificates across several PSD blocks remain available for validation.
+    return _CertifiedFacialReduction(
+        reduction.source,
+        unique(sort(mapped_scalars)),
+        copy(reduction.keep_bases),
+        mapped_slack,
+    )
 end
 
 function _exact_column_rank(matrix::Matrix{ExactRational})
     size(matrix, 2) == 0 && return 0
     _, pivots = _rref(hcat(matrix, zeros(ExactRational, size(matrix, 1))))
     return length(pivots)
+end
+
+function _add_block_exposing_matrix!(
+    slack::Vector{ExactRational},
+    block::BlockStructure,
+    matrix::Matrix{ExactRational},
+)
+    size(matrix) == (block.size, block.size) ||
+        error("Exact exposing slack matrix has the wrong PSD block size.")
+    for (local_index, (i, j)) in enumerate(block.local_positions)
+        slack[block.global_positions[local_index]] +=
+            i == j ? matrix[i, j] : 2 * matrix[i, j]
+    end
+    return slack
+end
+
+function _exact_exposing_slack_violation(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+)
+    slack = reduction.exposing_slack
+    slack === nothing && return "no exact exposing slack is attached"
+    length(slack) == length(problem.objective_vector_raw) ||
+        return "exact exposing slack has length $(length(slack)), expected $(length(problem.objective_vector_raw))"
+    all(index -> iszero(slack[index]), _facial_reduction_free_positions(problem)) ||
+        return "exact exposing slack is nonzero in a free position"
+
+    exposed_scalars = Set(reduction.exposed_scalars)
+    for position in problem.positive_scalars
+        value = slack[position]
+        value >= 0 // 1 ||
+            return "exact exposing slack is negative at scalar position $(position)"
+        (position in exposed_scalars) == (value > 0 // 1) ||
+            return "exact exposing slack does not expose the recorded scalar face at position $(position)"
+    end
+
+    for (block_index, block) in enumerate(problem.blocks)
+        block_slack = _dual_vector_to_matrix(slack, block)
+        _positive_semidefinite_exact(block_slack) ||
+            return "exact exposing slack is not positive semidefinite in PSD block $(block_index)"
+        recorded_keep = get(reduction.keep_bases, block_index, nothing)
+        if recorded_keep === nothing
+            all(iszero, block_slack) ||
+                return "exact exposing slack exposes an unrecorded face in PSD block $(block_index)"
+            continue
+        end
+        structure_violation =
+            _cached_keep_basis_structure_violation(problem, block_index, recorded_keep)
+        structure_violation === nothing || return structure_violation
+        slack_keep = _nullspace_basis_exact(block_slack)
+        size(slack_keep, 2) == size(recorded_keep, 2) ||
+            return "exact exposing slack has a different kernel dimension in PSD block $(block_index)"
+        _exact_column_rank(hcat(slack_keep, recorded_keep)) == size(recorded_keep, 2) ||
+            return "exact exposing slack has a different kernel in PSD block $(block_index)"
+    end
+
+    any(!iszero, slack) || return "exact exposing slack is zero"
+    indices = findall(!iszero, slack)
+    affine_violation = _affine_form_violation(problem, indices, slack[indices])
+    affine_violation === nothing ||
+        return "exact exposing slack does not vanish on the affine slice ($(affine_violation))"
+    return nothing
+end
+
+function _reconstruct_exact_exposing_slack(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+    settings::Settings,
+)
+    slack = zeros(ExactRational, length(problem.objective_vector_raw))
+    for position in reduction.exposed_scalars
+        1 <= position <= length(slack) || return nothing
+        slack[position] += 1 // 1
+    end
+
+    directions_by_block = Dict{Int,Vector{Vector{ExactRational}}}()
+    for block_index in sort(collect(keys(reduction.keep_bases)))
+        keep_basis = reduction.keep_bases[block_index]
+        _cached_keep_basis_structure_violation(problem, block_index, keep_basis) === nothing ||
+            return nothing
+        removed = _nullspace_basis_exact(Matrix(transpose(keep_basis)))
+        directions_by_block[block_index] = [
+            collect(view(removed, :, column)) for column in axes(removed, 2)
+        ]
+    end
+
+    unresolved_blocks = sort(collect(keys(directions_by_block)))
+    if length(unresolved_blocks) > 1
+        joint = _multiblock_weighted_subspace_exposure(
+            problem,
+            directions_by_block,
+            settings,
+            _facial_reduction_float_type(settings),
+        )
+        if joint !== nothing
+            for block_index in unresolved_blocks
+                directions = hcat(directions_by_block[block_index]...)
+                block_slack = directions * joint.weights[block_index] * transpose(directions)
+                _add_block_exposing_matrix!(
+                    slack,
+                    problem.blocks[block_index],
+                    block_slack,
+                )
+            end
+            empty!(unresolved_blocks)
+        end
+    end
+
+    cache = _FacialReductionExactCache(problem)
+    for block_index in unresolved_blocks
+        block = problem.blocks[block_index]
+        directions = directions_by_block[block_index]
+        exposure = _block_weighted_subspace_exposure(
+            problem,
+            block,
+            directions,
+            settings,
+            _facial_reduction_float_type(settings),
+        )
+        block_slack = if exposure === nothing
+            matrix = zeros(ExactRational, block.size, block.size)
+            for direction in directions
+                certificate = _block_face_direction_certificate(
+                    problem,
+                    block,
+                    direction;
+                    cache,
+                    block_index,
+                )
+                certificate.kind == :none && return nothing
+                matrix .+= direction * transpose(direction)
+            end
+            matrix
+        else
+            direction_matrix = hcat(directions...)
+            direction_matrix * exposure.weight * transpose(direction_matrix)
+        end
+        _add_block_exposing_matrix!(slack, block, block_slack)
+    end
+
+    candidate = _CertifiedFacialReduction(
+        reduction.source,
+        copy(reduction.exposed_scalars),
+        copy(reduction.keep_bases),
+        slack,
+    )
+    _exact_exposing_slack_violation(problem, candidate) === nothing || return nothing
+    return slack
+end
+
+function _with_exact_exposing_slack(
+    problem::ProblemData,
+    reduction::_CertifiedFacialReduction,
+    settings::Settings,
+)
+    if reduction.exposing_slack !== nothing
+        return _exact_exposing_slack_violation(problem, reduction) === nothing ? reduction :
+               nothing
+    end
+    slack = _reconstruct_exact_exposing_slack(problem, reduction, settings)
+    slack === nothing && return nothing
+    return _CertifiedFacialReduction(
+        reduction.source,
+        copy(reduction.exposed_scalars),
+        copy(reduction.keep_bases),
+        slack,
+    )
 end
 
 function _cached_scalar_face_violation(problem::ProblemData, position::Int)
@@ -2724,7 +2970,7 @@ function _cached_keep_basis_violation(
         block,
         directions,
         settings,
-        Float64,
+        _facial_reduction_float_type(settings),
     )
     weighted_exposure === nothing || return nothing
 
@@ -2763,6 +3009,9 @@ function _cached_facial_reduction_violation(
     if isempty(reduction.exposed_scalars) && isempty(reduction.keep_bases)
         return "cached reduction has no exposed scalar or PSD face"
     end
+    if reduction.exposing_slack !== nothing
+        return _exact_exposing_slack_violation(problem, reduction)
+    end
     for position in reduction.exposed_scalars
         violation = _cached_scalar_face_violation(problem, position)
         violation === nothing || return violation
@@ -2786,7 +3035,7 @@ function _cached_facial_reduction_violation(
             problem,
             directions_by_block,
             settings,
-            Float64,
+            _facial_reduction_float_type(settings),
         )
         joint_exposure === nothing || return nothing
     end
@@ -2818,7 +3067,8 @@ function _apply_loaded_facial_reductions(
     for record in records
         record isa NamedTuple || continue
         (:signature in keys(record)) || continue
-        _facial_reduction_signature_matches(current, record.signature) || continue
+        match_kind = _facial_reduction_signature_match_kind(current, record.signature)
+        match_kind == :none && continue
         matched += 1
 
         reduction = try
@@ -2831,11 +3081,42 @@ function _apply_loaded_facial_reductions(
             _log(opt, "Facial reduction: skipped malformed cache record")
             continue
         end
+        if match_kind == :legacy
+            reduction = _remap_legacy_cached_reduction(current, reduction)
+            if reduction === nothing
+                _log(
+                    opt,
+                    "Facial reduction: legacy cache record could not be mapped to compact coordinates",
+                )
+                continue
+            end
+            _log(
+                opt,
+                "Facial reduction: matched legacy expanded-coordinate cache record to compact coordinates",
+            )
+        end
 
         violation = _cached_facial_reduction_violation(current, reduction, opt.settings)
         if violation !== nothing
             _log(opt, "Facial reduction: cached face did not validate ($(violation))")
             continue
+        end
+
+        reduction_with_slack =
+            _with_exact_exposing_slack(current, reduction, opt.settings)
+        if reduction_with_slack === nothing
+            _log(
+                opt,
+                "Facial reduction: cached face validated, but its legacy certificate could not be upgraded to a composable exact exposing slack",
+            )
+        else
+            if reduction.exposing_slack === nothing
+                _log(
+                    opt,
+                    "Facial reduction: upgraded cached face to a composable exact exposing-slack certificate",
+                )
+            end
+            reduction = reduction_with_slack
         end
 
         if opt.settings.facial_reduction &&
@@ -2921,6 +3202,27 @@ function _exact_slack_keep_bases(
     return keep_bases
 end
 
+function _exact_exposing_slack_vector(
+    problem::ProblemData,
+    scalar_slack::Dict{Int,ExactRational},
+    block_slack::Dict{Int,Matrix{ExactRational}},
+)
+    slack = zeros(ExactRational, length(problem.objective_vector_raw))
+    for (position, value) in scalar_slack
+        slack[position] = value
+    end
+    for (block_index, matrix) in block_slack
+        block = problem.blocks[block_index]
+        size(matrix) == (block.size, block.size) ||
+            error("Exact exposing slack matrix has the wrong size for PSD block $(block_index).")
+        for (local_index, (i, j)) in enumerate(block.local_positions)
+            slack[block.global_positions[local_index]] =
+                i == j ? matrix[i, j] : 2 * matrix[i, j]
+        end
+    end
+    return slack
+end
+
 function _certified_reduction_from_exact_slack(
     opt::Optimizer,
     problem::ProblemData,
@@ -2938,7 +3240,14 @@ function _certified_reduction_from_exact_slack(
             opt,
             "Facial reduction: $(source) exposed $(length(exposed_scalars)) scalar cone direction(s) and $(length(keep_bases)) PSD block face(s)",
         )
-        return _CertifiedFacialReduction(source, exposed_scalars, keep_bases)
+        exposing_slack =
+            _exact_exposing_slack_vector(problem, scalar_slack_exact, block_slack_exact)
+        return _CertifiedFacialReduction(
+            String(source),
+            exposed_scalars,
+            keep_bases,
+            exposing_slack,
+        )
     end
     return nothing
 end
@@ -2978,15 +3287,16 @@ function _sieve_row_reduction(
     # eigensolver failure keeps the exact path.
     for block_index in keys(block_slack)
         matrix = block_slack[block_index]
+        F = _facial_reduction_float_type(opt.settings)
         numeric_matrix = try
-            Float64.(matrix)
+            F.(matrix)
         catch
             nothing
         end
         numeric_matrix === nothing && continue
         all(isfinite, numeric_matrix) || continue
-        scale = max(1.0, opnorm(numeric_matrix, 1))
-        tolerance = 100 * eps(Float64) * scale * max(1, size(matrix, 1))
+        scale = max(one(F), opnorm(numeric_matrix, 1))
+        tolerance = F(100) * eps(F) * scale * F(max(1, size(matrix, 1)))
         minimum_eigenvalue = try
             eigmin(Symmetric(numeric_matrix))
         catch
@@ -3157,18 +3467,7 @@ function _facial_reduction_oracle_float_type(opt::Optimizer, problem::ProblemDat
     if opt.settings.facial_reduction_float_type !== AbstractFloat
         return _facial_reduction_float_type(opt.settings)
     end
-
-    configured_type = _phase1_hypatia_float_type(opt.settings)
-    if _phase1_hypatia_float_type_is_auto(opt.settings) &&
-       configured_type != Float64 &&
-       _phase1_hypatia_prefers_sparse_float64(problem)
-        _log(
-            opt,
-            "Facial reduction oracle: using Float64 sparse linear algebra for this large sparse model",
-        )
-        return Float64
-    end
-    return configured_type
+    return _phase1_hypatia_float_type(opt.settings)
 end
 
 function _rational_boundary_kernel_candidate_sets(
@@ -3624,28 +3923,33 @@ function _certify_oracle_point_evidence(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
     normalization_row::Vector{ExactRational} = _facial_reduction_trace_row(problem),
+    attempt_exact_slack::Bool = true,
+    allow_subspace_recovery::Bool = true,
 ) where {F<:AbstractFloat}
-    exact_oracle_slack = _exact_facial_reduction_oracle_slack(
-        opt,
-        problem,
-        evidence.vector,
-        F,
-        ;
-        cache,
-        normalization_row,
-    )
-    if exact_oracle_slack !== nothing
-        scalar_slack_exact, block_slack_exact = exact_oracle_slack
-        reduction = _certified_reduction_from_exact_slack(
+    if attempt_exact_slack
+        exact_oracle_slack = _exact_facial_reduction_oracle_slack(
             opt,
             problem,
-            scalar_slack_exact,
-            block_slack_exact,
-            evidence.source,
+            evidence.vector,
+            F,
+            ;
+            cache,
+            normalization_row,
         )
-        reduction === nothing || return reduction
+        if exact_oracle_slack !== nothing
+            scalar_slack_exact, block_slack_exact = exact_oracle_slack
+            reduction = _certified_reduction_from_exact_slack(
+                opt,
+                problem,
+                scalar_slack_exact,
+                block_slack_exact,
+                evidence.source,
+            )
+            reduction === nothing || return reduction
+        end
     end
 
+    allow_subspace_recovery || return nothing
     _, block_slack = _facial_reduction_slack(problem, evidence.vector)
     keep_bases = Dict{Int,Matrix{ExactRational}}()
     for block_index in eachindex(problem.blocks)
@@ -3760,13 +4064,47 @@ function _merge_certified_facial_reductions(
         keep_bases[block_index] = keep_basis
     end
 
-    merged = _CertifiedFacialReduction(
-        join(unique(reduction.source for reduction in reductions), " + "),
-        exposed_scalars,
-        keep_bases,
+    source = join(unique(reduction.source for reduction in reductions), " + ")
+    reductions_with_slack = [
+        _with_exact_exposing_slack(problem, reduction, opt.settings) for
+        reduction in reductions
+    ]
+    if all(reduction -> reduction !== nothing, reductions_with_slack)
+        exposing_slack = sum(
+            reduction.exposing_slack for reduction in reductions_with_slack;
+            init = zeros(ExactRational, length(problem.objective_vector_raw)),
+        )
+        merged = _CertifiedFacialReduction(
+            source,
+            exposed_scalars,
+            keep_bases,
+            exposing_slack,
+        )
+        violation = _exact_exposing_slack_violation(problem, merged)
+        if violation !== nothing
+            _log(
+                opt,
+                "Facial reduction: rejected compositional merge of exact exposing slacks ($(violation))",
+            )
+            return nothing
+        end
+        _log(
+            opt,
+            "Facial reduction: merged $(length(reductions)) certified face(s) by composing their exact exposing slacks",
+        )
+        return merged
+    end
+
+    _log(
+        opt,
+        "Facial reduction: exact exposing-slack provenance was unavailable for a merge input; falling back to face reconstruction",
     )
-    _cached_facial_reduction_violation(problem, merged, opt.settings) === nothing ||
+    merged = _CertifiedFacialReduction(source, exposed_scalars, keep_bases)
+    violation = _cached_facial_reduction_violation(problem, merged, opt.settings)
+    if violation !== nothing
+        _log(opt, "Facial reduction: reconstructed face merge was rejected ($(violation))")
         return nothing
+    end
     return merged
 end
 
@@ -3874,6 +4212,13 @@ function _facial_reduction_oracle_solver_overrides(
     else
         :qrchol_dense
     end
+    if oracle_solver != :auto
+        # An explicit oracle solver is a complete policy, not merely a
+        # preference. In particular, do not fall back to the Phase-I solver:
+        # on large degenerate systems that fallback can spend hours making
+        # essentially no progress.
+        return Union{Nothing,Symbol}[oracle_solver]
+    end
     primary_override = oracle_solver == :auto ? nothing : oracle_solver
     primary_solver = oracle_solver == :auto ? phase1_solver : oracle_solver
     fallback_override = oracle_solver == :auto ? stable_solver : nothing
@@ -3881,6 +4226,11 @@ function _facial_reduction_oracle_solver_overrides(
     solver_overrides = Union{Nothing,Symbol}[primary_override]
     primary_solver == fallback_solver || push!(solver_overrides, fallback_override)
     return solver_overrides
+end
+
+function _defer_oracle_subspace_recovery(problem::ProblemData, settings::Settings)
+    affine_products = BigInt(size(problem.A, 1)) * size(problem.A, 2)
+    return affine_products > settings.facial_reduction_individual_max_affine_products
 end
 
 function _facial_reduction_oracle_round(
@@ -3893,6 +4243,8 @@ function _facial_reduction_oracle_round(
     source::AbstractString = "oracle",
 ) where {HF<:AbstractFloat}
     _record_facial_reduction_path!(:oracle)
+    defer_subspace_recovery = _defer_oracle_subspace_recovery(problem, opt.settings)
+    deferred_candidates = Any[]
     float_types = DataType[HF]
     oracle_precision_retries = max(
         opt.settings.facial_reduction_oracle_precision_escalation_max_retries,
@@ -3956,12 +4308,13 @@ function _facial_reduction_oracle_round(
                     oracle_float_type;
                     cache,
                     normalization_row,
+                    allow_subspace_recovery = !defer_subspace_recovery,
                 )
             catch err
                 if _is_inexact_facial_reduction_error(err)
                     _log(
                         opt,
-                        "Facial reduction oracle: $(oracle_float_type) candidate could not be certified exactly; continuing with other system solvers and recovery paths",
+                        "Facial reduction oracle: $(oracle_float_type) candidate could not be certified exactly; continuing with other numerical attempts",
                     )
                     precision_retry_recommended = true
                     nothing
@@ -3973,6 +4326,20 @@ function _facial_reduction_oracle_round(
                 _record_facial_reduction_path!(:oracle; success = true)
                 return reduction
             end
+            if defer_subspace_recovery
+                push!(
+                    deferred_candidates,
+                    (
+                        evidence = evidence,
+                        float_type = oracle_float_type,
+                        normalization_row = normalization_row,
+                    ),
+                )
+                _log(
+                    opt,
+                    "Facial reduction oracle: deferring expensive rational subspace recovery until alternate solvers and precisions have been tried",
+                )
+            end
             precision_retry_recommended = true
         end
         if precision_index < length(float_types) && !precision_retry_recommended
@@ -3981,6 +4348,41 @@ function _facial_reduction_oracle_round(
                 "Facial reduction oracle: higher precision is unnecessary after a completed numerical oracle solve",
             )
             break
+        end
+    end
+
+    if !isempty(deferred_candidates)
+        _log(
+            opt,
+            "Facial reduction oracle: numerical alternatives exhausted; attempting deferred rational subspace recovery on $(length(deferred_candidates)) candidate(s)",
+        )
+        for candidate in deferred_candidates
+            reduction = try
+                _certify_oracle_point_evidence(
+                    opt,
+                    problem,
+                    candidate.evidence,
+                    candidate.float_type;
+                    cache,
+                    normalization_row = candidate.normalization_row,
+                    attempt_exact_slack = false,
+                    allow_subspace_recovery = true,
+                )
+            catch err
+                if _is_inexact_facial_reduction_error(err)
+                    _log(
+                        opt,
+                        "Facial reduction oracle: deferred $(candidate.float_type) subspace candidate could not be certified exactly; continuing",
+                    )
+                    nothing
+                else
+                    rethrow()
+                end
+            end
+            if reduction !== nothing
+                _record_facial_reduction_path!(:oracle; success = true)
+                return reduction
+            end
         end
     end
     return nothing
@@ -4143,9 +4545,21 @@ function _facial_reduction_round_with_rank_expansion(
             normalization_row,
             source = "rank-expansion oracle $(expansion_round)",
         )
-        next === nothing && break
+        if next === nothing
+            _log(
+                opt,
+                "Facial reduction: rank expansion stopped after round $(expansion_round); no additional exact face was certified",
+            )
+            break
+        end
         merged = _merge_certified_facial_reductions(opt, problem, [current, next])
-        merged === nothing && break
+        if merged === nothing
+            _log(
+                opt,
+                "Facial reduction: rank expansion stopped after round $(expansion_round); the new exact face could not be merged",
+            )
+            break
+        end
         old_removed = sum(
             problem.blocks[index].size - size(current.keep_bases[index], 2) for
             index in keys(current.keep_bases);
@@ -4156,7 +4570,13 @@ function _facial_reduction_round_with_rank_expansion(
             index in keys(merged.keep_bases);
             init = 0,
         ) + length(merged.exposed_scalars)
-        new_removed > old_removed || break
+        if new_removed <= old_removed
+            _log(
+                opt,
+                "Facial reduction: rank expansion stopped after round $(expansion_round); the merged certificate exposed no new cone direction",
+            )
+            break
+        end
         previous = current
         current = merged
         _record_successful_facial_reduction!(
@@ -4167,6 +4587,245 @@ function _facial_reduction_round_with_rank_expansion(
         )
     end
     return current
+end
+
+function _remap_block_structure(
+    block::BlockStructure,
+    position_map::AbstractVector{Int},
+)
+    global_positions = Int[position_map[position] for position in block.global_positions]
+    all(>(0), global_positions) ||
+        error("Compact facial-reduction map removed an active PSD coordinate.")
+    diagonal_positions = Int[position_map[position] for position in block.diagonal_positions]
+    return BlockStructure(
+        block.size,
+        copy(block.variables),
+        global_positions,
+        copy(block.local_positions),
+        diagonal_positions,
+    )
+end
+
+function _face_basis_coefficient(
+    keep_basis::Matrix{ExactRational},
+    i::Int,
+    j::Int,
+    a::Int,
+    b::Int,
+)
+    return if a == b
+        keep_basis[i, a] * keep_basis[j, a]
+    else
+        keep_basis[i, a] * keep_basis[j, b] +
+        keep_basis[i, b] * keep_basis[j, a]
+    end
+end
+
+function _compact_face_coordinate_data(
+    problem::ProblemData,
+    exposed_scalars::Vector{Int},
+    keep_bases::Dict{Int,Matrix{ExactRational}},
+    block_replacements::Dict{Int,Union{Nothing,BlockStructure}},
+    extended_dimension::Int,
+)
+    old_dimension = length(problem.objective_vector_raw)
+    removed_old_positions = Set{Int}(exposed_scalars)
+    for block_index in keys(keep_bases)
+        union!(removed_old_positions, problem.blocks[block_index].global_positions)
+    end
+    kept_old_positions = [
+        position for position in 1:old_dimension if !(position in removed_old_positions)
+    ]
+    appended_positions = collect((old_dimension + 1):extended_dimension)
+    source_positions = vcat(kept_old_positions, appended_positions)
+    extended_to_compact = zeros(Int, extended_dimension)
+    for (compact_position, source_position) in enumerate(source_positions)
+        extended_to_compact[source_position] = compact_position
+    end
+
+    old_to_compact = view(extended_to_compact, 1:old_dimension)
+    compact_dimension = length(source_positions)
+    old_from_compact = spzeros(ExactRational, old_dimension, compact_dimension)
+    for old_position in kept_old_positions
+        old_from_compact[old_position, old_to_compact[old_position]] = one(ExactRational)
+    end
+
+    compact_blocks = BlockStructure[]
+    replacement_compact_positions = Dict{Int,Vector{Int}}()
+    for (block_index, block) in enumerate(problem.blocks)
+        keep_basis = get(keep_bases, block_index, nothing)
+        if keep_basis === nothing
+            push!(compact_blocks, _remap_block_structure(block, extended_to_compact))
+            continue
+        end
+        replacement = get(block_replacements, block_index, nothing)
+        replacement === nothing && continue
+        compact_replacement = _remap_block_structure(replacement, extended_to_compact)
+        push!(compact_blocks, compact_replacement)
+        replacement_compact_positions[block_index] = compact_replacement.global_positions
+        for (old_local_index, (i, j)) in enumerate(block.local_positions)
+            old_position = block.global_positions[old_local_index]
+            for (new_local_index, (a, b)) in enumerate(replacement.local_positions)
+                coefficient = _face_basis_coefficient(keep_basis, i, j, a, b)
+                iszero(coefficient) && continue
+                old_from_compact[
+                    old_position,
+                    compact_replacement.global_positions[new_local_index],
+                ] += coefficient
+            end
+        end
+    end
+
+    compact_positive_scalars = Int[]
+    for position in problem.positive_scalars
+        position in removed_old_positions && continue
+        compact_position = old_to_compact[position]
+        compact_position > 0 ||
+            error("Compact facial-reduction map removed an active scalar coordinate.")
+        push!(compact_positive_scalars, compact_position)
+    end
+    return (
+        source_positions = source_positions,
+        old_from_compact = old_from_compact,
+        blocks = compact_blocks,
+        positive_scalars = compact_positive_scalars,
+        old_to_compact = collect(old_to_compact),
+        replacement_compact_positions = replacement_compact_positions,
+    )
+end
+
+function _legacy_signature_after_face(
+    problem::ProblemData,
+    exposed_scalars::Vector{Int},
+    keep_bases::Dict{Int,Matrix{ExactRational}},
+    compact_data,
+)
+    previous_signature = problem.legacy_facial_reduction_signature === nothing ?
+                         _facial_reduction_problem_signature(problem) :
+                         problem.legacy_facial_reduction_signature
+    previous_position_map = problem.legacy_position_map
+    length(previous_position_map) == previous_signature.dimension ||
+        error("Legacy facial-reduction position map has the wrong dimension.")
+    current_to_legacy = zeros(Int, length(problem.objective_vector_raw))
+    for (legacy_position, current_position) in enumerate(previous_position_map)
+        current_position == 0 && continue
+        current_to_legacy[current_position] = legacy_position
+    end
+
+    legacy_exposed = Int[]
+    for current_position in exposed_scalars
+        legacy_position = current_to_legacy[current_position]
+        legacy_position > 0 ||
+            error("Exposed scalar has no legacy facial-reduction coordinate.")
+        push!(legacy_exposed, legacy_position)
+    end
+
+    next_position = previous_signature.dimension + 1
+    next_blocks = Any[]
+    appended_legacy_to_compact = Pair{Int,Int}[]
+    for (block_index, block_signature) in enumerate(previous_signature.blocks)
+        keep_basis = get(keep_bases, block_index, nothing)
+        if keep_basis === nothing
+            push!(next_blocks, block_signature)
+            continue
+        end
+        reduced_dimension = size(keep_basis, 2)
+        reduced_dimension == 0 && continue
+        local_positions = _triangle_positions(reduced_dimension)
+        global_positions = collect(next_position:(next_position + length(local_positions) - 1))
+        diagonal_positions = [
+            global_positions[index] for
+            (index, (i, j)) in enumerate(local_positions) if i == j
+        ]
+        push!(
+            next_blocks,
+            (
+                size = reduced_dimension,
+                global_positions = global_positions,
+                local_positions = local_positions,
+                diagonal_positions = diagonal_positions,
+            ),
+        )
+        compact_positions = compact_data.replacement_compact_positions[block_index]
+        append!(
+            appended_legacy_to_compact,
+            Pair{Int,Int}.(global_positions, compact_positions),
+        )
+        next_position += length(local_positions)
+    end
+
+    next_dimension = next_position - 1
+    next_position_map = zeros(Int, next_dimension)
+    for legacy_position in eachindex(previous_position_map)
+        old_current_position = previous_position_map[legacy_position]
+        old_current_position == 0 && continue
+        next_position_map[legacy_position] =
+            compact_data.old_to_compact[old_current_position]
+    end
+    for mapping in appended_legacy_to_compact
+        next_position_map[first(mapping)] = last(mapping)
+    end
+
+    extra_equations = length(legacy_exposed)
+    for block_index in keys(keep_bases)
+        extra_equations += length(previous_signature.blocks[block_index].local_positions)
+    end
+    next_positive_scalars = [
+        position for position in previous_signature.positive_scalars if
+        !(position in legacy_exposed)
+    ]
+    signature = (
+        dimension = next_dimension,
+        equation_count = previous_signature.equation_count + extra_equations,
+        positive_scalars = next_positive_scalars,
+        blocks = next_blocks,
+    )
+    previous_coordinate_lift = problem.legacy_coordinate_lift
+    size(previous_coordinate_lift) ==
+    (previous_signature.dimension, length(problem.objective_vector_raw)) ||
+        error("Legacy facial-reduction coordinate lift has the wrong dimensions.")
+    upper_coordinate_lift =
+        previous_coordinate_lift * compact_data.old_from_compact
+    appended_coordinate_lift = spzeros(
+        ExactRational,
+        next_dimension - previous_signature.dimension,
+        size(compact_data.old_from_compact, 2),
+    )
+    for mapping in appended_legacy_to_compact
+        appended_coordinate_lift[
+            first(mapping) - previous_signature.dimension,
+            last(mapping),
+        ] = one(ExactRational)
+    end
+    next_coordinate_lift =
+        sparse(vcat(upper_coordinate_lift, appended_coordinate_lift))
+    return signature, next_position_map, next_coordinate_lift
+end
+
+function _fixed_zero_cone_face(problem::ProblemData)
+    problem.affine === nothing && return Int[], Dict{Int,Matrix{ExactRational}}()
+    particular, nullspace = problem.affine
+    exposed_scalars = Int[
+        position for position in problem.positive_scalars if
+        _variable_fixed_zero(particular, nullspace, position)
+    ]
+    keep_bases = Dict{Int,Matrix{ExactRational}}()
+    for (block_index, block) in enumerate(problem.blocks)
+        keep_directions = Int[
+            direction for direction in 1:block.size if !_variable_fixed_zero(
+                particular,
+                nullspace,
+                block.diagonal_positions[direction],
+            )
+        ]
+        length(keep_directions) == block.size && continue
+        keep_basis = zeros(ExactRational, block.size, length(keep_directions))
+        for (column, direction) in enumerate(keep_directions)
+            keep_basis[direction, column] = one(ExactRational)
+        end
+        keep_bases[block_index] = keep_basis
+    end
+    return exposed_scalars, keep_bases
 end
 
 function _apply_facial_reduction(
@@ -4227,11 +4886,6 @@ function _apply_facial_reduction(
     checkpoint !== nothing && checkpoint(
         "face application: rebuilding $(length(problem.blocks)) PSD block(s) in $(total_dimension) variables",
     )
-    A = zeros(ExactRational, size(problem.A, 1), total_dimension)
-    if !isempty(problem.A)
-        A[:, 1:size(problem.A, 2)] = problem.A
-    end
-    b = copy(problem.b)
     extra_row_indices = Vector{Vector{Int}}()
     extra_row_values = Vector{Vector{ExactRational}}()
     extra_rhs = ExactRational[]
@@ -4256,33 +4910,10 @@ function _apply_facial_reduction(
     end
     extra_restrictions = _SparseAffineRestrictions(extra_row_indices, extra_row_values)
 
-    if !isempty(extra_rhs)
-        A_augmented = zeros(ExactRational, size(A, 1) + length(extra_rhs), total_dimension)
-        b_augmented = zeros(ExactRational, length(b) + length(extra_rhs))
-        if size(A, 1) > 0
-            A_augmented[1:size(A, 1), :] = A
-            b_augmented[1:length(b)] = b
-        end
-        for offset in eachindex(extra_rhs)
-            for (position, value) in zip(
-                extra_restrictions.indices[offset],
-                extra_restrictions.values[offset],
-            )
-                A_augmented[size(A, 1) + offset, position] = value
-            end
-            b_augmented[length(b) + offset] = extra_rhs[offset]
-        end
-        A = A_augmented
-        b = b_augmented
-    end
-
-    positive_scalars = [index for index in problem.positive_scalars if !(index in exposed_scalars)]
-    objective_extension = zeros(ExactRational, total_dimension - old_dimension)
-
     checkpoint !== nothing && checkpoint(
         "face application: restricting affine parametrization with $(length(extra_rhs)) exact face equation(s)",
     )
-    affine = _extend_and_restrict_affine_system(
+    extended_affine = _extend_and_restrict_affine_system(
         problem.affine,
         total_dimension - old_dimension,
         extra_restrictions,
@@ -4290,6 +4921,32 @@ function _apply_facial_reduction(
         checkpoint = checkpoint,
         settings = settings,
     )
+    checkpoint !== nothing && checkpoint(
+        "face application: eliminating superseded PSD coordinates",
+    )
+    compact_data = _compact_face_coordinate_data(
+        problem,
+        exposed_scalars,
+        keep_bases,
+        block_replacements,
+        total_dimension,
+    )
+    old_from_compact = compact_data.old_from_compact
+    A = Matrix{ExactRational}(problem.A * old_from_compact)
+    b = copy(problem.b)
+    objective_vector_raw =
+        Vector{ExactRational}(transpose(old_from_compact) * problem.objective_vector_raw)
+    objective_vector_min =
+        Vector{ExactRational}(transpose(old_from_compact) * problem.objective_vector_min)
+    affine = if extended_affine === nothing
+        nothing
+    else
+        extended_particular, extended_nullspace = extended_affine
+        (
+            extended_particular[compact_data.source_positions],
+            extended_nullspace[compact_data.source_positions, :],
+        )
+    end
     old_particular, old_nullspace = problem.affine === nothing ?
         (ExactRational[], zeros(ExactRational, 0, 0)) : problem.affine
     affine_representation_complete = size(problem.A, 1) > 0 ||
@@ -4305,6 +4962,16 @@ function _apply_facial_reduction(
         checkpoint !== nothing && checkpoint("face application: incremental restriction unavailable; solving full exact affine system")
         affine = _solve_affine_system(A, b; checkpoint = checkpoint)
     end
+    legacy_signature, legacy_position_map, legacy_coordinate_lift =
+        _legacy_signature_after_face(
+        problem,
+        exposed_scalars,
+        keep_bases,
+        compact_data,
+    )
+    solution_lift = problem.solution_lift * old_from_compact
+    blocks = compact_data.blocks
+    positive_scalars = compact_data.positive_scalars
     compaction_requested = size(A, 1) >
                            BigInt(settings.facial_reduction_affine_compaction_factor) *
                            max(1, size(problem.A, 1))
@@ -4313,7 +4980,8 @@ function _apply_facial_reduction(
                          compaction_entries <=
                          settings.facial_reduction_affine_compaction_max_entries
     if compaction_requested && compaction_allowed
-        checkpoint !== nothing && checkpoint("face application: compacting redundant affine equations")
+        checkpoint !== nothing &&
+            checkpoint("face application: compacting redundant affine equations")
         compacted = try
             _independent_affine_equalities(A, b; checkpoint = checkpoint)
         catch err
@@ -4325,11 +4993,8 @@ function _apply_facial_reduction(
         end
         if compacted !== nothing
             A, b = compacted
-            # Compaction is an exact row operation on [A b], so it does not
-            # change the affine slice. The parametrization computed above is
-            # still complete; solving the RREF output again only duplicates
-            # a large exact elimination and can cause severe coefficient and
-            # memory growth.
+            # Compaction is an exact row operation on [A b], so the affine
+            # parametrization computed above remains complete.
             checkpoint !== nothing && checkpoint(
                 "face application: retaining existing exact affine parametrization after compaction",
             )
@@ -4339,26 +5004,43 @@ function _apply_facial_reduction(
             "face application: skipping optional affine compaction ($(compaction_entries) entries; limit $(settings.facial_reduction_affine_compaction_max_entries))",
         )
     end
-    checkpoint !== nothing && checkpoint("face application: pruning forced cone faces")
-    positive_scalars, _ = _prune_positive_scalar_faces(positive_scalars, affine)
-    blocks, A, b, affine, _ = _prune_psd_faces(blocks, A, b, affine)
     reduced_problem = ProblemData(
         problem.original_variables,
         blocks,
         positive_scalars,
-        vcat(problem.objective_vector_raw, objective_extension),
+        objective_vector_raw,
         problem.objective_constant_raw,
-        vcat(problem.objective_vector_min, objective_extension),
+        objective_vector_min,
         A,
         b,
         affine,
         nothing,
         problem.scalar_constraint_rows,
         problem.psd_constraint_blocks,
+        solution_lift,
+        legacy_signature,
+        legacy_position_map,
+        legacy_coordinate_lift,
+        nothing,
     )
     new_barrier_dimension = _barrier_dimension(reduced_problem)
     new_barrier_dimension < old_barrier_dimension ||
         error("Facial reduction was applied without decreasing barrier dimension.")
+    auto_exposed_scalars, auto_keep_bases =
+        _fixed_zero_cone_face(reduced_problem)
+    if !isempty(auto_exposed_scalars) || !isempty(auto_keep_bases)
+        checkpoint !== nothing && checkpoint(
+            "face application: eliminating exactly fixed zero cone coordinates",
+        )
+        return _apply_facial_reduction(
+            reduced_problem,
+            auto_exposed_scalars,
+            auto_keep_bases;
+            certified = false,
+            checkpoint = checkpoint,
+            settings = settings,
+        )
+    end
     checkpoint !== nothing && checkpoint("face application: completed")
     return reduced_problem
 end

@@ -170,7 +170,7 @@ function _fixed_parameter_feasible(
             result = _quasiconvex_feasible_point(opt, problem, F; facial_reduction)
             return (
                 status = result.status,
-                problem = problem,
+                problem = result.problem,
                 anchor = result.anchor,
                 used_reduction = result.facial_reduction_rounds > 0,
             )
@@ -222,11 +222,12 @@ function _populate_from_quasiconvex_child!(
     termination_status::MOI.TerminationStatusCode = MOI.OPTIMAL,
     raw_status::String = "Solved by quasi-convex parameter search",
 ) where {T<:Real}
+    original_point = _lift_original_solution(problem, x_exact)
     for (index, variable) in enumerate(problem.original_variables)
-        opt.variable_primal[variable] = _to_output_type(T, x_exact[index])
+        opt.variable_primal[variable] = _to_output_type(T, original_point[index])
     end
     opt.variable_primal[data.parameter] = objective_value
-    _populate_constraint_results!(opt, problem, x_exact)
+    _populate_constraint_results!(opt, problem, original_point)
     opt.objective_value = objective_value
     opt.termination_status = termination_status
     opt.primal_status = MOI.FEASIBLE_POINT
@@ -742,19 +743,39 @@ function _quasiconvex_feasible_point(
     facial_reduction::Bool = opt.settings.facial_reduction,
 ) where {F<:AbstractFloat}
     problem.affine === nothing &&
-        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
+        return (
+            status = :infeasible,
+            problem = problem,
+            anchor = nothing,
+            facial_reduction_rounds = 0,
+        )
     problem = _apply_loaded_facial_reductions(opt, problem)
     problem.affine === nothing &&
-        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
+        return (
+            status = :infeasible,
+            problem = problem,
+            anchor = nothing,
+            facial_reduction_rounds = 0,
+        )
     infeasibility_reason = _exact_cone_infeasibility_reason(problem)
     if infeasibility_reason !== nothing
         _log(opt, "quasi-convex fixed probe is exactly infeasible: $(infeasibility_reason)")
-        return (status = :infeasible, anchor = nothing, facial_reduction_rounds = 0)
+        return (
+            status = :infeasible,
+            problem = problem,
+            anchor = nothing,
+            facial_reduction_rounds = 0,
+        )
     end
     particular, nullspace = problem.affine
     barrier_dim = _barrier_dimension(problem)
     barrier_dim == 0 &&
-        return (status = :feasible, anchor = particular, facial_reduction_rounds = 0)
+        return (
+            status = :feasible,
+            problem = problem,
+            anchor = particular,
+            facial_reduction_rounds = 0,
+        )
 
     phase1_result = _phase1_anchor_attempt(opt, problem, F)
     anchor = phase1_result.anchor
@@ -798,7 +819,12 @@ function _quasiconvex_feasible_point(
     else
         :unknown
     end
-    return (status = status, anchor = anchor, facial_reduction_rounds = facial_reduction_round)
+    return (
+        status = status,
+        problem = problem,
+        anchor = anchor,
+        facial_reduction_rounds = facial_reduction_round,
+    )
 end
 
 function _set_quasiconvex_endpoint_infeasible!(opt::Optimizer, endpoint_name::String)

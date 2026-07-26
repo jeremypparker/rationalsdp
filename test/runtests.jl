@@ -159,6 +159,41 @@ include("slowtest_helpers.jl")
             RationalSDP.Float64x2(1) / RationalSDP.Float64x2(3),
             RationalSDP.Float64x2(1e-8),
         ) == 1 // 3
+
+        large_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            RationalSDP.BlockStructure[],
+            collect(1:512),
+            zeros(Rational{BigInt}, 512),
+            0 // 1,
+            zeros(Rational{BigInt}, 512),
+            zeros(Rational{BigInt}, 0, 512),
+            Rational{BigInt}[],
+            nothing,
+        )
+        default_type_opt =
+            RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+        @test RationalSDP._phase1_hypatia_effective_float_type(
+            default_type_opt,
+            large_problem,
+        ) == RationalSDP.Float64x2
+        @test RationalSDP._facial_reduction_oracle_float_type(
+            default_type_opt,
+            large_problem,
+        ) == RationalSDP.Float64x2
+
+        big_type_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            working_float_type = BigFloat,
+        )
+        @test RationalSDP._phase1_hypatia_effective_float_type(
+            big_type_opt,
+            large_problem,
+        ) == BigFloat
+        @test RationalSDP._facial_reduction_oracle_float_type(
+            big_type_opt,
+            large_problem,
+        ) == BigFloat
     end
 
     @testset "Hypatia Phase I system solver selection" begin
@@ -929,7 +964,7 @@ include("slowtest_helpers.jl")
             ),
         )
 
-        phase2_nullspace = RationalSDP._phase2_nullspace(problem)
+        phase2_nullspace = RationalSDP._phase2_nullspace(problem, RationalSDP.Float64x2)
 
         @test RationalSDP._phase2_relevant_positions(problem) == [1, 2]
         @test size(phase2_nullspace) == (4, 2)
@@ -1400,12 +1435,11 @@ include("slowtest_helpers.jl")
             settings = RationalSDP.Settings(facial_reduction_affine_compaction_factor = 0),
         )
         @test size(compacted_rank_one_problem.A, 1) <= size(reduced_rank_one_problem.A, 1)
-        @test any(stage -> occursin("compacting redundant", stage), compaction_checkpoints)
         @test any(
-            stage -> occursin("retaining existing exact affine parametrization", stage),
+            stage -> occursin("eliminating superseded PSD coordinates", stage),
             compaction_checkpoints,
         )
-        @test !any(stage -> occursin("solving compacted", stage), compaction_checkpoints)
+        @test any(stage -> occursin("compacting redundant", stage), compaction_checkpoints)
 
         skipped_compaction_checkpoints = String[]
         uncompacted_rank_one_problem = RationalSDP._apply_facial_reduction(
@@ -1420,6 +1454,10 @@ include("slowtest_helpers.jl")
         )
         @test size(uncompacted_rank_one_problem.A, 1) ==
               size(reduced_rank_one_problem.A, 1)
+        @test any(
+            stage -> occursin("eliminating superseded PSD coordinates", stage),
+            skipped_compaction_checkpoints,
+        )
         @test any(
             stage -> occursin("skipping optional affine compaction", stage),
             skipped_compaction_checkpoints,
@@ -1815,6 +1853,188 @@ include("slowtest_helpers.jl")
         @test reduced_problem.A * particular == reduced_problem.b
         @test reduced_problem.A * nullspace == zeros(Rational{BigInt}, size(reduced_problem.A, 1), size(nullspace, 2))
         @test RationalSDP._vector_to_matrix(particular, reduced_problem.blocks[1]) == Rational{BigInt}[0//1;;]
+        @test length(reduced_problem.objective_vector_raw) == 1
+        @test size(reduced_problem.A) == (0, 1)
+        @test RationalSDP._lift_original_solution(
+            reduced_problem,
+            Rational{BigInt}[2//1],
+        ) == Rational{BigInt}[2//1, 2//1, 2//1]
+    end
+
+    @testset "Repeated facial reductions compact coordinates and preserve legacy cache replay" begin
+        triangle3 = [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)]
+        block = RationalSDP.BlockStructure(
+            3,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in triangle3],
+            collect(1:6),
+            triangle3,
+            [1, 3, 6],
+        )
+        A = Rational{BigInt}[
+            -1 1 0 0 0 0
+            -1 0 1 0 0 0
+            0 0 0 1 0 0
+            0 0 0 0 1 0
+            0 0 0 0 0 1
+        ]
+        b = zeros(Rational{BigInt}, 5)
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0//1,
+            zeros(Rational{BigInt}, 6),
+            A,
+            b,
+            RationalSDP._solve_affine_system(A, b),
+        )
+        keep_two = Rational{BigInt}[
+            1 0
+            0 1
+            0 0
+        ]
+        keep_one = reshape(Rational{BigInt}[1, 1], 2, 1)
+
+        reduced_once = RationalSDP._apply_facial_reduction(
+            problem,
+            Int[],
+            Dict(1 => keep_two),
+        )
+        reduced_twice = RationalSDP._apply_facial_reduction(
+            reduced_once,
+            Int[],
+            Dict(1 => keep_one),
+        )
+        @test length(reduced_once.objective_vector_raw) == 3
+        @test length(reduced_twice.objective_vector_raw) == 1
+        @test size(reduced_once.A) == (5, 3)
+        @test size(reduced_twice.A) == (5, 1)
+        @test [item.size for item in reduced_twice.blocks] == [1]
+        @test RationalSDP._lift_original_solution(
+            reduced_twice,
+            Rational{BigInt}[7//1],
+        ) == Rational{BigInt}[7//1, 7//1, 7//1, 0//1, 0//1, 0//1]
+        @test reduced_once.legacy_facial_reduction_signature.dimension == 9
+        @test reduced_once.legacy_facial_reduction_signature.equation_count == 11
+        @test Matrix(reduced_once.legacy_coordinate_lift) == Rational{BigInt}[
+            1 0 0
+            0 1 0
+            0 0 1
+            0 0 0
+            0 0 0
+            0 0 0
+            1 0 0
+            0 1 0
+            0 0 1
+        ]
+
+        first_reduction = RationalSDP._CertifiedFacialReduction(
+            "legacy first face",
+            Int[],
+            Dict(1 => keep_two),
+        )
+        second_reduction = RationalSDP._CertifiedFacialReduction(
+            "legacy second face",
+            Int[],
+            Dict(1 => keep_one),
+        )
+        legacy_records = Any[
+            RationalSDP._facial_reduction_record(problem, first_reduction),
+            (
+                signature = reduced_once.legacy_facial_reduction_signature,
+                source = second_reduction.source,
+                exposed_scalars = Int[],
+                keep_bases = [(block_index = 1, basis = copy(keep_one))],
+                exposing_slack = Rational{BigInt}[
+                    0, 0, 0, 0, 0, 0, 1, -2, 1
+                ],
+            ),
+        ]
+        mapped_second = RationalSDP._remap_legacy_cached_reduction(
+            reduced_once,
+            RationalSDP._cached_facial_reduction(legacy_records[2]),
+        )
+        @test mapped_second !== nothing
+        @test mapped_second.exposing_slack == Rational{BigInt}[1, -2, 1]
+        load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction = false,
+        )
+        load_opt.facial_reduction_loaded_records = legacy_records
+        replay = RationalSDP._apply_loaded_facial_reductions(
+            load_opt,
+            problem;
+            return_details = true,
+        )
+        @test replay.applied == 2
+        @test length(replay.problem.objective_vector_raw) == 1
+        @test [item.size for item in replay.problem.blocks] == [1]
+        @test RationalSDP._lift_original_solution(
+            replay.problem,
+            Rational{BigInt}[11//1],
+        ) == Rational{BigInt}[11//1, 11//1, 11//1, 0//1, 0//1, 0//1]
+    end
+
+    @testset "Exactly fixed PSD directions are eliminated without new equations" begin
+        triangle2 = [(1, 1), (2, 1), (2, 2)]
+        blocks = [
+            RationalSDP.BlockStructure(
+                2,
+                Union{Nothing,MOI.VariableIndex}[nothing for _ in triangle2],
+                collect(offset .+ (1:3)),
+                triangle2,
+                [offset + 1, offset + 3],
+            ) for offset in (0, 3)
+        ]
+        A = reshape(Rational{BigInt}[0, 0, 0, 1, 0, 0], 1, 6)
+        b = Rational{BigInt}[0]
+        problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            blocks,
+            Int[],
+            zeros(Rational{BigInt}, 6),
+            0 // 1,
+            zeros(Rational{BigInt}, 6),
+            A,
+            b,
+            RationalSDP._solve_affine_system(A, b),
+        )
+        checkpoints = String[]
+        reduced = RationalSDP._apply_facial_reduction(
+            problem,
+            Int[],
+            Dict(1 => reshape(Rational{BigInt}[1, 0], 2, 1));
+            checkpoint = stage -> push!(checkpoints, stage),
+        )
+        @test [block.size for block in reduced.blocks] == [1, 1]
+        @test length(reduced.objective_vector_raw) == 2
+        @test size(reduced.A) == (1, 2)
+        @test any(
+            stage -> occursin(
+                "eliminating exactly fixed zero cone coordinates",
+                stage,
+            ),
+            checkpoints,
+        )
+        @test RationalSDP._lift_original_solution(
+            reduced,
+            Rational{BigInt}[5, 7],
+        ) == Rational{BigInt}[5, 0, 0, 0, 0, 7]
+    end
+
+    @testset "Nullspace rank selection respects the selected float type" begin
+        huge = big(10)^400
+        exact_basis = Rational{BigInt}[
+            huge//1 0//1
+            0//1 1//1
+        ]
+        selected = RationalSDP._independent_nullspace_columns(
+            exact_basis,
+            [1, 2],
+            BigFloat,
+        )
+        @test selected == exact_basis
     end
 
     @testset "Facial reduction cache validates matching faces" begin
@@ -1861,6 +2081,37 @@ include("slowtest_helpers.jl")
             RationalSDP._prepare_facial_reduction_cache!(save_opt)
             RationalSDP._record_successful_facial_reduction!(save_opt, problem, reduction)
             @test isfile(cache_file)
+            saved_records = RationalSDP._read_facial_reduction_cache(cache_file)
+            @test length(saved_records) == 1
+            saved_reduction =
+                RationalSDP._cached_facial_reduction(only(saved_records))
+            @test saved_reduction !== nothing
+            @test saved_reduction.exposing_slack !== nothing
+
+            legacy_record = (
+                signature = RationalSDP._facial_reduction_problem_signature(problem),
+                source = reduction.source,
+                exposed_scalars = copy(reduction.exposed_scalars),
+                keep_bases = [
+                    (block_index = 1, basis = copy(keep_basis)),
+                ],
+            )
+            legacy_records = RationalSDP._facial_reduction_cache_records((
+                magic = RationalSDP._FACIAL_REDUCTION_CACHE_MAGIC,
+                version = 1,
+                records = Any[legacy_record],
+            ))
+            legacy_reduction =
+                RationalSDP._cached_facial_reduction(only(legacy_records))
+            @test legacy_reduction !== nothing
+            @test legacy_reduction.exposing_slack === nothing
+            upgraded_legacy = RationalSDP._with_exact_exposing_slack(
+                problem,
+                legacy_reduction,
+                RationalSDP.Settings(),
+            )
+            @test upgraded_legacy !== nothing
+            @test upgraded_legacy.exposing_slack !== nothing
 
             matching_problem =
                 cached_face_problem(Rational{BigInt}[7//1, 0//1, 0//1], [0//1, 0//1])
@@ -1877,8 +2128,11 @@ include("slowtest_helpers.jl")
             reduced_problem = loaded_details.problem
             @test loaded_details.applied == 1
             @test [block.size for block in reduced_problem.blocks] == [1]
-            @test reduced_problem.objective_vector_raw[1:3] ==
-                  Rational{BigInt}[7//1, 0//1, 0//1]
+            @test reduced_problem.objective_vector_raw == Rational{BigInt}[7//1]
+            @test RationalSDP._lift_original_solution(
+                reduced_problem,
+                Rational{BigInt}[3//1],
+            ) == Rational{BigInt}[3//1, 0//1, 0//1]
 
             invalid_problem =
                 cached_face_problem(Rational{BigInt}[7//1, 0//1, 0//1], [0//1, 1//1])
@@ -2093,24 +2347,32 @@ include("slowtest_helpers.jl")
             b,
             RationalSDP._solve_affine_system(A, b),
         )
-        opt = RationalSDP.Optimizer{Rational{BigInt}}(verbose = false)
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_weighted_subspace_max_form_entries = 0,
+            facial_reduction_weighted_subspace_max_affine_products = 0,
+            facial_reduction_individual_max_affine_products = 0,
+        )
         keep_without_first = Rational{BigInt}[0 0; 1 0; 0 1]
         keep_without_second = Rational{BigInt}[1 0; 0 0; 0 1]
         first = RationalSDP._CertifiedFacialReduction(
             "first",
             Int[],
             Dict(1 => keep_without_first),
+            Rational{BigInt}[1, 0, 0, 0, 0, 0],
         )
         second = RationalSDP._CertifiedFacialReduction(
             "second",
             Int[],
             Dict(1 => keep_without_second),
+            Rational{BigInt}[0, 0, 1, 0, 0, 0],
         )
         merged = RationalSDP._merge_certified_facial_reductions(opt, problem, [first, second])
         @test merged !== nothing
         @test occursin("first", merged.source)
         @test occursin("second", merged.source)
         @test size(merged.keep_bases[1], 2) == 1
+        @test merged.exposing_slack == Rational{BigInt}[1, 0, 1, 0, 0, 0]
         reduced = RationalSDP._apply_facial_reduction(
             problem,
             merged.exposed_scalars,

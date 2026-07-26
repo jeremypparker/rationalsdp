@@ -106,7 +106,25 @@
             oracle_qr_settings,
             large_problem,
             RationalSDP.Float64x4,
-        ) == Union{Nothing,Symbol}[:qrchol_dense, nothing]
+        ) == Union{Nothing,Symbol}[:qrchol_dense]
+        recovery_problem = RationalSDP.ProblemData(
+            small_problem.original_variables,
+            small_problem.blocks,
+            small_problem.positive_scalars,
+            small_problem.objective_vector_raw,
+            small_problem.objective_constant_raw,
+            small_problem.objective_vector_min,
+            zeros(Rational{BigInt}, 1, length(small_problem.objective_vector_raw)),
+            Rational{BigInt}[0//1],
+            small_problem.affine,
+        )
+        @test RationalSDP._defer_oracle_subspace_recovery(
+            recovery_problem,
+            RationalSDP.Settings(
+                facial_reduction_individual_max_affine_products = 1,
+            ),
+        )
+        @test !RationalSDP._defer_oracle_subspace_recovery(small_problem, settings)
     end
 
     @testset "statistics are exposed for a solve" begin
@@ -316,7 +334,7 @@
         @test stats.tentative_directions_rejected == 1
         @test RationalSDP._barrier_dimension(reduced) == 1
         reduced_particular, _ = reduced.affine
-        original_point = reduced_particular[1:length(problem.objective_vector_raw)]
+        original_point = RationalSDP._lift_original_solution(reduced, reduced_particular)
         @test RationalSDP._exact_primal_feasibility(problem, original_point).ok
         @test RationalSDP._positive_semidefinite_exact(
             RationalSDP._vector_to_matrix(original_point, problem.blocks[1]),

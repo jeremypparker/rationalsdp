@@ -654,17 +654,7 @@ function _phase1_hypatia_prefers_sparse_float64(problem::ProblemData)
 end
 
 function _phase1_hypatia_effective_float_type(opt::Optimizer, problem::ProblemData)
-    configured_type = _phase1_hypatia_float_type(opt.settings)
-    if _phase1_hypatia_float_type_is_auto(opt.settings) &&
-       configured_type != Float64 &&
-       _phase1_hypatia_prefers_sparse_float64(problem)
-        _log(
-            opt,
-            "Hypatia Phase I: using Float64 sparse linear algebra for this large sparse model",
-        )
-        return Float64
-    end
-    return configured_type
+    return _phase1_hypatia_float_type(opt.settings)
 end
 
 function _phase1_precision_escalation_syssolver(
@@ -912,7 +902,7 @@ function _phase1_hypatia_anchor_once(
     return _with_float_precision(HF, opt.settings.working_precision, function (::Type{HF})
         problem.affine === nothing && error("Hypatia Phase I requires affine data.")
         particular, _ = problem.affine
-        phase1_nullspace = _phase1_nullspace(problem)
+        phase1_nullspace = _phase1_nullspace(problem, HF)
         numeric_margin_upper = _to_working_float(HF, margin_upper)
         target_margin = _to_working_float(HF, _phase1_hypatia_target_margin(opt.settings))
         margin_goal =
@@ -929,6 +919,7 @@ function _phase1_hypatia_anchor_once(
             numeric_margin_upper,
         )
         problem.phase1_nullspace = nothing
+        problem.phase1_nullspace_float_type = nothing
         phase1_nullspace = nothing
         _gc_checkpoint!(opt, "before Hypatia load")
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(
@@ -1020,7 +1011,7 @@ function _phase1_hypatia_anchor_once(
         model = nothing
         _gc_checkpoint!(opt, "after Hypatia solve")
 
-        phase1_nullspace = _phase1_nullspace(problem)
+        phase1_nullspace = _phase1_nullspace(problem, HF)
         candidate = _hypatia_phase1_point(particular, phase1_nullspace, coordinates)
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
         b_numeric = _to_working_array(HF, problem.b)
@@ -1501,7 +1492,7 @@ function _phase2_exact_solution(
             gap_bound = zero(F),
         )
     particular, nullspace = problem.affine
-    phase2_nullspace = _phase2_nullspace(problem)
+    phase2_nullspace = _phase2_nullspace(problem, F)
     if size(phase2_nullspace, 2) == 0
         if size(nullspace, 2) > 0
             _log(opt, "Phase II skipped: no objective/barrier-visible affine directions")

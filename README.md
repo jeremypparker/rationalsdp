@@ -137,10 +137,14 @@ The cheap evidence pass tries, in order:
 If those do not certify a reducing face, RationalSDP launches a separate
 Hypatia exposing-vector oracle. By default this oracle first uses the Phase-I
 system solver, then tries a stable alternate solver when recovery is
-inconclusive. `facial_reduction_oracle_syssolver` can prefer a solver for the
-oracle without changing Phase I, while `facial_reduction_float_type` can
-override the oracle float type. An uncertifiable numerical oracle candidate no
-longer blocks the alternate solver or configured higher-precision retries.
+inconclusive. Setting `facial_reduction_oracle_syssolver` selects the oracle's
+solver without changing Phase I; an explicit selection is used exclusively,
+whereas `:auto` retains the default fallback sequence.
+`facial_reduction_float_type` can override the oracle float type. An
+uncertifiable numerical oracle candidate no longer blocks the alternate solver
+or configured higher-precision retries. On large affine systems, expensive
+rational subspace recovery is deferred until those numerical alternatives have
+been tried.
 
 When both cheap evidence sources certify faces, their exact kernel and scalar
 exposures are merged before the reduced problem is built. After each certified
@@ -148,11 +152,34 @@ reduction, a bounded rank-expansion oracle pass can search for another exposing
 slack normalized on the residual face; control its number of rounds with
 `facial_reduction_rank_expansion_rounds` (default `0`). A validated cached face
 seeds this expansion before it is applied, so all new directions are accumulated
-on the cache record's original formulation. When a save file is configured,
+on the cache record's original formulation. Exact exposing slacks are retained
+in version-2 cache records and composed when faces are merged, avoiding
+reconstruction of an ever-larger weighted subspace certificate. Version-1 cache
+records remain readable and are upgraded when their exposing slack can be
+reconstructed. When a save file is configured,
 each stronger merged face is checkpointed atomically and replaces the weaker
 record that it extends. Fixed-parameter
 quasiconvex probes deliberately use the conservative evidence path so that
 inconclusive numerical probes do not change the bisection result.
+
+An accepted face is represented compactly. The superseded coordinates of each
+reduced PSD block and its added face equations are eliminated immediately,
+rather than being retained beside the replacement block through later rounds.
+Any additional scalar coordinates or PSD rows and columns proved identically
+zero by the restricted affine parametrization are eliminated the same way,
+instead of being enforced by appending more zero equations.
+RationalSDP composes an exact sparse lift from the compact coordinates back to
+the original SDP, so returned variable values and final feasibility and
+objective checks remain in the original coordinates.
+
+Cache files produced by the earlier expanded-coordinate representation remain
+reusable. During a compact solve, RationalSDP also tracks the virtual legacy
+signature and coordinate map that the old implementation would have produced.
+Matching version-1 and version-2 records are translated through that map,
+revalidated exactly on the compact affine slice, and then applied normally.
+Coordinate-dependent cached exposing-slack covectors are pulled back through
+an exact sparse legacy-coordinate lift (or reconstructed for older records
+that do not contain one); the certified face bases themselves are reused.
 
 Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
 expose a nonzero face, vanish on free coordinates, and have an exact affine-row
@@ -395,6 +422,11 @@ The default working type is `Float64x2`. `Float64` is faster but less robust;
 `BigFloat` is slower but can help on ill-conditioned models. MultiFloats.jl v3
 scalar types are also accepted, for example `Float64x2`, `Float64x3`, and
 `Float64x4` via type values or optimizer-attribute strings.
+The configured working, Phase-I, and facial-reduction types are also used for
+numerical rank selection, cache reconstruction, and PSD sieve screening.
+Choosing a type other than `Float64` never silently downgrades a large problem
+to `Float64`; the Phase-I and facial-reduction `auto` settings inherit the
+chosen working type.
 
 Hypatia Phase I tolerance attributes use negative values to leave Hypatia's
 own defaults unchanged. The diagnostic attributes are off by default; enable

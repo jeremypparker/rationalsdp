@@ -147,16 +147,17 @@ rational subspace recovery is deferred until those numerical alternatives have
 been tried.
 
 When both cheap evidence sources certify faces, their exact kernel and scalar
-exposures are merged before the reduced problem is built. After each certified
-reduction, a bounded rank-expansion oracle pass can search for another exposing
-slack normalized on the residual face; control its number of rounds with
-`facial_reduction_rank_expansion_rounds` (default `0`). A validated cached face
-seeds this expansion before it is applied, so all new directions are accumulated
-on the cache record's original formulation. Exact exposing slacks are retained
-in version-2 cache records and composed when faces are merged, avoiding
-reconstruction of an ever-larger weighted subspace certificate. Version-1 cache
-records remain readable and are upgraded when their exposing slack can be
-reconstructed. When a save file is configured,
+exposures are merged before the reduced problem is built. After each newly
+certified reduction, a bounded rank-expansion oracle pass can search for another
+exposing slack normalized on the residual face; control its number of rounds
+with `facial_reduction_rank_expansion_rounds` (default `0`). Cached reductions
+are instead validated and applied as a complete chain before Phase I resumes on
+the final cached problem. If another face is then discovered, rank expansion is
+applied to that new face. This prevents an eager oracle call from changing an
+intermediate cached problem and making later cache records inapplicable. Exact
+exposing slacks are retained in cache records and composed when faces
+are merged, avoiding reconstruction of an ever-larger weighted subspace
+certificate. When a save file is configured,
 each stronger merged face is checkpointed atomically and replaces the weaker
 record that it extends. Fixed-parameter
 quasiconvex probes deliberately use the conservative evidence path so that
@@ -171,15 +172,6 @@ instead of being enforced by appending more zero equations.
 RationalSDP composes an exact sparse lift from the compact coordinates back to
 the original SDP, so returned variable values and final feasibility and
 objective checks remain in the original coordinates.
-
-Cache files produced by the earlier expanded-coordinate representation remain
-reusable. During a compact solve, RationalSDP also tracks the virtual legacy
-signature and coordinate map that the old implementation would have produced.
-Matching version-1 and version-2 records are translated through that map,
-revalidated exactly on the compact affine slice, and then applied normally.
-Coordinate-dependent cached exposing-slack covectors are pulled back through
-an exact sparse legacy-coordinate lift (or reconstructed for older records
-that do not contain one); the certified face bases themselves are reused.
 
 Exact exposing slacks must be nonnegative on scalar cones, PSD on PSD blocks,
 expose a nonzero face, vanish on free coordinates, and have an exact affine-row
@@ -301,6 +293,9 @@ The full set of optimizer attributes is:
 - `facial_reduction_cheap_weighted_subspace_max_affine_products`
 - `facial_reduction_numeric_weighted_subspace_max_form_entries`
 - `facial_reduction_numeric_weighted_subspace_max_affine_products`
+- `facial_reduction_weighted_max_candidate_sets`
+- `facial_reduction_weighted_max_total_affine_products`
+- `facial_reduction_weighted_exact_without_scout_limit`
 - `facial_reduction_individual_max_affine_products`
 - `facial_reduction_sparse_affine_validation_max_products`
 - `facial_reduction_sieve_transform_max_entries`
@@ -357,7 +352,12 @@ Boundary-kernel recovery is joint and basis invariant. RationalSDP tries up to
 each exact candidate span to a canonical row-reduced key, and certifies each
 distinct span at most once. With `facial_reduction_projector_recovery=true`, an
 exact symmetric idempotent rationalization of the numerical orthogonal
-projector is also tried. `facial_reduction_precision_escalation_max_retries`
+projector is also tried. A weighted joint certificate may be positive
+semidefinite and rank deficient; in that case RationalSDP extracts the exact
+rational range of the weight and reduces only that certified subspace, rather
+than requiring the entire numerical kernel to define a face. Cache validation
+still requires the exposing range to cover every direction removed by the
+cached record. `facial_reduction_precision_escalation_max_retries`
 controls the opt-in Phase-I precision ladder and, for compatibility, can raise
 the oracle retry budget. The independent
 `facial_reduction_oracle_precision_escalation_max_retries` defaults to `1`.
@@ -378,6 +378,9 @@ of the Float64 indirect solver.
 | `facial_reduction_cheap_weighted_subspace_max_affine_products` | `500_000` | Affine products allowed in the early “cheap” exact attempt. |
 | `facial_reduction_numeric_weighted_subspace_max_form_entries` | `1_000_000` | Entries in the numerical weighted-subspace scout's form matrix. |
 | `facial_reduction_numeric_weighted_subspace_max_affine_products` | `25_000_000` | Floating-point products estimated for that numerical scout. |
+| `facial_reduction_weighted_max_candidate_sets` | `9` | Ranked rational subspace candidates admitted per PSD block to non-cheap individual-direction or weighted recovery in one exact-cache lifetime. |
+| `facial_reduction_weighted_max_total_affine_products` | `2_000_000_000` | Cumulative estimated affine products admitted across individual-direction, numerical weighted, and non-cheap exact weighted attempts. |
+| `facial_reduction_weighted_exact_without_scout_limit` | `2` | Exact weighted attempts retained when the numerical scout did not report a promising positive-definite weight; these attempts determine the size of the reserved low-complexity candidate ladder. |
 | `facial_reduction_individual_max_affine_products` | `5_000_000` | Exact products estimated when certifying proposed kernel directions individually. |
 | `facial_reduction_sparse_affine_validation_max_products` | `5_000_000` | Exact products in the redundant post-solve validation of a sparse face restriction. |
 | `facial_reduction_sieve_transform_max_entries` | `250_000` | Entries in the affine system before the Sieve skips transformed-row provenance. |
@@ -394,8 +397,33 @@ of the Float64 indirect solver.
 When a complete tentative batch exceeds any budget, RationalSDP does not build
 it. It tries the best single direction that fits, reruns Phase I on that
 restricted problem, and recomputes the remaining numerical kernels. Exact
-affine lifting exploits the identity block for newly introduced face
-coordinates and never materializes the old extended-nullspace matrix.
+weighted-subspace recovery similarly collects and ranks all rational
+tolerance/chart candidates before expensive work. Cheap exact checks are
+applied first. Non-cheap work starts with a lowest-projector-error prefix, then
+reserves a ladder of the simplest distinct rational candidates. The ladder is
+sized by `facial_reduction_weighted_exact_without_scout_limit`, shortened only
+when the remaining candidate or cumulative-product budget cannot admit it, and
+promoted early enough that its complete individual, numerical-scout, and exact
+fallback work fits. Unpromising accuracy-first scouts cannot consume exact
+fallbacks reserved for later ladder candidates. Approximate projector clusters
+diversify both accuracy and simplicity rankings.
+Non-cheap individual-direction, numerical weighted, and exact weighted attempts
+share cumulative candidate and product budgets, and failed attempts are
+memoized for the current problem and selected numeric type/precision. An
+optional conservative tentative fallback is checked against its own work
+estimate before it is built.
+Before numerical scouting, rational direction and affine-basis columns are
+converted without changing their scale when the selected floating-point type
+can represent them. Only columns whose direct conversion is nonfinite are
+normalized, using exact direction scaling or a selected-precision affine ratio
+fallback. Candidates with nonfinite projector metrics are excluded before
+scheduling expensive individual or numerical work, but they retain the cheap
+exact trace and weighted checks that do not depend on those metrics. A scout
+exception is reported with its operation and complete exception message and is
+classified as unavailable, rather than as evidence that the candidate is
+unpromising; exact certification remains the only basis for accepting a face.
+Exact affine lifting exploits the identity block for newly introduced face
+coordinates without materializing an extended-nullspace matrix.
 
 Facial-reduction caches can be used to reuse exact faces across related
 instances:
@@ -408,7 +436,11 @@ set_optimizer_attribute(next_model, "facial_reduction_load_file", "faces.rsdpcac
 The cache stores exact certified reductions. Loading validates that the current
 affine slice is contained in the saved face before applying it, so objective
 coefficient changes are fine and incompatible constraint changes fall back to
-the normal facial-reduction search.
+the normal facial-reduction search. When the load and save paths differ, every
+successfully applied loaded reduction is re-recorded against the current compact
+problem and checkpointed to the save file before newly discovered reductions.
+The resulting save cache is therefore independently replayable rather than a
+tail that depends on the original load cache.
 
 Each solve records facial-reduction counters and timings. After a solve, obtain
 an immutable snapshot with `RationalSDP.facial_reduction_statistics(optimizer)`.

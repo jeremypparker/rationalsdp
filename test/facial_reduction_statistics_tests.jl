@@ -251,6 +251,68 @@
         @test RationalSDP._barrier_dimension(reduced) == 4
     end
 
+    @testset "conservative tentative fallback has its own budget" begin
+        problem = synthetic_face_problem([3, 3])
+        dimension = length(problem.objective_vector_raw)
+        problem.affine = (
+            zeros(Rational{BigInt}, dimension),
+            Matrix{Rational{BigInt}}(I, dimension, dimension),
+        )
+        candidates = RationalSDP._TentativeFaceDirection{Float64}[
+            RationalSDP._TentativeFaceDirection(1, Rational{BigInt}[0, 1, 0], 0.0, 0.0, 0.0),
+            RationalSDP._TentativeFaceDirection(1, Rational{BigInt}[0, 0, 1], 0.0, 0.0, 0.0),
+            RationalSDP._TentativeFaceDirection(2, Rational{BigInt}[0, 1, 0], 0.0, 0.0, 0.0),
+            RationalSDP._TentativeFaceDirection(2, Rational{BigInt}[0, 0, 1], 0.0, 0.0, 0.0),
+        ]
+        batch_work = RationalSDP._tentative_batch_work(problem, candidates)
+        conservative_work =
+            RationalSDP._tentative_batch_work(problem, candidates[1:1])
+        @test batch_work.lift_products < conservative_work.lift_products
+        settings = RationalSDP.Settings(
+            facial_reduction_tentative_max_directions = 4,
+            facial_reduction_tentative_max_coordinate_entries = typemax(Int),
+            facial_reduction_tentative_max_lift_products = Int(batch_work.lift_products),
+            facial_reduction_tentative_max_estimated_bytes = typemax(Int),
+            facial_reduction_affine_lift_max_output_entries = typemax(Int),
+            facial_reduction_affine_lift_max_estimated_bytes = typemax(Int),
+        )
+        @test RationalSDP._tentative_batch_within_budget(batch_work, settings)
+        @test !RationalSDP._tentative_batch_within_budget(conservative_work, settings)
+
+        opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = true,
+            facial_reduction_tentative_max_directions = 4,
+            facial_reduction_tentative_max_coordinate_entries = typemax(Int),
+            facial_reduction_tentative_max_lift_products = Int(batch_work.lift_products),
+            facial_reduction_tentative_max_estimated_bytes = typemax(Int),
+            facial_reduction_affine_lift_max_output_entries = typemax(Int),
+            facial_reduction_affine_lift_max_estimated_bytes = typemax(Int),
+        )
+        candidate = vcat(
+            Float64[1, 0, 0, 0, 0, 0],
+            Float64[1, 0, 0, 0, 0, 0],
+        )
+        reduced, log_text = mktemp() do _, io
+            result = redirect_stdout(io) do
+                RationalSDP._tentative_feasibility_search_problem(
+                    opt,
+                    problem,
+                    candidate,
+                    Float64,
+                )
+            end
+            flush(io)
+            seekstart(io)
+            return result, read(io, String)
+        end
+        @test reduced !== nothing
+        @test occursin(
+            "skipped optional conservative one-direction fallback",
+            log_text,
+        )
+        @test !occursin("conservative fallback: constructing", log_text)
+    end
+
     @testset "oversized tentative batches admit one direction incrementally" begin
         problem = synthetic_face_problem([3, 3])
         settings = RationalSDP.Settings(

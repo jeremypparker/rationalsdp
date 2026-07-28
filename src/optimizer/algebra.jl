@@ -782,9 +782,6 @@ function ProblemData(
         psd_constraint_blocks,
         identity_lift,
         nothing,
-        collect(1:dimension),
-        identity_lift,
-        nothing,
     )
 end
 

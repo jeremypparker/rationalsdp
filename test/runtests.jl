@@ -40,6 +40,17 @@ include("slowtest_helpers.jl")
             "facial_reduction_weighted_subspace_max_affine_products",
             5678,
         )
+        set_optimizer_attribute(model, "facial_reduction_weighted_max_candidate_sets", 6)
+        set_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_max_total_affine_products",
+            123_456,
+        )
+        set_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_exact_without_scout_limit",
+            1,
+        )
         set_optimizer_attribute(
             model,
             "facial_reduction_sparse_affine_validation_max_products",
@@ -91,6 +102,18 @@ include("slowtest_helpers.jl")
             model,
             "facial_reduction_weighted_subspace_max_affine_products",
         ) == 5678
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_max_candidate_sets",
+        ) == 6
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_max_total_affine_products",
+        ) == 123_456
+        @test get_optimizer_attribute(
+            model,
+            "facial_reduction_weighted_exact_without_scout_limit",
+        ) == 1
         @test get_optimizer_attribute(
             model,
             "facial_reduction_sparse_affine_validation_max_products",
@@ -320,6 +343,12 @@ include("slowtest_helpers.jl")
             RationalSDP.Hypatia.Solvers.SlowProgress,
         )
         @test !RationalSDP._facial_reduction_oracle_allows_candidate_status(
+            RationalSDP.Hypatia.Solvers.PrimalInfeasible,
+        )
+        @test RationalSDP._facial_reduction_oracle_recommends_precision_retry(
+            RationalSDP.Hypatia.Solvers.NearPrimalInfeasible,
+        )
+        @test !RationalSDP._facial_reduction_oracle_recommends_precision_retry(
             RationalSDP.Hypatia.Solvers.PrimalInfeasible,
         )
     end
@@ -1061,6 +1090,284 @@ include("slowtest_helpers.jl")
             RationalSDP._canonical_rational_subspace_key(candidate.directions) for
             candidate in chart_candidates
         )
+        multifloat_subspace = RationalSDP.Float64x2.(subspace_basis)
+        multifloat_candidates = RationalSDP._rational_subspace_candidate_sets(
+            multifloat_subspace,
+            RationalSDP.Settings(
+                facial_reduction_subspace_max_charts = 2,
+                facial_reduction_projector_recovery = false,
+            ),
+            RationalSDP.Float64x2,
+            RationalSDP.Float64x2(1.0e-10),
+        )
+        @test !isempty(multifloat_candidates)
+        @test all(
+            candidate.reconstruction_error isa RationalSDP.Float64x2 for
+            candidate in multifloat_candidates
+        )
+        @test all(
+            eltype(candidate.projector) === RationalSDP.Float64x2 for
+            candidate in multifloat_candidates
+        )
+        @test all(length(candidate.fingerprint) == 8 for candidate in multifloat_candidates)
+
+        extreme_integer = big(10)^10_000
+        extreme_direction =
+            Rational{BigInt}[extreme_integer // big(1), 0 // big(1)]
+        extreme_directions = [extreme_direction]
+        extreme_key =
+            RationalSDP._canonical_rational_subspace_key(extreme_directions)
+        extreme_metrics = RationalSDP._rational_subspace_candidate_metrics(
+            reshape(
+                RationalSDP.Float64x2[
+                    RationalSDP.Float64x2(1),
+                    RationalSDP.Float64x2(0),
+                ],
+                2,
+                1,
+            ),
+            extreme_directions,
+            extreme_key,
+            RationalSDP.Float64x2,
+        )
+        @test extreme_metrics.numeric_usable
+        @test isfinite(extreme_metrics.reconstruction_error)
+        @test all(isfinite, extreme_metrics.projector)
+
+        invalid_metrics = RationalSDP._rational_subspace_candidate_metrics(
+            reshape(
+                RationalSDP.Float64x2[
+                    RationalSDP.Float64x2(NaN),
+                    RationalSDP.Float64x2(0),
+                ],
+                2,
+                1,
+            ),
+            extreme_directions,
+            extreme_key,
+            RationalSDP.Float64x2,
+        )
+        @test !invalid_metrics.numeric_usable
+        @test occursin("nonfinite", invalid_metrics.numeric_issue)
+        schedule = RationalSDP._weighted_subspace_candidate_schedule(
+            Any[
+                (
+                    directions = extreme_directions,
+                    method = "extreme valid",
+                    key = extreme_key,
+                    tolerance = RationalSDP.Float64x2(1.0e-10),
+                    extreme_metrics...,
+                ),
+                (
+                    directions = extreme_directions,
+                    method = "nonfinite source",
+                    key = extreme_key,
+                    tolerance = RationalSDP.Float64x2(1.0e-11),
+                    invalid_metrics...,
+                ),
+            ],
+            RationalSDP.Settings(),
+            RationalSDP.Float64x2,
+        )
+        @test length(schedule.candidates) == 1
+        @test schedule.rejected_count == 1
+        @test schedule.candidates[1].method == "extreme valid"
+        simple_candidate = (
+            directions = extreme_directions,
+            method = "simple",
+            key = (:simple,),
+            tolerance = RationalSDP.Float64x2(1.0e-4),
+            projector = RationalSDP.Float64x2[1 0; 0 0],
+            reconstruction_error = RationalSDP.Float64x2(1.0e-4),
+            coefficient_bits = 7,
+            fingerprint = "simple",
+            numeric_usable = true,
+            numeric_issue = "",
+        )
+        overfit_candidate = merge(
+            simple_candidate,
+            (
+            method = "overfit",
+            key = (:overfit,),
+            tolerance = RationalSDP.Float64x2(1.0e-30),
+            reconstruction_error = RationalSDP.Float64x2(1.0e-30),
+            coefficient_bits = 900,
+            fingerprint = "overfit",
+            ),
+        )
+        moderate_candidate = merge(
+            simple_candidate,
+            (
+                method = "moderate",
+                key = (:moderate,),
+                tolerance = RationalSDP.Float64x2(1.0e-3),
+                reconstruction_error = RationalSDP.Float64x2(1.0e-3),
+                coefficient_bits = 12,
+                fingerprint = "moderate",
+            ),
+        )
+        complexity_schedule = RationalSDP._weighted_subspace_candidate_schedule(
+            Any[simple_candidate, overfit_candidate],
+            RationalSDP.Settings(),
+            RationalSDP.Float64x2,
+        )
+        @test [candidate.method for candidate in complexity_schedule.candidates] ==
+              ["overfit", "simple"]
+        accuracy_candidates = Any[
+            merge(
+                overfit_candidate,
+                (
+                    method = "accuracy $(index)",
+                    key = (:accuracy, index),
+                    reconstruction_error =
+                        RationalSDP.Float64x2(index) *
+                        RationalSDP.Float64x2(1.0e-30),
+                    coefficient_bits = 900 + index,
+                    fingerprint = "accuracy$(index)",
+                ),
+            ) for index in 1:8
+        ]
+        reserved_schedule = RationalSDP._weighted_subspace_candidate_schedule(
+            Any[accuracy_candidates; simple_candidate; moderate_candidate],
+            RationalSDP.Settings(),
+            RationalSDP.Float64x2,
+        )
+        @test [candidate.method for candidate in reserved_schedule.candidates[1:7]] ==
+              ["accuracy $(index)" for index in 1:7]
+        @test [candidate.method for candidate in reserved_schedule.candidates[8:9]] ==
+              ["simple", "moderate"]
+        @test reserved_schedule.candidates[10].method == "accuracy 8"
+        @test reserved_schedule.reserved_candidate_keys ==
+              Any[simple_candidate.key, moderate_candidate.key]
+        schedule_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            RationalSDP.BlockStructure[],
+            Int[],
+            Rational{BigInt}[],
+            0//1,
+            Rational{BigInt}[],
+            zeros(Rational{BigInt}, 0, 0),
+            Rational{BigInt}[],
+            (Rational{BigInt}[], zeros(Rational{BigInt}, 0, 0)),
+        )
+        schedule_cache = RationalSDP._FacialReductionExactCache(schedule_problem)
+        work_candidates = [
+            merge(
+                candidate,
+                (
+                    weighted_work = (
+                        form_entries = BigInt(1),
+                        affine_products = BigInt(20),
+                    ),
+                    individual_work = (affine_products = BigInt(10),),
+                    attempt_key = candidate.key,
+                    cheap_weighted_attempted = false,
+                ),
+            ) for candidate in reserved_schedule.candidates
+        ]
+        work_reserved_settings = RationalSDP.Settings(
+            facial_reduction_weighted_max_candidate_sets = 9,
+            facial_reduction_weighted_max_total_affine_products = 160,
+            facial_reduction_individual_max_affine_products = 100,
+            facial_reduction_numeric_weighted_subspace_max_form_entries = 100,
+            facial_reduction_numeric_weighted_subspace_max_affine_products = 100,
+            facial_reduction_weighted_subspace_max_form_entries = 100,
+            facial_reduction_weighted_subspace_max_affine_products = 100,
+        )
+        work_reserved_schedule =
+            RationalSDP._work_reserved_weighted_subspace_candidate_schedule(
+                work_candidates,
+                reserved_schedule.reserved_candidate_keys,
+                schedule_cache,
+                work_reserved_settings,
+                1,
+        )
+        @test work_reserved_schedule.promoted_from == [8, 9]
+        @test work_reserved_schedule.promoted_to == 1
+        @test work_reserved_schedule.reserved_affine_products == 100
+        @test work_reserved_schedule.reserved_candidate_keys ==
+              Any[simple_candidate.key, moderate_candidate.key]
+        @test [candidate.method for candidate in work_reserved_schedule.candidates[1:2]] ==
+              ["simple", "moderate"]
+        @test work_reserved_schedule.candidates[3].method == "accuracy 1"
+        per_block_cache = RationalSDP._FacialReductionExactCache(schedule_problem)
+        per_block_settings = RationalSDP.Settings(
+            facial_reduction_weighted_max_candidate_sets = 1,
+            facial_reduction_weighted_max_total_affine_products = 100,
+        )
+        @test RationalSDP._reserve_weighted_subspace_work!(
+            per_block_cache,
+            per_block_settings,
+            1,
+            10;
+            new_candidate = true,
+        ) == :reserved
+        @test RationalSDP._reserve_weighted_subspace_work!(
+            per_block_cache,
+            per_block_settings,
+            1,
+            10;
+            new_candidate = true,
+        ) == :candidate_limit
+        @test RationalSDP._reserve_weighted_subspace_work!(
+            per_block_cache,
+            per_block_settings,
+            2,
+            10;
+            new_candidate = true,
+        ) == :reserved
+        @test per_block_cache.weighted_search.candidate_sets_attempted ==
+              Dict(1 => 1, 2 => 1)
+        @test per_block_cache.weighted_search.total_affine_products == 20
+        exact_reservation_settings = RationalSDP.Settings(
+            facial_reduction_weighted_exact_without_scout_limit = 2,
+        )
+        @test RationalSDP._weighted_exact_without_scout_available(
+            schedule_cache,
+            exact_reservation_settings;
+            reserve_count = 1,
+        )
+        @test !RationalSDP._weighted_exact_without_scout_available(
+            schedule_cache,
+            exact_reservation_settings;
+            reserve_count = 2,
+        )
+        schedule_cache.weighted_search.exact_without_scout_attempts = 1
+        @test !RationalSDP._weighted_exact_without_scout_available(
+            schedule_cache,
+            exact_reservation_settings;
+            reserve_count = 1,
+        )
+        @test RationalSDP._weighted_exact_without_scout_available(
+            schedule_cache,
+            exact_reservation_settings,
+        )
+        schedule_cache.weighted_search.exact_without_scout_attempts = 0
+        plan = RationalSDP._weighted_subspace_candidate_plan(
+            Any[
+                (
+                    directions = extreme_directions,
+                    method = "extreme valid",
+                    key = extreme_key,
+                    tolerance = RationalSDP.Float64x2(1.0e-10),
+                    extreme_metrics...,
+                ),
+                (
+                    directions = extreme_directions,
+                    method = "nonfinite source",
+                    key = extreme_key,
+                    tolerance = RationalSDP.Float64x2(1.0e-11),
+                    invalid_metrics...,
+                ),
+            ],
+            RationalSDP.Settings(),
+            RationalSDP.Float64x2,
+        )
+        @test length(plan.scheduled) == 1
+        @test length(plan.cheap_exact_only) == 1
+        @test length(plan.exact_checks) == 2
+        @test plan.cheap_exact_only[1].method == "nonfinite source"
+        @test plan.exact_checks[end].method == "nonfinite source"
 
         projector_directions = RationalSDP._rational_projector_subspace_directions(
             subspace_basis * irrational_rotation,
@@ -1207,6 +1514,77 @@ include("slowtest_helpers.jl")
             Float64,
         )
         @test numeric_weighted !== nothing
+        @test length(numeric_weighted.directions) == 2
+
+        # A rank-deficient PSD weight certifies only its exact range inside the
+        # proposed numerical kernel. Returning the whole candidate here would
+        # over-reduce the block.
+        partial_A = zeros(Rational{BigInt}, 1, 10)
+        partial_A[1, 1] = 1//1
+        partial_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [block],
+            Int[],
+            zeros(Rational{BigInt}, 10),
+            0//1,
+            zeros(Rational{BigInt}, 10),
+            partial_A,
+            Rational{BigInt}[0//1],
+            RationalSDP._solve_affine_system(
+                partial_A,
+                Rational{BigInt}[0//1],
+            ),
+        )
+        partial_directions = [
+            Rational{BigInt}[1, 0, 0, 0],
+            Rational{BigInt}[0, 1, 0, 0],
+        ]
+        partial_exposure = RationalSDP._block_weighted_subspace_exposure(
+            partial_problem,
+            block,
+            partial_directions,
+            RationalSDP.Settings(),
+            Float64,
+        )
+        @test partial_exposure !== nothing
+        @test RationalSDP._positive_semidefinite_exact(partial_exposure.weight)
+        @test !RationalSDP._positive_definite_exact(partial_exposure.weight)
+        @test length(partial_exposure.directions) == 1
+        @test partial_exposure.directions[1][2:4] == zeros(Rational{BigInt}, 3)
+        partial_numeric_exposure =
+            RationalSDP._numeric_weighted_subspace_exposure(
+                partial_problem,
+                block,
+                partial_directions,
+                RationalSDP.Settings(),
+                Float64,
+            )
+        @test partial_numeric_exposure !== nothing
+        @test length(partial_numeric_exposure.directions) == 1
+        partial_certified = RationalSDP._certified_pivoted_subspace_directions(
+            reduction_opt,
+            partial_problem,
+            block,
+            1,
+            Float64.(hcat(partial_directions...)),
+            Float64,
+            "partial weighted regression subspace",
+        )
+        @test length(partial_certified) == 1
+        @test partial_certified[1][2:4] == zeros(Rational{BigInt}, 3)
+        invalid_partial_keep_basis = RationalSDP._orthogonal_complement_basis(
+            partial_directions,
+            block.size,
+        )
+        invalid_partial_reduction = RationalSDP._CertifiedFacialReduction(
+            "invalid partial weighted regression",
+            Int[],
+            Dict(1 => invalid_partial_keep_basis),
+        )
+        @test RationalSDP._cached_facial_reduction_violation(
+            partial_problem,
+            invalid_partial_reduction,
+        ) !== nothing
         weighted_keep_basis = RationalSDP._orthogonal_complement_basis(
             weighted_certified,
             block.size,
@@ -1286,6 +1664,179 @@ include("slowtest_helpers.jl")
             Float64,
         ) === nothing
 
+        fixed_block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:3],
+            collect(1:3),
+            RationalSDP._triangle_positions(2),
+            [1, 3],
+        )
+        fixed_A = Matrix{Rational{BigInt}}(I, 3, 3)
+        fixed_b = Rational{BigInt}[1, 0, 1]
+        fixed_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [fixed_block],
+            Int[],
+            zeros(Rational{BigInt}, 3),
+            0//1,
+            zeros(Rational{BigInt}, 3),
+            fixed_A,
+            fixed_b,
+            RationalSDP._solve_affine_system(fixed_A, fixed_b),
+        )
+        extreme_problem = RationalSDP.ProblemData(
+            MOI.VariableIndex[],
+            [fixed_block],
+            Int[],
+            zeros(Rational{BigInt}, 3),
+            0//1,
+            zeros(Rational{BigInt}, 3),
+            fixed_A,
+            Rational{BigInt}[extreme_integer, 0, extreme_integer],
+            (
+                Rational{BigInt}[extreme_integer, 0, extreme_integer],
+                zeros(Rational{BigInt}, 3, 0),
+            ),
+        )
+        extreme_scout = RationalSDP._numeric_weighted_subspace_exposure_attempt(
+            extreme_problem,
+            fixed_block,
+            [Rational{BigInt}[extreme_integer, 0]],
+            RationalSDP.Settings(),
+            RationalSDP.Float64x2,
+        )
+        @test extreme_scout.exposure === nothing
+        @test extreme_scout.status == :unpromising
+        @test !occursin("ArgumentError", extreme_scout.reason)
+        @test !occursin("nonfinite", extreme_scout.reason)
+
+        malformed_block = RationalSDP.BlockStructure(
+            2,
+            Union{Nothing,MOI.VariableIndex}[nothing for _ in 1:3],
+            collect(1:3),
+            [(0, 0), (1, 2), (2, 2)],
+            [1, 3],
+        )
+        unavailable_scout =
+            RationalSDP._numeric_weighted_subspace_exposure_attempt(
+                fixed_problem,
+                malformed_block,
+                [Rational{BigInt}[1, 0]],
+                RationalSDP.Settings(),
+                RationalSDP.Float64x2,
+            )
+        @test unavailable_scout.status == :unavailable
+        @test !unavailable_scout.promising
+        @test occursin("forming the weighted affine system", unavailable_scout.reason)
+        @test occursin("BoundsError", unavailable_scout.reason)
+        @test occursin(
+            "precise scout diagnostic",
+            RationalSDP._numerical_scout_exception_summary(
+                ArgumentError("precise scout diagnostic"),
+            ),
+        )
+        staged_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = true,
+            facial_reduction_subspace_max_charts = 1,
+            facial_reduction_projector_recovery = false,
+            facial_reduction_cheap_weighted_subspace_max_weight_dimension = 0,
+            facial_reduction_cheap_weighted_subspace_max_form_entries = 0,
+            facial_reduction_cheap_weighted_subspace_max_affine_products = 0,
+            facial_reduction_individual_max_affine_products = 0,
+            facial_reduction_numeric_weighted_subspace_max_form_entries = 100,
+            facial_reduction_numeric_weighted_subspace_max_affine_products = 100,
+            facial_reduction_weighted_subspace_max_form_entries = 100,
+            facial_reduction_weighted_subspace_max_affine_products = 100,
+            facial_reduction_weighted_max_candidate_sets = 4,
+            facial_reduction_weighted_max_total_affine_products = 100,
+            facial_reduction_weighted_exact_without_scout_limit = 1,
+        )
+        staged_cache = RationalSDP._FacialReductionExactCache(fixed_problem)
+        staged_result, staged_log_text = mktemp() do _, io
+            result = redirect_stdout(io) do
+                RationalSDP._certified_pivoted_subspace_directions(
+                    staged_opt,
+                    fixed_problem,
+                    fixed_block,
+                    1,
+                    reshape(Float64[1, 0], 2, 1),
+                    Float64,
+                    "staged regression";
+                    cache = staged_cache,
+                )
+            end
+            flush(io)
+            seekstart(io)
+            return result, read(io, String)
+        end
+        @test isempty(staged_result)
+        @test staged_cache.weighted_search.candidate_sets_attempted == Dict(1 => 1)
+        @test staged_cache.weighted_search.total_affine_products == 6
+        @test staged_cache.weighted_search.exact_without_scout_attempts == 1
+        @test length(staged_cache.numeric_weighted_failures) == 1
+        @test only(values(staged_cache.numeric_weighted_failures)).status ==
+              :unpromising
+        @test length(staged_cache.exact_weighted_failures) == 1
+        @test occursin("relation_tol=", staged_log_text)
+        @test occursin("method=pivot chart", staged_log_text)
+        @test occursin("fingerprint=", staged_log_text)
+        @test occursin("cumulative_products=3/100", staged_log_text)
+
+        cached_state = deepcopy(staged_cache.weighted_search)
+        cached_result, cached_log_text = mktemp() do _, io
+            result = redirect_stdout(io) do
+                RationalSDP._certified_pivoted_subspace_directions(
+                    staged_opt,
+                    fixed_problem,
+                    fixed_block,
+                    1,
+                    reshape(Float64[1, 0], 2, 1),
+                    Float64,
+                    "staged regression";
+                    cache = staged_cache,
+                )
+            end
+            flush(io)
+            seekstart(io)
+            return result, read(io, String)
+        end
+        @test isempty(cached_result)
+        @test staged_cache.weighted_search.candidate_sets_attempted ==
+              cached_state.candidate_sets_attempted
+        @test staged_cache.weighted_search.total_affine_products ==
+              cached_state.total_affine_products
+        @test occursin("cached_failures=2", cached_log_text)
+
+        limited_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction_subspace_max_charts = 1,
+            facial_reduction_projector_recovery = false,
+            facial_reduction_cheap_weighted_subspace_max_weight_dimension = 0,
+            facial_reduction_cheap_weighted_subspace_max_form_entries = 0,
+            facial_reduction_cheap_weighted_subspace_max_affine_products = 0,
+            facial_reduction_individual_max_affine_products = 0,
+            facial_reduction_numeric_weighted_subspace_max_form_entries = 100,
+            facial_reduction_numeric_weighted_subspace_max_affine_products = 100,
+            facial_reduction_weighted_subspace_max_form_entries = 100,
+            facial_reduction_weighted_subspace_max_affine_products = 100,
+            facial_reduction_weighted_max_candidate_sets = 4,
+            facial_reduction_weighted_max_total_affine_products = 3,
+            facial_reduction_weighted_exact_without_scout_limit = 1,
+        )
+        limited_cache = RationalSDP._FacialReductionExactCache(fixed_problem)
+        @test isempty(RationalSDP._certified_pivoted_subspace_directions(
+            limited_opt,
+            fixed_problem,
+            fixed_block,
+            1,
+            reshape(Float64[1, 0], 2, 1),
+            Float64,
+            "budget regression";
+            cache = limited_cache,
+        ))
+        @test limited_cache.weighted_search.total_affine_products == 3
+        @test isempty(limited_cache.exact_weighted_failures)
+
         directions = [
             Rational{BigInt}[1//1, 0//1],
             Rational{BigInt}[2//1, 0//1],
@@ -1312,7 +1863,7 @@ include("slowtest_helpers.jl")
             ]
         end
 
-        function legacy_exposing_column_directions(
+        function column_only_exposing_directions(
             opt::RationalSDP.Optimizer,
             problem::RationalSDP.ProblemData,
             block_index::Int,
@@ -1392,14 +1943,14 @@ include("slowtest_helpers.jl")
             rational_tolerance = big"1e-12",
             recovery_tolerance_shrink = big"0.01",
         )
-        legacy_directions = legacy_exposing_column_directions(
+        column_only_directions = column_only_exposing_directions(
             pivot_opt,
             rank_one_problem,
             1,
             exposing_slack,
             Float64,
         )
-        @test isempty(legacy_directions)
+        @test isempty(column_only_directions)
 
         exposing_directions = RationalSDP._facial_reduction_block_directions(
             pivot_opt,
@@ -1861,7 +2412,7 @@ include("slowtest_helpers.jl")
         ) == Rational{BigInt}[2//1, 2//1, 2//1]
     end
 
-    @testset "Repeated facial reductions compact coordinates and preserve legacy cache replay" begin
+    @testset "Repeated facial reductions compact coordinates and preserve cache replay" begin
         triangle3 = [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)]
         block = RationalSDP.BlockStructure(
             3,
@@ -1915,53 +2466,27 @@ include("slowtest_helpers.jl")
             reduced_twice,
             Rational{BigInt}[7//1],
         ) == Rational{BigInt}[7//1, 7//1, 7//1, 0//1, 0//1, 0//1]
-        @test reduced_once.legacy_facial_reduction_signature.dimension == 9
-        @test reduced_once.legacy_facial_reduction_signature.equation_count == 11
-        @test Matrix(reduced_once.legacy_coordinate_lift) == Rational{BigInt}[
-            1 0 0
-            0 1 0
-            0 0 1
-            0 0 0
-            0 0 0
-            0 0 0
-            1 0 0
-            0 1 0
-            0 0 1
-        ]
-
         first_reduction = RationalSDP._CertifiedFacialReduction(
-            "legacy first face",
+            "first compact face",
             Int[],
             Dict(1 => keep_two),
         )
         second_reduction = RationalSDP._CertifiedFacialReduction(
-            "legacy second face",
+            "second compact face",
             Int[],
             Dict(1 => keep_one),
         )
-        legacy_records = Any[
+        compact_records = Any[
             RationalSDP._facial_reduction_record(problem, first_reduction),
-            (
-                signature = reduced_once.legacy_facial_reduction_signature,
-                source = second_reduction.source,
-                exposed_scalars = Int[],
-                keep_bases = [(block_index = 1, basis = copy(keep_one))],
-                exposing_slack = Rational{BigInt}[
-                    0, 0, 0, 0, 0, 0, 1, -2, 1
-                ],
-            ),
+            RationalSDP._facial_reduction_record(reduced_once, second_reduction),
         ]
-        mapped_second = RationalSDP._remap_legacy_cached_reduction(
-            reduced_once,
-            RationalSDP._cached_facial_reduction(legacy_records[2]),
-        )
-        @test mapped_second !== nothing
-        @test mapped_second.exposing_slack == Rational{BigInt}[1, -2, 1]
+        @test [record.signature.dimension for record in compact_records] == [6, 3]
+        @test [record.signature.equation_count for record in compact_records] == [5, 5]
         load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
             verbose = false,
             facial_reduction = false,
         )
-        load_opt.facial_reduction_loaded_records = legacy_records
+        load_opt.facial_reduction_loaded_records = compact_records
         replay = RationalSDP._apply_loaded_facial_reductions(
             load_opt,
             problem;
@@ -1974,6 +2499,74 @@ include("slowtest_helpers.jl")
             replay.problem,
             Rational{BigInt}[11//1],
         ) == Rational{BigInt}[11//1, 11//1, 11//1, 0//1, 0//1, 0//1]
+
+        rank_expansion_load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            facial_reduction = true,
+            facial_reduction_float_type = Float64,
+            facial_reduction_rank_expansion_rounds = 1,
+        )
+        rank_expansion_load_opt.facial_reduction_loaded_records = compact_records
+        deferred_replay = RationalSDP._apply_loaded_facial_reductions(
+            rank_expansion_load_opt,
+            problem;
+            return_details = true,
+        )
+        # Enabling rank expansion must not strengthen the first cached face
+        # before the second record's intermediate-problem signature is matched.
+        @test deferred_replay.applied == 2
+        @test length(deferred_replay.problem.objective_vector_raw) == 1
+
+        mktempdir() do directory
+            input_file = joinpath(directory, "compact-input.rsdpcache")
+            output_file = joinpath(directory, "compact-output.rsdpcache")
+            RationalSDP._write_facial_reduction_cache(input_file, compact_records)
+            source_bytes = read(input_file)
+            replay_save_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+                verbose = false,
+                facial_reduction = false,
+                facial_reduction_load_file = input_file,
+                facial_reduction_save_file = output_file,
+            )
+            RationalSDP._prepare_facial_reduction_cache!(replay_save_opt)
+            distinct_file_replay = RationalSDP._apply_loaded_facial_reductions(
+                replay_save_opt,
+                problem;
+                return_details = true,
+            )
+            @test distinct_file_replay.applied == 2
+            @test length(distinct_file_replay.problem.objective_vector_raw) == 1
+            @test read(input_file) == source_bytes
+            replayed_records =
+                RationalSDP._read_facial_reduction_cache(output_file)
+            @test length(replayed_records) == 2
+            @test [
+                record.signature.dimension for record in replayed_records
+            ] == [6, 3]
+            @test [
+                record.signature.equation_count for record in replayed_records
+            ] == [5, 5]
+            @test all(
+                RationalSDP._facial_reduction_signature_matches_signature(
+                    compact.signature,
+                    replayed.signature,
+                ) for (compact, replayed) in zip(compact_records, replayed_records)
+            )
+
+            output_load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+                verbose = false,
+                facial_reduction = false,
+                facial_reduction_load_file = output_file,
+            )
+            RationalSDP._prepare_facial_reduction_cache!(output_load_opt)
+            output_replay = RationalSDP._apply_loaded_facial_reductions(
+                output_load_opt,
+                problem;
+                return_details = true,
+            )
+            @test output_replay.applied == 2
+            @test length(output_replay.problem.objective_vector_raw) == 1
+        end
     end
 
     @testset "Exactly fixed PSD directions are eliminated without new equations" begin
@@ -2087,31 +2680,6 @@ include("slowtest_helpers.jl")
                 RationalSDP._cached_facial_reduction(only(saved_records))
             @test saved_reduction !== nothing
             @test saved_reduction.exposing_slack !== nothing
-
-            legacy_record = (
-                signature = RationalSDP._facial_reduction_problem_signature(problem),
-                source = reduction.source,
-                exposed_scalars = copy(reduction.exposed_scalars),
-                keep_bases = [
-                    (block_index = 1, basis = copy(keep_basis)),
-                ],
-            )
-            legacy_records = RationalSDP._facial_reduction_cache_records((
-                magic = RationalSDP._FACIAL_REDUCTION_CACHE_MAGIC,
-                version = 1,
-                records = Any[legacy_record],
-            ))
-            legacy_reduction =
-                RationalSDP._cached_facial_reduction(only(legacy_records))
-            @test legacy_reduction !== nothing
-            @test legacy_reduction.exposing_slack === nothing
-            upgraded_legacy = RationalSDP._with_exact_exposing_slack(
-                problem,
-                legacy_reduction,
-                RationalSDP.Settings(),
-            )
-            @test upgraded_legacy !== nothing
-            @test upgraded_legacy.exposing_slack !== nothing
 
             matching_problem =
                 cached_face_problem(Rational{BigInt}[7//1, 0//1, 0//1], [0//1, 0//1])
@@ -2308,6 +2876,19 @@ include("slowtest_helpers.jl")
         @test certified.exposed_scalars == [1]
         @test isempty(certified.keep_bases)
 
+        deferred_opt = RationalSDP.Optimizer{Rational{BigInt}}(
+            verbose = false,
+            working_float_type = Float64,
+            facial_reduction_float_type = Float64,
+            facial_reduction_row_space_max_entries = 0,
+        )
+        @test RationalSDP._certify_facial_reduction_evidence(
+            deferred_opt,
+            problem,
+            first(evidence),
+            Float64,
+        ) === nothing
+
         reduction = RationalSDP._certified_facial_reduction_from_initial_evidence(
             opt,
             problem,
@@ -2428,13 +3009,29 @@ include("slowtest_helpers.jl")
         @test RationalSDP._cached_facial_reduction_violation(problem, expanded) === nothing
 
         cache_file = tempname()
+        checkpoint_log_file = tempname()
         try
             save_opt = RationalSDP.Optimizer{Rational{BigInt}}(
-                verbose = false,
+                verbose = true,
                 facial_reduction_save_file = cache_file,
             )
             RationalSDP._prepare_facial_reduction_cache!(save_opt)
-            RationalSDP._record_successful_facial_reduction!(save_opt, problem, first)
+            open(checkpoint_log_file, "w") do io
+                redirect_stdout(io) do
+                    RationalSDP._record_successful_facial_reduction!(
+                        save_opt,
+                        problem,
+                        first,
+                    )
+                    RationalSDP._record_successful_facial_reduction!(
+                        save_opt,
+                        problem,
+                        first,
+                    )
+                end
+            end
+            checkpoint_log = read(checkpoint_log_file, String)
+            @test length(findall("checkpointed 1 reduction record(s)", checkpoint_log)) == 1
 
             load_opt = RationalSDP.Optimizer{Rational{BigInt}}(
                 verbose = false,
@@ -2456,9 +3053,10 @@ include("slowtest_helpers.jl")
             @test length(checkpointed_records) == 1
             checkpointed = RationalSDP._cached_facial_reduction(only(checkpointed_records))
             @test checkpointed !== nothing
-            @test size(checkpointed.keep_bases[1], 2) == 1
+            @test size(checkpointed.keep_bases[1], 2) == 2
         finally
             rm(cache_file; force = true)
+            rm(checkpoint_log_file; force = true)
         end
     end
 

@@ -300,6 +300,12 @@ Base.@kwdef mutable struct Settings
     facial_reduction_cheap_weighted_subspace_max_affine_products::Int = 500_000
     facial_reduction_numeric_weighted_subspace_max_form_entries::Int = 1_000_000
     facial_reduction_numeric_weighted_subspace_max_affine_products::Int = 25_000_000
+    # Per-candidate limits above prevent one oversized weighted-subspace
+    # attempt. The candidate-set limit below applies separately to each PSD
+    # block, while the product limit remains cumulative across all blocks.
+    facial_reduction_weighted_max_candidate_sets::Int = 9
+    facial_reduction_weighted_max_total_affine_products::Int = 2_000_000_000
+    facial_reduction_weighted_exact_without_scout_limit::Int = 2
     facial_reduction_individual_max_affine_products::Int = 5_000_000
     facial_reduction_sparse_affine_validation_max_products::Int = 5_000_000
     facial_reduction_sieve_transform_max_entries::Int = 250_000
@@ -372,9 +378,6 @@ mutable struct ProblemData
     scalar_constraint_rows::Dict{Any,Vector{Int}}
     psd_constraint_blocks::Dict{Any,Int}
     solution_lift::SparseMatrixCSC{ExactRational,Int}
-    legacy_facial_reduction_signature::Any
-    legacy_position_map::Vector{Int}
-    legacy_coordinate_lift::SparseMatrixCSC{ExactRational,Int}
     phase1_nullspace_float_type::Union{Nothing,DataType}
 end
 
@@ -578,9 +581,9 @@ end
 
 function _format_metric(x)
     value = try
-        Float64(x)
+        BigFloat(x)
     catch
-        NaN
+        big"NaN"
     end
     if isfinite(value)
         return @sprintf("%.3e", value)
@@ -1001,6 +1004,9 @@ function _validate_settings(settings::Settings)
         :facial_reduction_cheap_weighted_subspace_max_affine_products,
         :facial_reduction_numeric_weighted_subspace_max_form_entries,
         :facial_reduction_numeric_weighted_subspace_max_affine_products,
+        :facial_reduction_weighted_max_candidate_sets,
+        :facial_reduction_weighted_max_total_affine_products,
+        :facial_reduction_weighted_exact_without_scout_limit,
         :facial_reduction_individual_max_affine_products,
         :facial_reduction_sparse_affine_validation_max_products,
         :facial_reduction_sieve_transform_max_entries,

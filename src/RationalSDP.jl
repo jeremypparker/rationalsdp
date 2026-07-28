@@ -26,6 +26,9 @@ import MathOptInterface as MOI
 include("multifloat_matmul.jl")
 include("optimizer.jl")
 
-export Optimizer, Settings, FacialReductionStatistics, facial_reduction_statistics
+export Optimizer,
+    Settings,
+    FacialReductionStatistics,
+    facial_reduction_statistics
 
 end

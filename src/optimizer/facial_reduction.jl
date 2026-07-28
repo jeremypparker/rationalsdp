@@ -10,11 +10,24 @@ mutable struct _FacialReductionRowSpaceCache
     inverse::Matrix{ExactRational}
 end
 
+mutable struct _WeightedSubspaceSearchState
+    # Candidate allowances are per PSD block so an earlier block cannot starve
+    # later blocks. The product and exact-without-scout caps remain cumulative
+    # across the exact-cache lifetime because they bound total exact work.
+    candidate_sets_attempted::Dict{Int,Int}
+    total_affine_products::BigInt
+    exact_without_scout_attempts::Int
+end
+
 mutable struct _FacialReductionExactCache
     problem::ProblemData
     row_space::Union{Nothing,_FacialReductionRowSpaceCache}
     block_exact_directions::Vector{Union{Nothing,Vector{Vector{ExactRational}}}}
     A_transpose::Union{Nothing,Nemo.QQMatrix}
+    weighted_search::_WeightedSubspaceSearchState
+    individual_subspace_failures::Set{Any}
+    numeric_weighted_failures::Dict{Any,Any}
+    exact_weighted_failures::Set{Any}
 end
 
 struct _TentativeFaceDirection{F<:AbstractFloat}
@@ -31,6 +44,10 @@ function _FacialReductionExactCache(problem::ProblemData)
         nothing,
         Union{Nothing,Vector{Vector{ExactRational}}}[nothing for _ in problem.blocks],
         nothing,
+        _WeightedSubspaceSearchState(Dict{Int,Int}(), BigInt(0), 0),
+        Set{Any}(),
+        Dict{Any,Any}(),
+        Set{Any}(),
     )
     _record_approximate_cache_memory!(:facial_reduction, cache)
     return cache
@@ -443,30 +460,137 @@ function _block_weighted_subspace_form(
     return exposed_indices, exposed_values
 end
 
-function _numeric_weighted_subspace_exposure(
+function _weighted_exposure_directions(
+    direction_matrix::AbstractMatrix{ExactRational},
+    weight_matrix::Matrix{ExactRational},
+)
+    size(weight_matrix, 1) == size(weight_matrix, 2) || return Vector{Vector{ExactRational}}()
+    size(direction_matrix, 2) == size(weight_matrix, 1) ||
+        return Vector{Vector{ExactRational}}()
+    augmented = hcat(
+        copy(weight_matrix),
+        zeros(ExactRational, size(weight_matrix, 1)),
+    )
+    _, pivot_columns = _rref(augmented)
+    return [
+        collect(direction_matrix * view(weight_matrix, :, column)) for
+        column in pivot_columns
+    ]
+end
+
+function _finite_rational_directions(
+    ::Type{F},
+    directions::Vector{Vector{ExactRational}},
+) where {F<:AbstractFloat}
+    return [
+        begin
+            numeric_direction = try
+                _to_working_array(F, direction)
+            catch
+                nothing
+            end
+            if numeric_direction !== nothing && all(isfinite, numeric_direction)
+                copy(direction)
+            else
+                scale = maximum(abs, direction; init = zero(ExactRational))
+                iszero(scale) ?
+                copy(direction) :
+                ExactRational[value / scale for value in direction]
+            end
+        end for direction in directions
+    ]
+end
+
+function _finite_exact_columns_to_working_array(
+    ::Type{F},
+    values::AbstractMatrix{ExactRational},
+) where {F<:AbstractFloat}
+    converted = try
+        _to_working_array(F, values)
+    catch
+        nothing
+    end
+    fast_conversion_succeeded = converted !== nothing
+    converted === nothing && (converted = Matrix{F}(undef, size(values)...))
+    for column in axes(values, 2)
+        converted_column = view(converted, :, column)
+        if fast_conversion_succeeded && all(isfinite, converted_column)
+            continue
+        else
+            exact_scale =
+                maximum(abs, view(values, :, column); init = zero(ExactRational))
+            if iszero(exact_scale)
+                fill!(converted_column, zero(F))
+                continue
+            end
+            setprecision(BigFloat, max(precision(F), 64)) do
+                numeric_scale = BigFloat(exact_scale)
+                for row in axes(values, 1)
+                    converted[row, column] =
+                        F(BigFloat(values[row, column]) / numeric_scale)
+                end
+            end
+        end
+    end
+    return converted
+end
+
+function _numerical_scout_exception_summary(err)
+    detail = replace(sprint(showerror, err), r"\s+" => " ")
+    isempty(detail) && (detail = string(nameof(typeof(err))))
+    return first(detail, min(length(detail), 500))
+end
+
+function _numeric_weighted_subspace_exposure_attempt(
     problem::ProblemData,
     block::BlockStructure,
     directions::Vector{Vector{ExactRational}},
     settings::Settings,
     ::Type{F},
 ) where {F<:AbstractFloat}
-    isempty(directions) && return nothing
-    problem.affine === nothing && return nothing
+    failure(reason; promising::Bool = false, status::Symbol = :unpromising) = (
+        exposure = nothing,
+        promising = promising,
+        status = status,
+        reason = reason,
+    )
+    isempty(directions) &&
+        return failure("the candidate subspace is empty"; status = :unavailable)
+    problem.affine === nothing &&
+        return failure("the affine system is inconsistent"; status = :unavailable)
 
-    direction_matrix = hcat(directions...)
-    size(direction_matrix, 1) == block.size || return nothing
+    scaled_directions = _finite_rational_directions(F, directions)
+    direction_matrix = hcat(scaled_directions...)
+    size(direction_matrix, 1) == block.size ||
+        return failure(
+            "the candidate dimension does not match the PSD block";
+            status = :unavailable,
+        )
     rank = size(direction_matrix, 2)
     work = _weighted_subspace_exposure_work(problem, block, rank)
-    _numeric_weighted_subspace_exposure_is_small(work, settings) || return nothing
+    _numeric_weighted_subspace_exposure_is_small(work, settings) ||
+        return failure(
+            "the numerical scout exceeds its per-candidate work limit";
+            status = :skipped,
+        )
 
     weight_positions = _triangle_positions(rank)
+    stage = "converting and scaling the candidate data"
     try
         numeric_directions = _to_working_array(F, direction_matrix)
         particular, nullspace = problem.affine
         affine_basis = hcat(particular, nullspace)
-        numeric_affine_basis = _to_working_array(F, affine_basis[block.global_positions, :])
-        all(isfinite, numeric_directions) && all(isfinite, numeric_affine_basis) || return nothing
+        numeric_affine_basis = _finite_exact_columns_to_working_array(
+            F,
+            affine_basis[block.global_positions, :],
+        )
+        all(isfinite, numeric_directions) && all(isfinite, numeric_affine_basis) ||
+            return failure(
+                "the scaled numerical input contains nonfinite values";
+                status = :unavailable,
+            )
 
+        stage = "forming the weighted affine system"
         form_columns = zeros(F, length(block.local_positions), length(weight_positions))
         for (weight_index, (a, b)) in enumerate(weight_positions)
             weight_basis = zeros(F, rank, rank)
@@ -478,44 +602,136 @@ function _numeric_weighted_subspace_exposure(
                     i == j ? exposed_matrix[i, j] : 2 * exposed_matrix[i, j]
             end
         end
+        all(isfinite, form_columns) ||
+            return failure(
+                "the weighted form matrix contains nonfinite values";
+                status = :unavailable,
+            )
 
-        singular_factor = svd(transpose(numeric_affine_basis) * form_columns)
+        vanish_constraints = transpose(numeric_affine_basis) * form_columns
+        all(isfinite, vanish_constraints) ||
+            return failure(
+                "the weighted affine product contains nonfinite values";
+                status = :unavailable,
+            )
+
+        stage = "factorizing the weighted affine system"
+        singular_factor = svd(vanish_constraints)
         singular_values = singular_factor.S
-        isempty(singular_values) && return nothing
+        isempty(singular_values) &&
+            return failure(
+                "the weighted affine system has no singular values";
+                status = :unavailable,
+            )
+        all(isfinite, singular_values) ||
+            return failure(
+                "the weighted affine singular values are nonfinite";
+                status = :unavailable,
+            )
         scale = max(one(F), maximum(abs, singular_values))
         rank_tolerance = max(sqrt(eps(F)), F(100) * eps(F)) * scale
         constraint_rank = count(value -> value > rank_tolerance, singular_values)
-        constraint_rank < length(weight_positions) || return nothing
+        constraint_rank < length(weight_positions) ||
+            return failure("the numerical weighted affine system has no nullspace")
         numeric_weight_subspace =
             transpose(singular_factor.Vt)[:, (constraint_rank + 1):end]
+        all(isfinite, numeric_weight_subspace) ||
+            return failure(
+                "the numerical weight subspace contains nonfinite values";
+                status = :unavailable,
+            )
+
+        stage = "fitting a positive-semidefinite numerical weight"
         identity_target = F[a == b ? one(F) : zero(F) for (a, b) in weight_positions]
         numeric_coordinates = numeric_weight_subspace \ identity_target
-        all(isfinite, numeric_coordinates) || return nothing
+        all(isfinite, numeric_coordinates) ||
+            return failure(
+                "the numerical weight coordinates are nonfinite";
+                status = :unavailable,
+            )
         numeric_weight_vector = numeric_weight_subspace * numeric_coordinates
-        all(isfinite, numeric_weight_vector) || return nothing
+        all(isfinite, numeric_weight_vector) ||
+            return failure("the numerical weight is nonfinite"; status = :unavailable)
 
+        numeric_weight_matrix = zeros(F, rank, rank)
+        for (weight_index, (a, b)) in enumerate(weight_positions)
+            numeric_weight_matrix[a, b] = numeric_weight_vector[weight_index]
+            numeric_weight_matrix[b, a] = numeric_weight_vector[weight_index]
+        end
+        all(isfinite, numeric_weight_matrix) ||
+            return failure(
+                "the fitted numerical weight matrix is nonfinite";
+                status = :unavailable,
+            )
+        stage = "checking the numerical weight eigenvalues"
+        weight_eigenvalues = eigvals(Symmetric(numeric_weight_matrix))
+        all(isfinite, weight_eigenvalues) ||
+            return failure(
+                "the fitted numerical weight eigenvalues are nonfinite";
+                status = :unavailable,
+            )
+        minimum_weight_eigenvalue = minimum(weight_eigenvalues)
+        maximum_weight_eigenvalue = maximum(weight_eigenvalues)
+        promising =
+            minimum_weight_eigenvalue >= -rank_tolerance &&
+            maximum_weight_eigenvalue > rank_tolerance
+
+        stage = "rationalizing the numerical weight"
         for tolerance in _facial_reduction_subspace_tolerances(settings, F)
             weight_matrix = zeros(ExactRational, rank, rank)
             for (weight_index, (a, b)) in enumerate(weight_positions)
-                value = rationalize(
-                    BigInt,
-                    BigFloat(numeric_weight_vector[weight_index]);
-                    tol = BigFloat(tolerance),
-                )
+                value = _rationalize_float(numeric_weight_vector[weight_index], tolerance)
                 weight_matrix[a, b] = value
                 weight_matrix[b, a] = value
             end
-            _positive_definite_exact(weight_matrix) || continue
+            _positive_semidefinite_exact(weight_matrix) || continue
+            exposure_directions =
+                _weighted_exposure_directions(direction_matrix, weight_matrix)
+            isempty(exposure_directions) && continue
             exposed_indices, exposed_values =
                 _block_weighted_subspace_form(block, direction_matrix, weight_matrix)
             _affine_form_violation(problem, exposed_indices, exposed_values) === nothing ||
                 continue
-            return (weight = weight_matrix, tolerance = tolerance)
+            return (
+                exposure = (
+                    weight = weight_matrix,
+                    directions = exposure_directions,
+                    tolerance = tolerance,
+                ),
+                promising = true,
+                status = :certified,
+                reason = "certified",
+            )
         end
-    catch
-        return nothing
+        return failure(
+            promising ? "a nonzero positive-semidefinite numerical weight did not rationalize to an exact certificate" :
+            "the fitted numerical weight was not nonzero positive semidefinite";
+            promising,
+            status = promising ? :promising : :unpromising,
+        )
+    catch err
+        detail = _numerical_scout_exception_summary(err)
+        return failure(
+            "the numerical scout was unavailable during $(stage): $(detail)";
+            status = :unavailable,
+        )
     end
-    return nothing
+end
+
+function _numeric_weighted_subspace_exposure(
+    problem::ProblemData,
+    block::BlockStructure,
+    directions::Vector{Vector{ExactRational}},
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    return _numeric_weighted_subspace_exposure_attempt(
+        problem,
+        block,
+        directions,
+        settings,
+        F,
+    ).exposure
 end
 
 function _block_weighted_subspace_exposure(
@@ -577,13 +793,20 @@ function _block_weighted_subspace_exposure(
             weight_matrix[a, b] = weight_vector[weight_index]
             weight_matrix[b, a] = weight_vector[weight_index]
         end
-        _positive_definite_exact(weight_matrix) || continue
+        _positive_semidefinite_exact(weight_matrix) || continue
+        exposure_directions =
+            _weighted_exposure_directions(direction_matrix, weight_matrix)
+        isempty(exposure_directions) && continue
 
         exposed_indices, exposed_values =
             _block_weighted_subspace_form(block, direction_matrix, weight_matrix)
         _affine_form_violation(problem, exposed_indices, exposed_values) === nothing ||
             continue
-        return (weight = weight_matrix, tolerance = tolerance)
+        return (
+            weight = weight_matrix,
+            directions = exposure_directions,
+            tolerance = tolerance,
+        )
     end
 
     return nothing
@@ -938,6 +1161,98 @@ function _canonical_rational_subspace_key(directions::Vector{Vector{ExactRationa
     return Tuple(vec(reduced[:, 1:size(row_basis, 2)]))
 end
 
+function _rational_subspace_coefficient_bits(key)
+    maximum_bits = 0
+    for value in key
+        value isa ExactRational || continue
+        maximum_bits = max(
+            maximum_bits,
+            ndigits(abs(numerator(value)); base = 2),
+            ndigits(denominator(value); base = 2),
+        )
+    end
+    return maximum_bits
+end
+
+function _stable_rational_subspace_fingerprint(key)
+    state = UInt64(0xcbf29ce484222325)
+    for byte in codeunits(string(key))
+        state = xor(state, UInt64(byte)) * UInt64(0x100000001b3)
+    end
+    return first(lpad(string(state; base = 16), 16, '0'), 8)
+end
+
+function _numeric_subspace_projector(
+    subspace::AbstractMatrix{F},
+    rank::Int,
+) where {F<:AbstractFloat}
+    rank > 0 || return zeros(F, size(subspace, 1), size(subspace, 1))
+    orthogonal_basis = Matrix(qr(Matrix{F}(subspace)).Q[:, 1:rank])
+    return orthogonal_basis * transpose(orthogonal_basis)
+end
+
+function _rational_subspace_candidate_metrics(
+    subspace::AbstractMatrix{F},
+    directions::Vector{Vector{ExactRational}},
+    key,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    coefficient_bits = _rational_subspace_coefficient_bits(key)
+    fingerprint = _stable_rational_subspace_fingerprint(key)
+    try
+        all(isfinite, subspace) || return (
+            projector = nothing,
+            reconstruction_error = nothing,
+            coefficient_bits = coefficient_bits,
+            fingerprint = fingerprint,
+            numeric_usable = false,
+            numeric_issue = "the source subspace contains nonfinite values",
+        )
+        scaled_directions = _finite_rational_directions(F, directions)
+        direction_matrix = _to_working_array(F, hcat(scaled_directions...))
+        all(isfinite, direction_matrix) || return (
+            projector = nothing,
+            reconstruction_error = nothing,
+            coefficient_bits = coefficient_bits,
+            fingerprint = fingerprint,
+            numeric_usable = false,
+            numeric_issue = "the scaled rational directions contain nonfinite values",
+        )
+        rank = size(direction_matrix, 2)
+        projector = _numeric_subspace_projector(direction_matrix, rank)
+        target_projector = _numeric_subspace_projector(subspace, rank)
+        reconstruction_error =
+            maximum(abs, projector - target_projector; init = zero(F))
+        all(isfinite, projector) &&
+            all(isfinite, target_projector) &&
+            isfinite(reconstruction_error) || return (
+            projector = nothing,
+            reconstruction_error = nothing,
+            coefficient_bits = coefficient_bits,
+            fingerprint = fingerprint,
+            numeric_usable = false,
+            numeric_issue = "the reconstructed projector metric is nonfinite",
+        )
+        return (
+            projector = projector,
+            reconstruction_error = reconstruction_error,
+            coefficient_bits = coefficient_bits,
+            fingerprint = fingerprint,
+            numeric_usable = true,
+            numeric_issue = "",
+        )
+    catch err
+        return (
+            projector = nothing,
+            reconstruction_error = nothing,
+            coefficient_bits = coefficient_bits,
+            fingerprint = fingerprint,
+            numeric_usable = false,
+            numeric_issue = "projector metric failed: $(_numerical_scout_exception_summary(err))",
+        )
+    end
+end
+
 function _rational_projector_subspace_directions(
     subspace::AbstractMatrix{F},
     rank::Int,
@@ -994,7 +1309,16 @@ function _rational_subspace_candidate_sets(
         key = _canonical_rational_subspace_key(directions)
         key in seen && continue
         push!(seen, key)
-        push!(candidate_sets, (directions = directions, method = "pivot chart $(chart_index)"))
+        metrics = _rational_subspace_candidate_metrics(subspace, directions, key, F)
+        push!(
+            candidate_sets,
+            (
+                directions = directions,
+                method = "pivot chart $(chart_index)",
+                key = key,
+                metrics...,
+            ),
+        )
     end
     if settings.facial_reduction_projector_recovery
         _record_facial_reduction_event!(:rational_projectors_attempted)
@@ -1005,10 +1329,174 @@ function _rational_subspace_candidate_sets(
         )
         if !isempty(directions)
             key = _canonical_rational_subspace_key(directions)
-            key in seen || push!(candidate_sets, (directions = directions, method = "rational projector"))
+            if !(key in seen)
+                metrics = _rational_subspace_candidate_metrics(subspace, directions, key, F)
+                push!(
+                    candidate_sets,
+                    (
+                        directions = directions,
+                        method = "rational projector",
+                        key = key,
+                        metrics...,
+                    ),
+                )
+            end
         end
     end
     return candidate_sets
+end
+
+function _weighted_subspace_candidate_schedule(
+    candidates::Vector,
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    isempty(candidates) &&
+        return (
+            candidates = candidates,
+            cluster_count = 0,
+            rejected_count = 0,
+            reserved_candidate_keys = Any[],
+        )
+    usable_candidates = filter(candidates) do candidate
+        hasproperty(candidate, :numeric_usable) &&
+            candidate.numeric_usable &&
+            candidate.projector !== nothing &&
+            candidate.reconstruction_error !== nothing &&
+            all(isfinite, candidate.projector) &&
+            isfinite(candidate.reconstruction_error)
+    end
+    rejected_count = length(candidates) - length(usable_candidates)
+    isempty(usable_candidates) &&
+        return (
+            candidates = usable_candidates,
+            cluster_count = 0,
+            rejected_count,
+            reserved_candidate_keys = Any[],
+        )
+    threshold = max(
+        _to_working_float(F, settings.facial_reduction_exposure_tolerance),
+        F(100) * eps(F),
+    )
+    function clustered_schedule(ordered)
+        clusters = Vector{Vector{Any}}()
+        centers = Matrix{F}[]
+        for candidate in ordered
+            cluster_index = findfirst(
+                center ->
+                    maximum(
+                        abs,
+                        candidate.projector - center;
+                        init = zero(F),
+                    ) <= threshold,
+                centers,
+            )
+            if cluster_index === nothing
+                push!(centers, candidate.projector)
+                push!(clusters, Any[candidate])
+            else
+                push!(clusters[cluster_index], candidate)
+            end
+        end
+        scheduled = Any[]
+        for depth in 1:maximum(length, clusters)
+            for cluster in clusters
+                depth <= length(cluster) && push!(scheduled, cluster[depth])
+            end
+        end
+        return scheduled, length(clusters)
+    end
+
+    accuracy_order = sort(
+        collect(usable_candidates);
+        by = candidate -> (
+            candidate.reconstruction_error,
+            candidate.coefficient_bits,
+            -candidate.tolerance,
+            candidate.method,
+            candidate.fingerprint,
+        ),
+    )
+    simplicity_order = sort(
+        collect(usable_candidates);
+        by = candidate -> (
+            candidate.coefficient_bits,
+            candidate.reconstruction_error,
+            -candidate.tolerance,
+            candidate.method,
+            candidate.fingerprint,
+        ),
+    )
+    accuracy_schedule, accuracy_cluster_count =
+        clustered_schedule(accuracy_order)
+    simplicity_schedule, simplicity_cluster_count =
+        clustered_schedule(simplicity_order)
+
+    # Preserve an accuracy-first prefix, then reserve a ladder of distinct
+    # low-complexity candidates. An unpromising numerical scout is not enough
+    # to reject an exact face, so the ladder is sized to the number of exact
+    # fallbacks that can actually be attempted.
+    scheduled = Any[]
+    seen = Set{Any}()
+    reserved_candidate_keys = Any[]
+    reserved_count = min(
+        length(simplicity_schedule),
+        max(
+            1,
+            min(
+                settings.facial_reduction_weighted_exact_without_scout_limit,
+                settings.facial_reduction_weighted_max_candidate_sets,
+            ),
+        ),
+    )
+    accuracy_prefix = min(
+        length(accuracy_schedule),
+        max(
+            0,
+            settings.facial_reduction_weighted_max_candidate_sets -
+            reserved_count,
+        ),
+    )
+    for candidate in Iterators.take(accuracy_schedule, accuracy_prefix)
+        push!(seen, candidate.key)
+        push!(scheduled, candidate)
+    end
+    for candidate in simplicity_schedule
+        length(reserved_candidate_keys) >= reserved_count && break
+        candidate.key in seen && continue
+        push!(reserved_candidate_keys, candidate.key)
+        push!(seen, candidate.key)
+        push!(scheduled, candidate)
+    end
+    for index in eachindex(accuracy_schedule)
+        for candidate in (accuracy_schedule[index], simplicity_schedule[index])
+            candidate.key in seen && continue
+            push!(seen, candidate.key)
+            push!(scheduled, candidate)
+        end
+    end
+    return (
+        candidates = scheduled,
+        cluster_count = max(accuracy_cluster_count, simplicity_cluster_count),
+        rejected_count = rejected_count,
+        reserved_candidate_keys,
+    )
+end
+
+function _weighted_subspace_candidate_plan(
+    candidates::Vector,
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    schedule = _weighted_subspace_candidate_schedule(candidates, settings, F)
+    cheap_exact_only = filter(candidate -> !candidate.numeric_usable, candidates)
+    return (
+        scheduled = schedule.candidates,
+        cheap_exact_only = cheap_exact_only,
+        exact_checks = vcat(schedule.candidates, cheap_exact_only),
+        cluster_count = schedule.cluster_count,
+        rejected_count = schedule.rejected_count,
+    )
 end
 
 function _facial_reduction_subspace_tolerances(
@@ -1037,6 +1525,186 @@ function _facial_reduction_subspace_tolerances(
     return sort!(unique(tolerances); rev = true)
 end
 
+function _weighted_subspace_attempt_key(
+    block_index::Int,
+    candidate,
+    settings::Settings,
+    ::Type{F},
+) where {F<:AbstractFloat}
+    return (
+        block_index,
+        candidate.key,
+        F,
+        F === BigFloat ? precision(BigFloat) : 0,
+        settings.facial_reduction_exposure_tolerance,
+        settings.facial_reduction_rank_tolerance,
+        settings.rational_tolerance,
+        settings.recovery_tolerance_shrink,
+    )
+end
+
+function _reserve_weighted_subspace_work!(
+    cache::_FacialReductionExactCache,
+    settings::Settings,
+    block_index::Int,
+    affine_products::Integer;
+    new_candidate::Bool,
+)
+    state = cache.weighted_search
+    block_candidate_sets = get(state.candidate_sets_attempted, block_index, 0)
+    if new_candidate &&
+       block_candidate_sets >= settings.facial_reduction_weighted_max_candidate_sets
+        return :candidate_limit
+    end
+    proposed_total = state.total_affine_products + BigInt(affine_products)
+    if proposed_total >
+       BigInt(settings.facial_reduction_weighted_max_total_affine_products)
+        return :product_limit
+    end
+    new_candidate &&
+        (state.candidate_sets_attempted[block_index] = block_candidate_sets + 1)
+    state.total_affine_products = proposed_total
+    return :reserved
+end
+
+function _weighted_subspace_budget_summary(
+    cache::_FacialReductionExactCache,
+    settings::Settings,
+    block_index::Int,
+)
+    state = cache.weighted_search
+    block_candidate_sets = get(state.candidate_sets_attempted, block_index, 0)
+    return "candidate_sets(block $(block_index))=$(block_candidate_sets)/$(settings.facial_reduction_weighted_max_candidate_sets), " *
+           "affine_products=$(state.total_affine_products)/$(settings.facial_reduction_weighted_max_total_affine_products), " *
+           "exact_without_scout=$(state.exact_without_scout_attempts)/$(settings.facial_reduction_weighted_exact_without_scout_limit)"
+end
+
+function _weighted_exact_without_scout_available(
+    cache::_FacialReductionExactCache,
+    settings::Settings;
+    reserve_count::Int = 0,
+)
+    limit = settings.facial_reduction_weighted_exact_without_scout_limit
+    effective_limit = max(0, limit - max(0, reserve_count))
+    return cache.weighted_search.exact_without_scout_attempts < effective_limit
+end
+
+function _weighted_subspace_candidate_remaining_work(
+    candidate,
+    cache::_FacialReductionExactCache,
+    settings::Settings,
+)
+    products = BigInt(0)
+    needs_candidate_slot = false
+    if _individual_subspace_certificate_is_small(candidate.individual_work, settings) &&
+       !(candidate.attempt_key in cache.individual_subspace_failures)
+        products += BigInt(candidate.individual_work.affine_products)
+        needs_candidate_slot = true
+    end
+    if _numeric_weighted_subspace_exposure_is_small(candidate.weighted_work, settings) &&
+       !haskey(cache.numeric_weighted_failures, candidate.attempt_key)
+        products += BigInt(candidate.weighted_work.affine_products)
+        needs_candidate_slot = true
+    end
+    if !candidate.cheap_weighted_attempted &&
+       _weighted_subspace_exposure_is_small(candidate.weighted_work, settings) &&
+       !(candidate.attempt_key in cache.exact_weighted_failures)
+        # A promising scout may still require the exact weighted fallback. Reserve
+        # enough work for that path instead of assuming that an unpromising scout
+        # will make it unnecessary.
+        products += BigInt(candidate.weighted_work.affine_products)
+        needs_candidate_slot = true
+    end
+    return (affine_products = products, candidate_slots = needs_candidate_slot ? 1 : 0)
+end
+
+function _work_reserved_weighted_subspace_candidate_schedule(
+    candidates::Vector,
+    reserved_candidate_keys::Vector,
+    cache::_FacialReductionExactCache,
+    settings::Settings,
+    block_index::Int,
+)
+    isempty(reserved_candidate_keys) && return (
+        candidates,
+        reserved_candidate_keys = Any[],
+        promoted_from = Int[],
+        promoted_to = nothing,
+        reserved_affine_products = BigInt(0),
+    )
+    keyed_candidates = Dict(candidate.key => candidate for candidate in candidates)
+    available_keys =
+        filter(key -> haskey(keyed_candidates, key), reserved_candidate_keys)
+    isempty(available_keys) && return (
+        candidates,
+        reserved_candidate_keys = Any[],
+        promoted_from = Int[],
+        promoted_to = nothing,
+        reserved_affine_products = BigInt(0),
+    )
+
+    available_products = max(
+        BigInt(0),
+        BigInt(settings.facial_reduction_weighted_max_total_affine_products) -
+        cache.weighted_search.total_affine_products,
+    )
+    available_candidate_slots = max(
+        0,
+        settings.facial_reduction_weighted_max_candidate_sets -
+        get(cache.weighted_search.candidate_sets_attempted, block_index, 0),
+    )
+
+    retained_keys = Any[]
+    reserved_products = BigInt(0)
+    reserved_candidate_slots = 0
+    for key in available_keys
+        work = _weighted_subspace_candidate_remaining_work(
+            keyed_candidates[key],
+            cache,
+            settings,
+        )
+        reserved_products + work.affine_products > available_products && break
+        reserved_candidate_slots + work.candidate_slots >
+        available_candidate_slots && break
+        push!(retained_keys, key)
+        reserved_products += work.affine_products
+        reserved_candidate_slots += work.candidate_slots
+    end
+    isempty(retained_keys) && return (
+        candidates,
+        reserved_candidate_keys = Any[],
+        promoted_from = Int[],
+        promoted_to = nothing,
+        reserved_affine_products = BigInt(0),
+    )
+
+    reserved_key_set = Set(retained_keys)
+    original_positions = [
+        findfirst(candidate -> candidate.key == key, candidates) for
+        key in retained_keys
+    ]
+    reserved_candidates = [keyed_candidates[key] for key in retained_keys]
+    remaining_candidates =
+        filter(candidate -> !(candidate.key in reserved_key_set), candidates)
+    # Exact structural faces commonly have very small rational coefficients,
+    # whereas a slightly better numerical fit can carry thousands of bits.
+    # Try the reserved low-complexity ladder first. Merely reserving enough
+    # work for it still lets expensive overfit candidates consume many
+    # minutes before the useful candidate is reached.
+    reordered = vcat(reserved_candidates, remaining_candidates)
+    promoted_to = 1
+    already_in_place =
+        original_positions ==
+        collect(promoted_to:(promoted_to + length(retained_keys) - 1))
+    return (
+        candidates = reordered,
+        reserved_candidate_keys = retained_keys,
+        promoted_from = already_in_place ? Int[] : original_positions,
+        promoted_to = already_in_place ? nothing : promoted_to,
+        reserved_affine_products = reserved_products,
+    )
+end
+
 function _linearly_independent_directions(directions::Vector{Vector{ExactRational}})
     isempty(directions) && return directions
     matrix = hcat(directions...)
@@ -1055,184 +1723,469 @@ function _certified_pivoted_subspace_directions(
     description::AbstractString,
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
+    tolerances = nothing,
+    candidate_limit::Union{Nothing,Int} = nothing,
+    probe_coarsest_candidate::Bool = true,
 ) where {F<:AbstractFloat}
-    attempted_tolerances = 0
-    proposed_directions = 0
-    last_violation = nothing
-    seen_subspaces = Set{Any}()
-    for tolerance in _facial_reduction_subspace_tolerances(opt.settings, F)
-        candidate_sets = _rational_subspace_candidate_sets(
+    selected_tolerances =
+        tolerances === nothing ?
+        _facial_reduction_subspace_tolerances(opt.settings, F) :
+        collect(tolerances)
+    if probe_coarsest_candidate && length(selected_tolerances) > 1
+        coarse_directions = _certified_pivoted_subspace_directions(
+            opt,
+            problem,
+            block,
+            block_index,
             subspace,
-            opt.settings,
             F,
-            tolerance,
+            description;
+            cache,
+            tolerances = selected_tolerances[1:1],
+            candidate_limit = 1,
+            probe_coarsest_candidate = false,
         )
+        isempty(coarse_directions) || return coarse_directions
+        return _certified_pivoted_subspace_directions(
+            opt,
+            problem,
+            block,
+            block_index,
+            subspace,
+            F,
+            description;
+            cache,
+            tolerances = selected_tolerances,
+            probe_coarsest_candidate = false,
+        )
+    end
+
+    # Generate and exactly deduplicate every tolerance/chart reconstruction
+    # before launching work whose cost scales with the affine nullspace.
+    attempted_tolerances = 0
+    generated_candidate_sets = 0
+    seen_subspaces = Set{Any}()
+    candidates = Any[]
+    for tolerance in selected_tolerances
+        candidate_sets =
+            _rational_subspace_candidate_sets(subspace, opt.settings, F, tolerance)
         isempty(candidate_sets) && continue
         attempted_tolerances += 1
         for candidate_set in candidate_sets
-        candidates = candidate_set.directions
-        subspace_key = _canonical_rational_subspace_key(candidates)
-        subspace_key in seen_subspaces && continue
-        push!(seen_subspaces, subspace_key)
-        proposed_directions += length(candidates)
-        _record_directions!(:certified, length(candidates), 0, 0)
-        if attempted_tolerances == 1 &&
-           !_facial_reduction_row_space_is_small(problem, opt.settings)
-            row_count, variable_count = size(problem.A)
-            _log(
-                opt,
-                "Facial reduction: certifying pivoted $(description) candidates with exact affine tests; skipping dense row-space provenance for large affine system ($(row_count)×$(variable_count))",
-            )
+            generated_candidate_sets += 1
+            candidate_set.key in seen_subspaces && continue
+            push!(seen_subspaces, candidate_set.key)
+            push!(candidates, (candidate_set..., tolerance = tolerance))
+            candidate_limit !== nothing &&
+                length(candidates) >= candidate_limit &&
+                break
         end
+        candidate_limit !== nothing &&
+            length(candidates) >= candidate_limit &&
+            break
+    end
+    isempty(candidates) && return Vector{ExactRational}[]
 
+    plan = _weighted_subspace_candidate_plan(candidates, opt.settings, F)
+    unusable_candidates = plan.cheap_exact_only
+    scheduled_candidates = plan.scheduled
+    exact_check_candidates = plan.exact_checks
+    if plan.rejected_count > 0
+        examples = join(
+            [
+                "fingerprint=$(candidate.fingerprint), relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), reason=$(candidate.numeric_issue)" for
+                candidate in Iterators.take(unusable_candidates, 3)
+            ],
+            "; ",
+        )
+        suffix =
+            plan.rejected_count > 3 ? "; $(plan.rejected_count - 3) more omitted" : ""
+        _log(
+            opt,
+            "Facial reduction: retained $(plan.rejected_count) numerically unusable pivoted $(description) candidate subspace(s) for cheap exact checks but excluded them from weighted scheduling ($(examples)$(suffix))",
+        )
+    end
+    _log(
+        opt,
+        "Facial reduction: collected $(length(exact_check_candidates)) unique pivoted $(description) candidate subspace(s) from $(generated_candidate_sets) reconstruction(s) across $(attempted_tolerances) relation tolerance(s); scheduled $(length(scheduled_candidates)) numerically usable candidate(s) in $(plan.cluster_count) approximate projector cluster(s)",
+    )
+    if !_facial_reduction_row_space_is_small(problem, opt.settings)
+        row_count, variable_count = size(problem.A)
+        _log(
+            opt,
+            "Facial reduction: certifying pivoted $(description) candidates with exact affine tests; skipping dense row-space provenance for large affine system ($(row_count)x$(variable_count))",
+        )
+    end
+
+    proposed_directions = 0
+    last_violation = nothing
+    weighted_candidates = Any[]
+    # Basis-invariant trace checks and explicitly cheap weighted checks remain
+    # available to every candidate. They can certify a face before any global
+    # expensive-work budget is consumed.
+    for candidate in exact_check_candidates
+        directions = candidate.directions
+        proposed_directions += length(directions)
+        _record_directions!(:certified, length(directions), 0, 0)
         joint_violation = _block_trace_vanish_violation(
             problem,
             block,
-            candidates;
+            directions;
             cache,
             block_index,
         )
         if joint_violation === nothing
-            _record_directions!(:certified, 0, length(candidates), 0)
+            _record_directions!(:certified, 0, length(directions), 0)
             _log(
                 opt,
-                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (joint PSD trace certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)))",
+                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (joint PSD trace certificate; $(length(directions)) direction(s); relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint))",
             )
-            return candidates
+            return directions
         end
         last_violation = joint_violation
 
-        weighted_work = _weighted_subspace_exposure_work(
-            problem,
-            block,
-            length(candidates),
-        )
-        weighted_attempted = false
-        if _weighted_subspace_exposure_is_cheap(weighted_work, opt.settings)
+        work = _weighted_subspace_exposure_work(problem, block, length(directions))
+        attempt_key =
+            _weighted_subspace_attempt_key(block_index, candidate, opt.settings, F)
+        cheap_weighted_attempted =
+            _weighted_subspace_exposure_is_cheap(work, opt.settings) &&
+            _weighted_subspace_exposure_is_small(work, opt.settings)
+        if cheap_weighted_attempted
             _log(
                 opt,
-                "Facial reduction: attempting cheap exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
+                "Facial reduction: cheap exact weighted candidate for PSD block $(block_index) (relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), affine_products=$(work.affine_products))",
             )
-            weighted_attempted = true
-            weighted_exposure = _block_weighted_subspace_exposure(
-                problem,
-                block,
-                candidates,
-                opt.settings,
-                F,
-            )
-            if weighted_exposure !== nothing
-                _record_directions!(:certified, 0, length(candidates), 0)
-                _log(
-                    opt,
-                    "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
-                )
-                return candidates
-            end
-        end
-
-        individual_work = _individual_subspace_certificate_work(
-            problem,
-            block,
-            length(candidates),
-        )
-        accepted = Vector{Vector{ExactRational}}()
-        rejected = 0
-        if _individual_subspace_certificate_is_small(individual_work, opt.settings)
-            for direction in candidates
-                violation = _block_annihilation_violation(
+            weighted_exposure = if attempt_key in cache.exact_weighted_failures
+                nothing
+            else
+                result = _block_weighted_subspace_exposure(
                     problem,
                     block,
-                    direction;
-                    cache,
-                    block_index,
-                )
-                if violation === nothing
-                    push!(accepted, direction)
-                else
-                    rejected += 1
-                    last_violation = violation
-                end
-            end
-        else
-            _log(
-                opt,
-                "Facial reduction: skipping individual direction certificates for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(individual_work.affine_dimension), affine_products=$(individual_work.affine_products); limit affine_products=$(opt.settings.facial_reduction_individual_max_affine_products))",
-            )
-        end
-        _record_directions!(:certified, 0, length(accepted), rejected)
-
-        accepted = _linearly_independent_directions(accepted)
-        if !isempty(accepted)
-            _log(
-                opt,
-                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s); relation_tol=$(_format_metric(tolerance)))",
-            )
-            return accepted
-        end
-
-        if _numeric_weighted_subspace_exposure_is_small(weighted_work, opt.settings)
-            _log(
-                opt,
-                "Facial reduction: attempting numerical weighted scout for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
-            )
-            numeric_weighted_exposure = _numeric_weighted_subspace_exposure(
-                problem,
-                block,
-                candidates,
-                opt.settings,
-                F,
-            )
-            if numeric_weighted_exposure !== nothing
-                _record_directions!(:certified, 0, length(candidates), 0)
-                _log(
-                    opt,
-                    "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (numerical-to-exact weighted PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(numeric_weighted_exposure.tolerance)))",
-                )
-                return candidates
-            end
-        else
-            _log(
-                opt,
-                "Facial reduction: skipping numerical weighted scout for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products); limits form_entries=$(opt.settings.facial_reduction_numeric_weighted_subspace_max_form_entries), affine_products=$(opt.settings.facial_reduction_numeric_weighted_subspace_max_affine_products))",
-            )
-        end
-
-        if !weighted_attempted
-            if _weighted_subspace_exposure_is_small(weighted_work, opt.settings)
-                _log(
-                    opt,
-                    "Facial reduction: attempting exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products))",
-                )
-                weighted_exposure = _block_weighted_subspace_exposure(
-                    problem,
-                    block,
-                    candidates,
+                    directions,
                     opt.settings,
                     F,
                 )
-                if weighted_exposure !== nothing
-                    _record_directions!(:certified, 0, length(candidates), 0)
-                    _log(
-                        opt,
-                        "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(candidates)) direction(s); relation_tol=$(_format_metric(tolerance)), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
-                    )
-                    return candidates
-                end
-            else
+                result === nothing &&
+                    push!(cache.exact_weighted_failures, attempt_key)
+                result
+            end
+            if weighted_exposure !== nothing
+                exposure_directions = weighted_exposure.directions
+                _record_directions!(
+                    :certified,
+                    0,
+                    length(exposure_directions),
+                    0,
+                )
                 _log(
                     opt,
-                    "Facial reduction: skipping exact weighted joint certificate for PSD block $(block_index) ($(length(candidates)) direction(s); affine_dim=$(weighted_work.affine_dimension), block_entries=$(weighted_work.block_entries), weights=$(weighted_work.weight_dimension), form_entries=$(weighted_work.form_entries), affine_products=$(weighted_work.affine_products); limits form_entries=$(opt.settings.facial_reduction_weighted_subspace_max_form_entries), affine_products=$(opt.settings.facial_reduction_weighted_subspace_max_affine_products))",
+                    "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(exposure_directions))/$(length(directions)) direction(s); relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
                 )
+                return exposure_directions
             end
         end
-    end
+        candidate.numeric_usable || continue
+
+        push!(
+            weighted_candidates,
+            (
+                candidate...,
+                weighted_work = work,
+                individual_work = _individual_subspace_certificate_work(
+                    problem,
+                    block,
+                    length(directions),
+                ),
+                attempt_key = attempt_key,
+                cheap_weighted_attempted = cheap_weighted_attempted,
+                joint_violation = joint_violation,
+            ),
+        )
     end
 
+    weighted_schedule =
+        _weighted_subspace_candidate_schedule(weighted_candidates, opt.settings, F)
+    work_reserved_schedule = _work_reserved_weighted_subspace_candidate_schedule(
+        weighted_schedule.candidates,
+        weighted_schedule.reserved_candidate_keys,
+        cache,
+        opt.settings,
+        block_index,
+    )
+    weighted_candidates = work_reserved_schedule.candidates
+    reserved_candidate_key_set =
+        Set(work_reserved_schedule.reserved_candidate_keys)
+    function reserved_candidate_needs_exact(candidate)
+        return candidate.key in reserved_candidate_key_set &&
+            opt.settings.facial_reduction_weighted_exact_without_scout_limit > 0 &&
+            !candidate.cheap_weighted_attempted &&
+            _weighted_subspace_exposure_is_small(
+                candidate.weighted_work,
+                opt.settings,
+            ) &&
+            !(candidate.attempt_key in cache.exact_weighted_failures)
+    end
+    reserved_candidate_indices = [
+        index for (index, candidate) in enumerate(weighted_candidates) if
+        reserved_candidate_needs_exact(candidate)
+    ]
+    if work_reserved_schedule.promoted_to !== nothing
+        promoted_from = join(work_reserved_schedule.promoted_from, ", ")
+        promoted_range = work_reserved_schedule.promoted_to:(
+            work_reserved_schedule.promoted_to +
+            length(work_reserved_schedule.reserved_candidate_keys) - 1
+        )
+        promoted_candidates = weighted_candidates[promoted_range]
+        candidate_details = join(
+            [
+                "relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), coefficient_bits=$(candidate.coefficient_bits)" for
+                candidate in promoted_candidates
+            ],
+            "; ",
+        )
+        _log(
+            opt,
+            "Facial reduction: promoted reserved low-complexity $(description) candidate ladder for PSD block $(block_index) from scheduled position(s) $(promoted_from) to $(first(promoted_range))-$(last(promoted_range)) to preserve $(work_reserved_schedule.reserved_affine_products) affine products of remaining work ($(candidate_details))",
+        )
+    end
+    start_candidates = get(cache.weighted_search.candidate_sets_attempted, block_index, 0)
+    start_products = cache.weighted_search.total_affine_products
+    cached_failures = 0
+    budget_truncated = false
+    # Approximate projector clusters diversify this order. The cluster test is
+    # only a scheduling heuristic; all accepted faces still pass exact checks.
+    for (scheduled_index, candidate) in enumerate(weighted_candidates)
+        work = candidate.weighted_work
+        candidate_started = false
+        scout_promising = false
+        scout_status = :skipped
+        scout_reason = "disabled by its per-candidate work limit"
+        last_violation = candidate.joint_violation
+
+        if _individual_subspace_certificate_is_small(
+            candidate.individual_work,
+            opt.settings,
+        )
+            if candidate.attempt_key in cache.individual_subspace_failures
+                cached_failures += 1
+            else
+                reservation = _reserve_weighted_subspace_work!(
+                    cache,
+                    opt.settings,
+                    block_index,
+                    candidate.individual_work.affine_products;
+                    new_candidate = true,
+                )
+                if reservation !== :reserved
+                    _log(
+                        opt,
+                        "Facial reduction: subspace candidate search reached the $(reservation === :candidate_limit ? "candidate-set" : "cumulative-product") limit before individual checks for scheduled candidate $(scheduled_index)/$(length(weighted_candidates)); $(_weighted_subspace_budget_summary(cache, opt.settings, block_index))",
+                    )
+                    budget_truncated = true
+                    break
+                end
+                candidate_started = true
+                _log(
+                    opt,
+                    "Facial reduction: weighted candidate $(get(cache.weighted_search.candidate_sets_attempted, block_index, 0))/$(opt.settings.facial_reduction_weighted_max_candidate_sets) for PSD block $(block_index): individual exact direction checks (scheduled=$(scheduled_index)/$(length(weighted_candidates)), relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), affine_products=$(candidate.individual_work.affine_products), cumulative_products=$(cache.weighted_search.total_affine_products)/$(opt.settings.facial_reduction_weighted_max_total_affine_products))",
+                )
+                accepted = Vector{Vector{ExactRational}}()
+                rejected = 0
+                for direction in candidate.directions
+                    violation = _block_annihilation_violation(
+                        problem,
+                        block,
+                        direction;
+                        cache,
+                        block_index,
+                    )
+                    if violation === nothing
+                        push!(accepted, direction)
+                    else
+                        rejected += 1
+                        last_violation = violation
+                    end
+                end
+                _record_directions!(:certified, 0, length(accepted), rejected)
+                accepted = _linearly_independent_directions(accepted)
+                if !isempty(accepted)
+                    _log(
+                        opt,
+                        "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) ($(length(accepted)) direction(s); relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint))",
+                    )
+                    return accepted
+                end
+                push!(cache.individual_subspace_failures, candidate.attempt_key)
+            end
+        end
+
+        if _numeric_weighted_subspace_exposure_is_small(work, opt.settings)
+            if haskey(cache.numeric_weighted_failures, candidate.attempt_key)
+                cached_failures += 1
+                cached_scout =
+                    cache.numeric_weighted_failures[candidate.attempt_key]
+                scout_promising = cached_scout.promising
+                scout_status = cached_scout.status
+                scout_reason = "cached: $(cached_scout.reason)"
+            else
+                reservation = _reserve_weighted_subspace_work!(
+                    cache,
+                    opt.settings,
+                    block_index,
+                    work.affine_products;
+                    new_candidate = !candidate_started,
+                )
+                if reservation !== :reserved
+                    _log(
+                        opt,
+                        "Facial reduction: weighted candidate search reached the $(reservation === :candidate_limit ? "candidate-set" : "cumulative-product") limit before scheduled candidate $(scheduled_index)/$(length(weighted_candidates)); $(_weighted_subspace_budget_summary(cache, opt.settings, block_index))",
+                    )
+                    budget_truncated = true
+                    break
+                end
+                candidate_started = true
+                _log(
+                    opt,
+                    "Facial reduction: weighted candidate $(get(cache.weighted_search.candidate_sets_attempted, block_index, 0))/$(opt.settings.facial_reduction_weighted_max_candidate_sets) for PSD block $(block_index): numerical scout (scheduled=$(scheduled_index)/$(length(weighted_candidates)), relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), reconstruction_error=$(_format_metric(candidate.reconstruction_error)), coefficient_bits=$(candidate.coefficient_bits), affine_products=$(work.affine_products), cumulative_products=$(cache.weighted_search.total_affine_products)/$(opt.settings.facial_reduction_weighted_max_total_affine_products))",
+                )
+                scout = _numeric_weighted_subspace_exposure_attempt(
+                    problem,
+                    block,
+                    candidate.directions,
+                    opt.settings,
+                    F,
+                )
+                if scout.exposure !== nothing
+                    exposure_directions = scout.exposure.directions
+                    _record_directions!(
+                        :certified,
+                        0,
+                        length(exposure_directions),
+                        0,
+                    )
+                    _log(
+                        opt,
+                        "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (numerical-to-exact weighted PSD certificate; $(length(exposure_directions))/$(length(candidate.directions)) direction(s); relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), weight_tol=$(_format_metric(scout.exposure.tolerance)))",
+                    )
+                    return exposure_directions
+                end
+                scout_promising = scout.promising
+                scout_status = scout.status
+                scout_reason = scout.reason
+                cache.numeric_weighted_failures[candidate.attempt_key] = (
+                    promising = scout.promising,
+                    status = scout.status,
+                    reason = scout.reason,
+                )
+                if scout.status === :unavailable
+                    _log(
+                        opt,
+                        "Facial reduction: weighted candidate fingerprint=$(candidate.fingerprint) numerical scout unavailable ($(scout_reason))",
+                    )
+                else
+                    _log(
+                        opt,
+                        "Facial reduction: weighted candidate fingerprint=$(candidate.fingerprint) numerical scout did not certify a face (status=$(scout.status), $(scout_reason))",
+                    )
+                end
+            end
+        end
+
+        candidate.cheap_weighted_attempted && continue
+        _weighted_subspace_exposure_is_small(work, opt.settings) || continue
+        if candidate.attempt_key in cache.exact_weighted_failures
+            cached_failures += 1
+            continue
+        end
+        future_reserved_indices =
+            filter(index -> index > scheduled_index, reserved_candidate_indices)
+        reserved_exact_count = length(future_reserved_indices)
+        exact_without_scout =
+            !scout_promising &&
+            _weighted_exact_without_scout_available(
+                cache,
+                opt.settings;
+                reserve_count = reserved_exact_count,
+            )
+        if !scout_promising && !exact_without_scout
+            if reserved_exact_count > 0 &&
+               !(candidate.key in reserved_candidate_key_set) &&
+               _weighted_exact_without_scout_available(cache, opt.settings)
+                reserved_positions = join(future_reserved_indices, ", ")
+                _log(
+                    opt,
+                    "Facial reduction: weighted candidate fingerprint=$(candidate.fingerprint) exact certificate skipped after an unpromising numerical scout; preserving $(reserved_exact_count) exact-without-scout attempt(s) for the reserved low-complexity candidates at scheduled position(s) $(reserved_positions)",
+                )
+                continue
+            end
+            scout_description =
+                scout_status === :unavailable ? "an unavailable numerical scout" :
+                scout_status === :unpromising ? "an unpromising numerical scout" :
+                "no promising numerical scout"
+            _log(
+                opt,
+                "Facial reduction: weighted candidate fingerprint=$(candidate.fingerprint) exact certificate skipped after $(scout_description); exact-without-scout allowance exhausted",
+            )
+            continue
+        end
+
+        reservation = _reserve_weighted_subspace_work!(
+            cache,
+            opt.settings,
+            block_index,
+            work.affine_products;
+            new_candidate = !candidate_started,
+        )
+        if reservation !== :reserved
+            _log(
+                opt,
+                "Facial reduction: exact weighted certificate for fingerprint=$(candidate.fingerprint) skipped by the $(reservation === :candidate_limit ? "candidate-set" : "cumulative-product") limit; $(_weighted_subspace_budget_summary(cache, opt.settings, block_index))",
+            )
+            budget_truncated = true
+            break
+        end
+        exact_without_scout &&
+            (cache.weighted_search.exact_without_scout_attempts += 1)
+        _log(
+            opt,
+            "Facial reduction: weighted candidate $(get(cache.weighted_search.candidate_sets_attempted, block_index, 0))/$(opt.settings.facial_reduction_weighted_max_candidate_sets) for PSD block $(block_index): exact joint certificate (relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), scout_status=$(scout_status), scout=$(scout_reason), affine_products=$(work.affine_products), cumulative_products=$(cache.weighted_search.total_affine_products)/$(opt.settings.facial_reduction_weighted_max_total_affine_products))",
+        )
+        weighted_exposure = _block_weighted_subspace_exposure(
+            problem,
+            block,
+            candidate.directions,
+            opt.settings,
+            F,
+        )
+        if weighted_exposure !== nothing
+            exposure_directions = weighted_exposure.directions
+            _record_directions!(
+                :certified,
+                0,
+                length(exposure_directions),
+                0,
+            )
+            _log(
+                opt,
+                "Facial reduction: using certified pivoted $(description) subspace for PSD block $(block_index) (weighted joint PSD certificate; $(length(exposure_directions))/$(length(candidate.directions)) direction(s); relation_tol=$(_format_metric(candidate.tolerance)), method=$(candidate.method), fingerprint=$(candidate.fingerprint), weight_tol=$(_format_metric(weighted_exposure.tolerance)))",
+            )
+            return exposure_directions
+        end
+        push!(cache.exact_weighted_failures, candidate.attempt_key)
+    end
+
+    delta_candidates =
+        get(cache.weighted_search.candidate_sets_attempted, block_index, 0) -
+        start_candidates
+    delta_products = cache.weighted_search.total_affine_products - start_products
+    _log(
+        opt,
+        "Facial reduction: weighted $(description) search summary for PSD block $(block_index): scheduled=$(length(weighted_candidates)), attempted=$(delta_candidates), affine_products=$(delta_products), cached_failures=$(cached_failures), truncated_by_budget=$(budget_truncated); $(_weighted_subspace_budget_summary(cache, opt.settings, block_index))",
+    )
     proposed_directions == 0 && return Vector{ExactRational}[]
     _log(
         opt,
-        "Facial reduction: rejected joint $(description) candidates for PSD block $(block_index) across $(attempted_tolerances) relation tolerance(s); no exact subspace certificate for $(proposed_directions) deduplicated proposed direction(s) ($(last_violation))",
+        "Facial reduction: no exact subspace certificate recovered from $(length(exact_check_candidates)) unique joint $(description) candidate(s) for PSD block $(block_index) across $(attempted_tolerances) relation tolerance(s); $(proposed_directions) direction proposal(s) checked$(budget_truncated ? " before the weighted search budget was exhausted" : "") ($(last_violation))",
     )
     return Vector{ExactRational}[]
 end
@@ -1741,32 +2694,43 @@ function _tentative_feasibility_search_problem(
     if batch_problem.affine !== nothing
         fallback_problem = nothing
         if length(unique_candidates) > 1
-            _log(
-                opt,
-                "Feasibility search: building optional conservative one-direction fallback",
-            )
-            conservative_checkpoint = stage -> _log(
-                opt,
-                "Feasibility search: conservative fallback: $(stage)",
-            )
-            conservative_problem = _tentative_batch_problem(
-                problem,
-                unique_candidates[1:1],
-                checkpoint = conservative_checkpoint,
-                settings = opt.settings,
-            )
-            if conservative_problem.affine !== nothing &&
-               _barrier_dimension(conservative_problem) >
-               _barrier_dimension(batch_problem)
-                fallback_problem = conservative_problem
+            conservative_candidates = unique_candidates[1:1]
+            conservative_work =
+                _tentative_batch_work(problem, conservative_candidates)
+            if _tentative_batch_within_budget(conservative_work, opt.settings)
                 _log(
                     opt,
-                    "Feasibility search: retained the conservative one-direction fallback",
+                    "Feasibility search: building optional conservative one-direction fallback",
                 )
+                conservative_checkpoint = stage -> _log(
+                    opt,
+                    "Feasibility search: conservative fallback: $(stage)",
+                )
+                conservative_problem = _tentative_batch_problem(
+                    problem,
+                    conservative_candidates;
+                    checkpoint = conservative_checkpoint,
+                    settings = opt.settings,
+                )
+                if conservative_problem.affine !== nothing &&
+                   _barrier_dimension(conservative_problem) >
+                   _barrier_dimension(batch_problem)
+                    fallback_problem = conservative_problem
+                    _log(
+                        opt,
+                        "Feasibility search: retained the conservative one-direction fallback",
+                    )
+                else
+                    _log(
+                        opt,
+                        "Feasibility search: discarded the conservative one-direction fallback",
+                    )
+                end
             else
+                _record_facial_reduction_event!(:tentative_batches_skipped_by_budget)
                 _log(
                     opt,
-                    "Feasibility search: discarded the conservative one-direction fallback",
+                    "Feasibility search: skipped optional conservative one-direction fallback because it exceeds the work budget ($(_tentative_batch_work_summary(conservative_work, opt.settings)))",
                 )
             end
         end
@@ -1965,6 +2929,13 @@ function _facial_reduction_oracle_allows_candidate_status(status)
     )
 end
 
+function _facial_reduction_oracle_recommends_precision_retry(status)
+    # A near infeasibility certificate is deliberately tolerance-based. Retry
+    # it at the next configured precision before concluding that no normalized
+    # exposing vector exists.
+    return status == Hypatia.Solvers.NearPrimalInfeasible
+end
+
 function _facial_reduction_oracle_attempt(
     opt::Optimizer,
     problem::ProblemData,
@@ -2042,7 +3013,10 @@ function _facial_reduction_oracle_attempt(
                 "Facial reduction oracle: status=$(status), time=$(@sprintf("%.2f", elapsed_sec))s",
             )
             record_oracle(Hypatia.Solvers.get_num_iters(solver))
-            return attempt_result(nothing, false)
+            return attempt_result(
+                nothing,
+                _facial_reduction_oracle_recommends_precision_retry(status),
+            )
         end
         candidate = try
             vec(collect(Hypatia.Solvers.get_x(solver)))
@@ -2430,7 +3404,6 @@ end
 
 const _FACIAL_REDUCTION_CACHE_MAGIC = "RationalSDP facial reduction cache"
 const _FACIAL_REDUCTION_CACHE_VERSION = 2
-const _FACIAL_REDUCTION_CACHE_READABLE_VERSIONS = (1, _FACIAL_REDUCTION_CACHE_VERSION)
 
 function _facial_reduction_cache_path(path::AbstractString)
     stripped = strip(path)
@@ -2442,7 +3415,7 @@ function _facial_reduction_cache_records(payload)
         throw(ArgumentError("Facial reduction cache is not a RationalSDP cache payload."))
     (:magic in keys(payload) && payload.magic == _FACIAL_REDUCTION_CACHE_MAGIC) ||
         throw(ArgumentError("Facial reduction cache has an unrecognized file header."))
-    (:version in keys(payload) && payload.version in _FACIAL_REDUCTION_CACHE_READABLE_VERSIONS) ||
+    (:version in keys(payload) && payload.version == _FACIAL_REDUCTION_CACHE_VERSION) ||
         throw(ArgumentError("Unsupported facial reduction cache version."))
     (:records in keys(payload) && payload.records isa AbstractVector) ||
         throw(ArgumentError("Facial reduction cache is missing its record list."))
@@ -2465,7 +3438,11 @@ function _read_facial_reduction_cache(path::AbstractString; missing_ok::Bool = f
     return _facial_reduction_cache_records(payload)
 end
 
-function _write_facial_reduction_cache(path::AbstractString, records::Vector{Any})
+function _write_facial_reduction_cache(
+    path::AbstractString,
+    records::Vector{Any};
+    overwrite::Bool = true,
+)
     full_path = abspath(path)
     mkpath(dirname(full_path))
     payload = (
@@ -2477,7 +3454,7 @@ function _write_facial_reduction_cache(path::AbstractString, records::Vector{Any
     try
         Serialization.serialize(io, payload)
         close(io)
-        mv(temporary_path, full_path; force = true)
+        mv(temporary_path, full_path; force = overwrite)
     catch
         isopen(io) && close(io)
         rm(temporary_path; force = true)
@@ -2521,6 +3498,14 @@ function _loaded_facial_reduction_records!(opt::Optimizer)
         )
     end
     return opt.facial_reduction_loaded_records
+end
+
+function _checkpoint_loaded_facial_reductions_to_distinct_file(opt::Optimizer)
+    save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
+    load_path = _facial_reduction_cache_path(opt.settings.facial_reduction_load_file)
+    return save_path !== nothing &&
+           load_path !== nothing &&
+           abspath(save_path) != abspath(load_path)
 end
 
 function _facial_reduction_block_signature(block::BlockStructure)
@@ -2569,14 +3554,6 @@ function _facial_reduction_signature_matches(problem::ProblemData, signature)
         _facial_reduction_problem_signature(problem),
         signature,
     )
-end
-
-function _facial_reduction_signature_match_kind(problem::ProblemData, signature)
-    _facial_reduction_signature_matches(problem, signature) && return :current
-    legacy = problem.legacy_facial_reduction_signature
-    legacy === nothing && return :none
-    return _facial_reduction_signature_matches_signature(legacy, signature) ?
-           :legacy : :none
 end
 
 function _facial_reduction_record(
@@ -2630,14 +3607,12 @@ function _record_successful_facial_reduction!(
 )
     save_path = _facial_reduction_cache_path(opt.settings.facial_reduction_save_file)
     save_path === nothing && return
+    attached_exposing_slack = false
     if reduction.exposing_slack === nothing
         upgraded = _with_exact_exposing_slack(problem, reduction, opt.settings)
         if upgraded !== nothing
             reduction = upgraded
-            _log(
-                opt,
-                "Facial reduction: attached a composable exact exposing slack before checkpointing",
-            )
+            attached_exposing_slack = true
         end
     end
     target = supersedes === nothing ? reduction : supersedes
@@ -2656,6 +3631,16 @@ function _record_successful_facial_reduction!(
         push!(replace_indices, record_index)
     end
     new_record = _facial_reduction_record(problem, reduction)
+    if length(replace_indices) == 1 &&
+       isequal(opt.facial_reduction_save_records[only(replace_indices)], new_record)
+        return
+    end
+    if attached_exposing_slack
+        _log(
+            opt,
+            "Facial reduction: attached a composable exact exposing slack before checkpointing",
+        )
+    end
     if isempty(replace_indices)
         push!(opt.facial_reduction_save_records, new_record)
     else
@@ -2710,37 +3695,6 @@ function _cached_facial_reduction(record)
         exposed_scalars,
         keep_bases,
         exposing_slack,
-    )
-end
-
-function _remap_legacy_cached_reduction(
-    problem::ProblemData,
-    reduction::_CertifiedFacialReduction,
-)
-    mapped_scalars = Int[]
-    for legacy_position in reduction.exposed_scalars
-        1 <= legacy_position <= length(problem.legacy_position_map) || return nothing
-        current_position = problem.legacy_position_map[legacy_position]
-        current_position > 0 || return nothing
-        push!(mapped_scalars, current_position)
-    end
-    mapped_slack = if reduction.exposing_slack === nothing
-        nothing
-    else
-        length(reduction.exposing_slack) == size(problem.legacy_coordinate_lift, 1) ||
-            return nothing
-        Vector{ExactRational}(
-            transpose(problem.legacy_coordinate_lift) * reduction.exposing_slack,
-        )
-    end
-    # A cached exposing slack is a covector in the old expanded coordinates.
-    # Pull it back through the exact legacy-coordinate lift so coupled
-    # certificates across several PSD blocks remain available for validation.
-    return _CertifiedFacialReduction(
-        reduction.source,
-        unique(sort(mapped_scalars)),
-        copy(reduction.keep_bases),
-        mapped_slack,
     )
 end
 
@@ -2867,7 +3821,8 @@ function _reconstruct_exact_exposing_slack(
             settings,
             _facial_reduction_float_type(settings),
         )
-        block_slack = if exposure === nothing
+        block_slack = if exposure === nothing ||
+                         length(exposure.directions) != length(directions)
             matrix = zeros(ExactRational, block.size, block.size)
             for direction in directions
                 certificate = _block_face_direction_certificate(
@@ -2972,7 +3927,10 @@ function _cached_keep_basis_violation(
         settings,
         _facial_reduction_float_type(settings),
     )
-    weighted_exposure === nothing || return nothing
+    if weighted_exposure !== nothing &&
+       length(weighted_exposure.directions) == length(directions)
+        return nothing
+    end
 
     cache = _FacialReductionExactCache(problem)
     last_violation = nothing
@@ -3067,8 +4025,7 @@ function _apply_loaded_facial_reductions(
     for record in records
         record isa NamedTuple || continue
         (:signature in keys(record)) || continue
-        match_kind = _facial_reduction_signature_match_kind(current, record.signature)
-        match_kind == :none && continue
+        _facial_reduction_signature_matches(current, record.signature) || continue
         matched += 1
 
         reduction = try
@@ -3081,21 +4038,6 @@ function _apply_loaded_facial_reductions(
             _log(opt, "Facial reduction: skipped malformed cache record")
             continue
         end
-        if match_kind == :legacy
-            reduction = _remap_legacy_cached_reduction(current, reduction)
-            if reduction === nothing
-                _log(
-                    opt,
-                    "Facial reduction: legacy cache record could not be mapped to compact coordinates",
-                )
-                continue
-            end
-            _log(
-                opt,
-                "Facial reduction: matched legacy expanded-coordinate cache record to compact coordinates",
-            )
-        end
-
         violation = _cached_facial_reduction_violation(current, reduction, opt.settings)
         if violation !== nothing
             _log(opt, "Facial reduction: cached face did not validate ($(violation))")
@@ -3107,7 +4049,7 @@ function _apply_loaded_facial_reductions(
         if reduction_with_slack === nothing
             _log(
                 opt,
-                "Facial reduction: cached face validated, but its legacy certificate could not be upgraded to a composable exact exposing slack",
+                "Facial reduction: cached face validated, but an exact exposing slack could not be reconstructed",
             )
         else
             if reduction.exposing_slack === nothing
@@ -3119,21 +4061,11 @@ function _apply_loaded_facial_reductions(
             reduction = reduction_with_slack
         end
 
-        if opt.settings.facial_reduction &&
-           opt.settings.facial_reduction_rank_expansion_rounds > 0
-            _log(
-                opt,
-                "Facial reduction: using cached face as the seed for rank expansion before application",
-            )
-            reduction = _facial_reduction_round_with_rank_expansion(
-                opt,
-                current,
-                reduction,
-                _facial_reduction_oracle_float_type(opt, current);
-                cache = _FacialReductionExactCache(current),
-            )
-        end
-
+        # Cached records form a sequential chain of problem signatures.  Do
+        # not rank-expand an intermediate record: strengthening it can skip
+        # the problem on which the next record is keyed.  After the complete
+        # chain is applied, the normal Phase-I facial-reduction path performs
+        # rank expansion on any newly certified face.
         reduced_problem = _apply_facial_reduction(
             current,
             reduction.exposed_scalars,
@@ -3151,6 +4083,13 @@ function _apply_loaded_facial_reductions(
                 "Facial reduction: cached face produced an inconsistent affine system; ignoring it",
             )
             continue
+        end
+        if _checkpoint_loaded_facial_reductions_to_distinct_file(opt)
+            # The save cache is a compact-coordinate replay chain, not merely
+            # the reductions discovered after loading. Re-record each validated
+            # loaded face against the current compact problem so a distinct
+            # output file remains independently replayable.
+            _record_successful_facial_reduction!(opt, current, reduction)
         end
         applied += 1
         old_barrier_dimension = _barrier_dimension(current)
@@ -3442,6 +4381,14 @@ function _certify_dual_slack_evidence(
     ;
     cache::_FacialReductionExactCache = _FacialReductionExactCache(problem),
 ) where {F<:AbstractFloat}
+    if !_facial_reduction_row_space_is_small(problem, opt.settings)
+        row_count, variable_count = size(problem.A)
+        _log(
+            opt,
+            "Facial reduction: skipping exact Phase I cone-dual reconstruction for large affine system ($(row_count)x$(variable_count)); trying boundary subspaces first",
+        )
+        return nothing
+    end
     exact_slack = _exact_exposing_slack_from_numeric_slack(
         opt,
         problem,
@@ -3506,6 +4453,11 @@ function _rational_boundary_kernel_candidate_sets(
                 directions = directions,
                 method = candidate_set.method,
                 tolerance = tolerance,
+                key = key,
+                projector = candidate_set.projector,
+                reconstruction_error = candidate_set.reconstruction_error,
+                coefficient_bits = candidate_set.coefficient_bits,
+                fingerprint = candidate_set.fingerprint,
             ))
         end
     end
@@ -4651,7 +5603,6 @@ function _compact_face_coordinate_data(
     end
 
     compact_blocks = BlockStructure[]
-    replacement_compact_positions = Dict{Int,Vector{Int}}()
     for (block_index, block) in enumerate(problem.blocks)
         keep_basis = get(keep_bases, block_index, nothing)
         if keep_basis === nothing
@@ -4662,7 +5613,6 @@ function _compact_face_coordinate_data(
         replacement === nothing && continue
         compact_replacement = _remap_block_structure(replacement, extended_to_compact)
         push!(compact_blocks, compact_replacement)
-        replacement_compact_positions[block_index] = compact_replacement.global_positions
         for (old_local_index, (i, j)) in enumerate(block.local_positions)
             old_position = block.global_positions[old_local_index]
             for (new_local_index, (a, b)) in enumerate(replacement.local_positions)
@@ -4689,117 +5639,7 @@ function _compact_face_coordinate_data(
         old_from_compact = old_from_compact,
         blocks = compact_blocks,
         positive_scalars = compact_positive_scalars,
-        old_to_compact = collect(old_to_compact),
-        replacement_compact_positions = replacement_compact_positions,
     )
-end
-
-function _legacy_signature_after_face(
-    problem::ProblemData,
-    exposed_scalars::Vector{Int},
-    keep_bases::Dict{Int,Matrix{ExactRational}},
-    compact_data,
-)
-    previous_signature = problem.legacy_facial_reduction_signature === nothing ?
-                         _facial_reduction_problem_signature(problem) :
-                         problem.legacy_facial_reduction_signature
-    previous_position_map = problem.legacy_position_map
-    length(previous_position_map) == previous_signature.dimension ||
-        error("Legacy facial-reduction position map has the wrong dimension.")
-    current_to_legacy = zeros(Int, length(problem.objective_vector_raw))
-    for (legacy_position, current_position) in enumerate(previous_position_map)
-        current_position == 0 && continue
-        current_to_legacy[current_position] = legacy_position
-    end
-
-    legacy_exposed = Int[]
-    for current_position in exposed_scalars
-        legacy_position = current_to_legacy[current_position]
-        legacy_position > 0 ||
-            error("Exposed scalar has no legacy facial-reduction coordinate.")
-        push!(legacy_exposed, legacy_position)
-    end
-
-    next_position = previous_signature.dimension + 1
-    next_blocks = Any[]
-    appended_legacy_to_compact = Pair{Int,Int}[]
-    for (block_index, block_signature) in enumerate(previous_signature.blocks)
-        keep_basis = get(keep_bases, block_index, nothing)
-        if keep_basis === nothing
-            push!(next_blocks, block_signature)
-            continue
-        end
-        reduced_dimension = size(keep_basis, 2)
-        reduced_dimension == 0 && continue
-        local_positions = _triangle_positions(reduced_dimension)
-        global_positions = collect(next_position:(next_position + length(local_positions) - 1))
-        diagonal_positions = [
-            global_positions[index] for
-            (index, (i, j)) in enumerate(local_positions) if i == j
-        ]
-        push!(
-            next_blocks,
-            (
-                size = reduced_dimension,
-                global_positions = global_positions,
-                local_positions = local_positions,
-                diagonal_positions = diagonal_positions,
-            ),
-        )
-        compact_positions = compact_data.replacement_compact_positions[block_index]
-        append!(
-            appended_legacy_to_compact,
-            Pair{Int,Int}.(global_positions, compact_positions),
-        )
-        next_position += length(local_positions)
-    end
-
-    next_dimension = next_position - 1
-    next_position_map = zeros(Int, next_dimension)
-    for legacy_position in eachindex(previous_position_map)
-        old_current_position = previous_position_map[legacy_position]
-        old_current_position == 0 && continue
-        next_position_map[legacy_position] =
-            compact_data.old_to_compact[old_current_position]
-    end
-    for mapping in appended_legacy_to_compact
-        next_position_map[first(mapping)] = last(mapping)
-    end
-
-    extra_equations = length(legacy_exposed)
-    for block_index in keys(keep_bases)
-        extra_equations += length(previous_signature.blocks[block_index].local_positions)
-    end
-    next_positive_scalars = [
-        position for position in previous_signature.positive_scalars if
-        !(position in legacy_exposed)
-    ]
-    signature = (
-        dimension = next_dimension,
-        equation_count = previous_signature.equation_count + extra_equations,
-        positive_scalars = next_positive_scalars,
-        blocks = next_blocks,
-    )
-    previous_coordinate_lift = problem.legacy_coordinate_lift
-    size(previous_coordinate_lift) ==
-    (previous_signature.dimension, length(problem.objective_vector_raw)) ||
-        error("Legacy facial-reduction coordinate lift has the wrong dimensions.")
-    upper_coordinate_lift =
-        previous_coordinate_lift * compact_data.old_from_compact
-    appended_coordinate_lift = spzeros(
-        ExactRational,
-        next_dimension - previous_signature.dimension,
-        size(compact_data.old_from_compact, 2),
-    )
-    for mapping in appended_legacy_to_compact
-        appended_coordinate_lift[
-            first(mapping) - previous_signature.dimension,
-            last(mapping),
-        ] = one(ExactRational)
-    end
-    next_coordinate_lift =
-        sparse(vcat(upper_coordinate_lift, appended_coordinate_lift))
-    return signature, next_position_map, next_coordinate_lift
 end
 
 function _fixed_zero_cone_face(problem::ProblemData)
@@ -4962,13 +5802,6 @@ function _apply_facial_reduction(
         checkpoint !== nothing && checkpoint("face application: incremental restriction unavailable; solving full exact affine system")
         affine = _solve_affine_system(A, b; checkpoint = checkpoint)
     end
-    legacy_signature, legacy_position_map, legacy_coordinate_lift =
-        _legacy_signature_after_face(
-        problem,
-        exposed_scalars,
-        keep_bases,
-        compact_data,
-    )
     solution_lift = problem.solution_lift * old_from_compact
     blocks = compact_data.blocks
     positive_scalars = compact_data.positive_scalars
@@ -5018,9 +5851,6 @@ function _apply_facial_reduction(
         problem.scalar_constraint_rows,
         problem.psd_constraint_blocks,
         solution_lift,
-        legacy_signature,
-        legacy_position_map,
-        legacy_coordinate_lift,
         nothing,
     )
     new_barrier_dimension = _barrier_dimension(reduced_problem)

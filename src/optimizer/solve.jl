@@ -129,6 +129,13 @@ function MOI.optimize!(opt::Optimizer{T}) where {T}
     end
 end
 
+function _solver_failure_message(context::AbstractString, err)
+    type_name = _exception_type_name(err)
+    detail = _exception_message(err)
+    prefix = "$(context) failed ($(type_name))"
+    return isempty(detail) ? prefix : "$(prefix): $(detail)"
+end
+
 function _optimize_impl!(opt::Optimizer{T}) where {T}
     start_time = time_ns()
     _reset_results!(opt)
@@ -340,9 +347,9 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
             catch err
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
-                opt.raw_status = "Phase II failed"
+                opt.raw_status = _solver_failure_message("Phase II", err)
                 opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
-                _log(opt, "Phase II failed: $(typeof(err))")
+                _log(opt, opt.raw_status)
                 return
             end
         end

@@ -1460,6 +1460,41 @@ function _exact_phase2_objective_value(problem::ProblemData, x::Vector{ExactRati
     return dot(problem.objective_vector_min, x)
 end
 
+function _phase2_initial_coordinates(
+    initial_point::Vector{F},
+    x0::Vector{F},
+    N_big::Matrix{F},
+    relevant_positions::Vector{Int};
+    match_relevant::Bool,
+) where {F<:AbstractFloat}
+    size(N_big, 2) == 0 && return zeros(F, 0)
+    delta = initial_point - x0
+    if !match_relevant
+        # N_big has orthonormal columns. This is the orthogonal projection onto
+        # the complete affine nullspace.
+        return transpose(N_big) * delta
+    end
+
+    # A reduced Phase II basis is selected for independence only after
+    # restricting to the barrier/objective-visible coordinates. Projecting in
+    # the full variable space can therefore change those visible coordinates
+    # and destroy strict interiority. Fit on the same restricted coordinates
+    # used to select the reduced basis.
+    restricted_basis = Matrix(@view N_big[relevant_positions, :])
+    restricted_delta = delta[relevant_positions]
+    coordinates = try
+        restricted_basis \ restricted_delta
+    catch
+        return nothing
+    end
+    residual = _max_abs(restricted_basis * coordinates - restricted_delta)
+    residual_scale = max(one(F), _max_abs(restricted_delta))
+    residual_tolerance =
+        sqrt(eps(F)) * F(max(size(restricted_basis)...)) * residual_scale
+    residual <= residual_tolerance || return nothing
+    return Vector{F}(coordinates)
+end
+
 function _barrier_dimension(problem::ProblemData)
     return length(problem.positive_scalars) + sum((block.size for block in problem.blocks); init = 0)
 end
@@ -1493,6 +1528,7 @@ function _phase2_exact_solution(
         )
     particular, nullspace = problem.affine
     phase2_nullspace = _phase2_nullspace(problem, F)
+    reduced_affine_directions = size(phase2_nullspace, 2) < size(nullspace, 2)
     if size(phase2_nullspace, 2) == 0
         if size(nullspace, 2) > 0
             _log(opt, "Phase II skipped: no objective/barrier-visible affine directions")
@@ -1504,22 +1540,88 @@ function _phase2_exact_solution(
             termination_reason = :optimal,
             gap_bound = zero(F),
         )
-    elseif size(phase2_nullspace, 2) < size(nullspace, 2)
+    elseif reduced_affine_directions
         _log(
             opt,
             "Phase II: reduced affine directions from $(size(nullspace, 2)) to $(size(phase2_nullspace, 2))",
         )
     end
-    numeric_affine = _numeric_affine_data(anchor, phase2_nullspace, F)
 
     numeric_settings = _numeric_settings(opt.settings, F)
     numeric_blocks = _numeric_blocks(problem.blocks)
-    x0 = _to_working_array(F, anchor)
-    N_big = _numeric_nullspace!(numeric_affine)
+    anchor_numeric = _to_working_array(F, anchor)
+    use_phase1_numeric_center =
+        initial_point !== nothing &&
+        _strictly_interior_numeric(
+            initial_point,
+            numeric_blocks,
+            problem.positive_scalars,
+        )
+    x0 = use_phase1_numeric_center ? copy(initial_point) : anchor_numeric
+    if use_phase1_numeric_center
+        _log(
+            opt,
+            "Phase II: using the strictly interior Phase I candidate as the numeric affine center",
+        )
+    end
     c_big = _to_working_array(F, problem.objective_vector_min)
-    z = zeros(F, size(phase2_nullspace, 2))
-    if initial_point !== nothing && !isempty(z)
-        z .= transpose(N_big) * (initial_point - x0)
+    relevant_positions = _phase2_relevant_positions(problem)
+
+    function phase2_start(nullspace_basis; match_relevant)
+        affine_data = _numeric_affine_data(anchor, nullspace_basis, F)
+        numeric_basis = _numeric_nullspace!(affine_data)
+        coordinates = zeros(F, size(nullspace_basis, 2))
+        if !use_phase1_numeric_center &&
+           initial_point !== nothing &&
+           !isempty(coordinates)
+            fitted = _phase2_initial_coordinates(
+                initial_point,
+                x0,
+                numeric_basis,
+                relevant_positions;
+                match_relevant,
+            )
+            fitted === nothing || (coordinates .= fitted)
+        end
+        return affine_data, numeric_basis, coordinates
+    end
+
+    numeric_affine, N_big, z = phase2_start(
+        phase2_nullspace;
+        match_relevant = reduced_affine_directions,
+    )
+    phase2_start_point = x0 + N_big * z
+    if !_strictly_interior_numeric(
+        phase2_start_point,
+        numeric_blocks,
+        problem.positive_scalars,
+    ) && reduced_affine_directions
+        _log(
+            opt,
+            "Phase II: reduced-coordinate initialization was not strictly interior; " *
+            "falling back to the complete affine nullspace",
+        )
+        phase2_nullspace = nullspace
+        reduced_affine_directions = false
+        numeric_affine, N_big, z = phase2_start(
+            phase2_nullspace;
+            match_relevant = false,
+        )
+        phase2_start_point = x0 + N_big * z
+    end
+    if !_strictly_interior_numeric(
+        phase2_start_point,
+        numeric_blocks,
+        problem.positive_scalars,
+    )
+        if _strictly_interior_numeric(x0, numeric_blocks, problem.positive_scalars)
+            fill!(z, zero(F))
+        else
+            error(
+                "Phase II could not construct a strictly interior starting point " *
+                "from the Phase I candidate",
+            )
+        end
     end
     barrier_parameter = one(F)
 

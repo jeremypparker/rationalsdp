@@ -1084,8 +1084,16 @@ function _validate_settings(settings::Settings)
     return nothing
 end
 
-_to_working_float(::Type{F}, x::ExactRational) where {F<:AbstractFloat} = F(numerator(x)) / F(denominator(x))
-_to_working_float(::Type{F}, x::Rational{S}) where {F<:AbstractFloat,S<:Integer} = F(numerator(x)) / F(denominator(x))
+function _to_working_float(::Type{F}, x::Rational) where {F<:AbstractFloat}
+    # Converting numerator and denominator separately can overflow to Inf/Inf
+    # for perfectly moderate rational values produced by exact recovery. Use
+    # BigFloat for the division so conversion depends on the rational's value,
+    # not the magnitudes of its numerator and denominator.
+    precision_bits = max(precision(BigFloat), precision(F))
+    return setprecision(BigFloat, precision_bits) do
+        F(BigFloat(x))
+    end
+end
 _to_working_float(::Type{F}, x::Integer) where {F<:AbstractFloat} = F(x)
 _to_working_float(::Type{F}, x::AbstractFloat) where {F<:AbstractFloat} = F(x)
 

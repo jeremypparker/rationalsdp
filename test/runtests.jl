@@ -178,6 +178,14 @@ include("slowtest_helpers.jl")
               RationalSDP.Float64x4
         @test RationalSDP._to_working_float(RationalSDP.Float64x2, 1//3) isa
               RationalSDP.Float64x2
+        huge_scale = big(10)^1000
+        moderate_huge_rational = (3 * huge_scale + 1) // huge_scale
+        converted_huge_rational = RationalSDP._to_working_float(
+            RationalSDP.Float64x2,
+            moderate_huge_rational,
+        )
+        @test isfinite(converted_huge_rational)
+        @test isapprox(converted_huge_rational, RationalSDP.Float64x2(3))
         @test RationalSDP._rationalize_float(
             RationalSDP.Float64x2(1) / RationalSDP.Float64x2(3),
             RationalSDP.Float64x2(1e-8),
@@ -999,6 +1007,42 @@ include("slowtest_helpers.jl")
         @test size(phase2_nullspace) == (4, 2)
         @test phase2_nullspace[1:2, :] == Matrix{Rational{BigInt}}(I, 2, 2)
         @test all(iszero, phase2_nullspace[3:4, :])
+    end
+
+    @testset "Reduced Phase II initialization preserves visible coordinates" begin
+        inverse_sqrt_two = inv(sqrt(2.0))
+        reduced_basis = reshape(
+            Float64[inverse_sqrt_two, 0.0, inverse_sqrt_two],
+            3,
+            1,
+        )
+        x0 = zeros(Float64, 3)
+        phase1_point = Float64[1.0, 10.0, 0.0]
+
+        old_projection = transpose(reduced_basis) * (phase1_point - x0)
+        @test !isapprox(
+            (x0 + reduced_basis * old_projection)[1],
+            phase1_point[1],
+        )
+
+        coordinates = RationalSDP._phase2_initial_coordinates(
+            phase1_point,
+            x0,
+            reduced_basis,
+            [1];
+            match_relevant = true,
+        )
+        @test coordinates !== nothing
+        reconstructed = x0 + reduced_basis * coordinates
+        @test isapprox(reconstructed[1], phase1_point[1])
+    end
+
+    @testset "Solver failure messages expose nested exceptions" begin
+        nested = CompositeException(Any[ErrorException("inner phase failure")])
+        message = RationalSDP._solver_failure_message("Phase II", nested)
+        @test occursin("Phase II failed", message)
+        @test occursin("CompositeException", message)
+        @test occursin("inner phase failure", message)
     end
 
     @testset "Facial reduction helper regressions" begin

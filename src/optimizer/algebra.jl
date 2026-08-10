@@ -272,23 +272,79 @@ function _rref(
     return reduced, pivot_columns
 end
 
+function _affine_column_nonzero_counts(A::AbstractMatrix)
+    column_nonzeros = zeros(Int, size(A, 2))
+    for column in axes(A, 2)
+        count = 0
+        for row in axes(A, 1)
+            count += !iszero(A[row, column])
+        end
+        column_nonzeros[column] = count
+    end
+    return column_nonzeros
+end
+
+function _affine_column_permutation(
+    A::AbstractMatrix,
+    column_nonzeros::AbstractVector{<:Integer} = _affine_column_nonzero_counts(A),
+)
+    length(column_nonzeros) == size(A, 2) ||
+        error("Affine column nonzero counts have the wrong dimension.")
+    permutation = collect(1:size(A, 2))
+    sort!(
+        permutation;
+        by = column -> begin
+            nnz = column_nonzeros[column]
+            iszero(nnz) ? (1, 0, column) : (0, nnz, column)
+        end,
+    )
+    return permutation
+end
+
 function _solve_affine_system(
     A::Matrix{ExactRational},
     b::Vector{ExactRational},
     ;
     checkpoint::Union{Nothing,Function} = nothing,
+    column_order::Symbol = :sparsity,
 )
-    p = size(A, 2)
-    if size(A, 1) == 0
-        return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
-    end
     size(A, 1) == length(b) || error("Affine equality matrix and rhs dimensions must match.")
+    column_order in (:sparsity, :natural) || throw(
+        ArgumentError(
+            "Unsupported affine column ordering $(repr(column_order)); expected :sparsity or :natural.",
+        ),
+    )
+
+    row_count, p = size(A)
+    column_nonzeros = _affine_column_nonzero_counts(A)
+    total_nonzeros = sum(column_nonzeros)
+    zero_columns = count(iszero, column_nonzeros)
+    singleton_columns = count(==(1), column_nonzeros)
+    permutation = column_order == :sparsity ?
+                  _affine_column_permutation(A, column_nonzeros) : collect(1:p)
 
     checkpoint !== nothing && checkpoint(
-        "affine elimination: building dense $(size(A, 1))-by-$(p + 1) augmented system",
+        "affine elimination: building dense $(row_count)-by-$(p + 1) augmented system; " *
+        "coefficient matrix $(row_count)-by-$(p), total structural nonzeros=$(total_nonzeros), " *
+        "zero columns=$(zero_columns), singleton columns=$(singleton_columns), " *
+        "column ordering=$(column_order)",
     )
+
+    if row_count == 0
+        return zeros(ExactRational, p), Matrix{ExactRational}(I, p, p)
+    end
+
     rhs_column = p + 1
-    augmented = hcat(A, b)
+    augmented = Matrix{ExactRational}(undef, row_count, rhs_column)
+    for permuted_column in 1:p
+        original_column = permutation[permuted_column]
+        for row in 1:row_count
+            augmented[row, permuted_column] = A[row, original_column]
+        end
+    end
+    for row in 1:row_count
+        augmented[row, rhs_column] = b[row]
+    end
     checkpoint !== nothing && checkpoint(
         "affine elimination: converting to Nemo and computing exact RREF",
     )
@@ -302,19 +358,22 @@ function _solve_affine_system(
     end
 
     particular = zeros(ExactRational, p)
-    for (row, pivot_column) in zip(pivot_rows, pivot_columns)
-        particular[pivot_column] = _from_nemo_rational(reduced[row, rhs_column])
+    for (row, permuted_pivot_column) in zip(pivot_rows, pivot_columns)
+        original_pivot_column = permutation[permuted_pivot_column]
+        particular[original_pivot_column] = _from_nemo_rational(reduced[row, rhs_column])
     end
 
     pivot_set = Set(pivot_columns)
-    free_columns = [column for column in 1:p if !(column in pivot_set)]
-    nullspace = zeros(ExactRational, p, length(free_columns))
-    for (basis_index, free_column) in enumerate(free_columns)
-        nullspace[free_column, basis_index] = one(ExactRational)
-        for (row, pivot_column) in zip(pivot_rows, pivot_columns)
-            coefficient = reduced[row, free_column]
+    permuted_free_columns = [column for column in 1:p if !(column in pivot_set)]
+    nullspace = zeros(ExactRational, p, length(permuted_free_columns))
+    for (basis_index, permuted_free_column) in enumerate(permuted_free_columns)
+        original_free_column = permutation[permuted_free_column]
+        nullspace[original_free_column, basis_index] = one(ExactRational)
+        for (row, permuted_pivot_column) in zip(pivot_rows, pivot_columns)
+            coefficient = reduced[row, permuted_free_column]
             iszero(coefficient) ||
-                (nullspace[pivot_column, basis_index] = -_from_nemo_rational(coefficient))
+                (nullspace[permutation[permuted_pivot_column], basis_index] =
+                    -_from_nemo_rational(coefficient))
         end
     end
     # The basis is read directly from an exact Nemo RREF. Recomputing A*p and

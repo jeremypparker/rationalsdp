@@ -1,5 +1,6 @@
 include("testutils.jl")
 include("slowtest_helpers.jl")
+include("affine_column_ordering_tests.jl")
 
 @testset "RationalSDP JuMP integration" begin
     @testset "Optimizer metadata" begin

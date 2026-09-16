@@ -5668,6 +5668,30 @@ function _fixed_zero_cone_face(problem::ProblemData)
     return exposed_scalars, keep_bases
 end
 
+function _orthogonal_face_keep_basis(U::Matrix{ExactRational})
+    V = copy(U)
+    squared_norms = ExactRational[]
+    for j in axes(V, 2)
+        for i in 1:(j - 1)
+            coefficient = dot(view(V, :, i), view(V, :, j)) / squared_norms[i]
+            iszero(coefficient) && continue
+            V[:, j] -= coefficient * V[:, i]
+        end
+        norm_squared = dot(view(V, :, j), view(V, :, j))
+        norm_squared > 0 || error("Facial-reduction keep basis has dependent columns.")
+        exponent = setprecision(BigFloat, 256) do
+            round(Int, log2(BigFloat(norm_squared)) / 2)
+        end
+        scale = exponent >= 0 ?
+                (big(1) << exponent) // big(1) : big(1) // (big(1) << -exponent)
+        V[:, j] /= scale
+        push!(squared_norms, norm_squared / scale^2)
+    end
+    # Each step is an invertible rational column operation, so range(V) =
+    # range(U). No proposed kernel direction is certified by conditioning.
+    return V
+end
+
 function _apply_facial_reduction(
     problem::ProblemData,
     exposed_scalars::Vector{Int},
@@ -5685,6 +5709,10 @@ function _apply_facial_reduction(
         )
         violation === nothing ||
             error("Certified facial reduction failed exact preservation checks: $(violation)")
+    end
+    if settings.facial_reduction_orthogonalize
+        checkpoint !== nothing && checkpoint("face application: orthogonalizing exact keep bases")
+        keep_bases = Dict(index => _orthogonal_face_keep_basis(basis) for (index, basis) in keep_bases)
     end
     old_dimension = length(problem.objective_vector_raw)
     old_barrier_dimension = _barrier_dimension(problem)

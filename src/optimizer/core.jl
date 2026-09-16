@@ -244,6 +244,9 @@ Base.@kwdef mutable struct Settings
     phase1_backend::Symbol = :hypatia
     phase1_hypatia_float_type::DataType = AbstractFloat
     phase1_hypatia_syssolver::Symbol = :auto
+    # Orthogonalize the cone map in numerical free coordinates, retaining
+    # its inverse map for exact recovery in the original rational basis.
+    phase1_hypatia_orthogonalize::Bool = false
     phase1_hypatia_iter_limit::Int = 400
     phase1_hypatia_target_margin::BigFloat = big"1e-8"
     phase1_hypatia_margin_upper::BigFloat = big"1.0"
@@ -262,6 +265,9 @@ Base.@kwdef mutable struct Settings
     phase1_exact_recovery_pivot_log_frequency::Int = 10
     working_float_type::DataType = Float64x2
     facial_reduction::Bool = true
+    # Replace each face keep basis by an exactly orthogonal rational basis
+    # of the same range, with approximately unit column norms.
+    facial_reduction_orthogonalize::Bool = false
     facial_reduction_max_rounds::Int = 24
     # Rank expansion launches another exposing-vector solve after an exact
     # face has already been certified.  Keep it opt-in: the common case is

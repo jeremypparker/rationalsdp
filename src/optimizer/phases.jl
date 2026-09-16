@@ -891,6 +891,41 @@ function _log_phase1_hypatia_attempt(
     return
 end
 
+function _orthogonalize_hypatia_phase1!(model)
+    F = eltype(model.c)
+    d = model.n - 1
+    model.p == 0 || error("Phase I orthogonalization requires eliminated equalities.")
+    all(iszero, model.c[1:d]) || error("Phase I free-coordinate objective must vanish.")
+    d == 0 && return nothing
+    model.q >= d || error("Phase I cone map has too few rows for independent coordinates.")
+    G = Matrix(model.G[:, 1:d])
+    scales = [norm(view(G, :, j)) for j in 1:d]
+    all(s -> isfinite(s) && s > zero(F), scales) ||
+        error("Phase I cone map has zero or non-finite columns.")
+    for j in 1:d
+        view(G, :, j) ./= scales[j]
+    end
+    factor = qr!(G, ColumnNorm())
+    upper = UpperTriangular(Matrix(factor.R)[1:d, 1:d])
+    diagonal = abs.(diag(upper))
+    threshold = maximum(diagonal) * F(max(model.q, d)) * eps(F)
+    minimum(diagonal) > threshold || error(
+        "Phase I cone map is numerically rank deficient at $(F); orthogonalization did not discard directions.",
+    )
+    Q = Matrix{F}(I, model.q, d)
+    lmul!(factor.Q, Q)
+    model.G = hcat(Q, model.G[:, end])
+    return (upper = upper, pivots = copy(factor.p), scales = scales)
+end
+
+function _phase1_original_coordinates(transform, coordinates)
+    transform === nothing && return coordinates
+    result = similar(coordinates)
+    result[transform.pivots] = transform.upper \ coordinates
+    result ./= transform.scales
+    return result
+end
+
 function _phase1_hypatia_anchor_once(
     opt::Optimizer,
     problem::ProblemData,
@@ -918,9 +953,17 @@ function _phase1_hypatia_anchor_once(
             HF,
             numeric_margin_upper,
         )
+        coordinate_transform = if opt.settings.phase1_hypatia_orthogonalize
+            _log(opt, "Hypatia Phase I: orthogonalizing $(model.q)-by-$(model.n - 1) cone map in $(HF)")
+            _orthogonalize_hypatia_phase1!(model)
+        else
+            nothing
+        end
         problem.phase1_nullspace = nothing
         problem.phase1_nullspace_float_type = nothing
-        phase1_nullspace = nothing
+        # Retain the selected exact columns when using their QR inverse. This
+        # also avoids repeating the costly column-selection QR after the solve.
+        opt.settings.phase1_hypatia_orthogonalize || (phase1_nullspace = nothing)
         _gc_checkpoint!(opt, "before Hypatia load")
         syssolver, use_dense_model, preprocess = _hypatia_phase1_syssolver(
             opt.settings,
@@ -1003,7 +1046,10 @@ function _phase1_hypatia_anchor_once(
             return attempt
         end
 
-        coordinates = raw_solution[1:(end - 1)]
+        coordinates = _phase1_original_coordinates(
+            coordinate_transform, raw_solution[1:(end - 1)],
+        )
+        coordinate_transform = nothing
         margin = raw_solution[end]
         raw_solution = nothing
         raw_cone_dual = nothing
@@ -1011,7 +1057,7 @@ function _phase1_hypatia_anchor_once(
         model = nothing
         _gc_checkpoint!(opt, "after Hypatia solve")
 
-        phase1_nullspace = _phase1_nullspace(problem, HF)
+        phase1_nullspace === nothing && (phase1_nullspace = _phase1_nullspace(problem, HF))
         candidate = _hypatia_phase1_point(particular, phase1_nullspace, coordinates)
         A_numeric = _to_working_sparse_matrix(HF, problem.A)
         b_numeric = _to_working_array(HF, problem.b)

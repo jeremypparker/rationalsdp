@@ -244,6 +244,24 @@ set_optimizer_attribute(model, "phase1_backend", :hypatia)
 set_optimizer_attribute(model, "quasiconvex_bisection_iterations", 24)
 ```
 
+For ill-conditioned facial-reduction coordinates, two opt-in settings carry
+conditioning through the normal `optimize!(model)` pipeline:
+
+```julia
+set_optimizer_attribute(model, "facial_reduction_orthogonalize", true)
+set_optimizer_attribute(model, "phase1_hypatia_orthogonalize", true)
+```
+
+The first uses exactly orthogonal rational keep bases with approximately unit
+column norms whenever a face is applied. It preserves the proposed face; it does
+not certify a tentative restriction. The second scales and QR-orthogonalizes
+the selected free-coordinate cone map before each Hypatia Phase I solve, then
+maps the answer back for exact recovery. This is a dense operation in the chosen
+Phase I precision and can take substantial memory and time. Neither setting
+changes the exact feasibility checks. Both default to `false`. Use a separate
+facial-reduction cache file when changing the basis setting: later cache records
+are tied to the coordinates of preceding reductions.
+
 The full set of optimizer attributes is:
 
 - `max_iterations`
@@ -252,6 +270,7 @@ The full set of optimizer attributes is:
 - `phase1_backend`
 - `phase1_hypatia_float_type`
 - `phase1_hypatia_syssolver`
+- `phase1_hypatia_orthogonalize`
 - `phase1_hypatia_iter_limit`
 - `phase1_hypatia_target_margin`
 - `phase1_hypatia_margin_upper`
@@ -270,6 +289,7 @@ The full set of optimizer attributes is:
 - `phase1_exact_recovery_pivot_log_frequency`
 - `working_float_type`
 - `facial_reduction`
+- `facial_reduction_orthogonalize`
 - `facial_reduction_max_rounds`
 - `facial_reduction_rank_expansion_rounds`
 - `facial_reduction_float_type`

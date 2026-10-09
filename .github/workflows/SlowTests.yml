@@ -1,0 +1,31 @@
+name: Slow tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_slow:
+        description: Include the extra-slow regressions
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  slow:
+    name: Slow regressions / latest stable Julia
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      JULIA_NUM_THREADS: '2'
+      RATIONALSDP_EXTRA_SLOW_TESTS: ${{ inputs.extra_slow && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v3
+        with:
+          delete-old-caches: 'false'
+      - name: Run slow regressions
+        run: julia --color=yes --startup-file=no --project=test test/runslowtests.jl

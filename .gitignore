@@ -1,0 +1,21 @@
+# Local package and test environments; benchmarks keep their reproducible manifest.
+/Manifest.toml
+/Manifest-v*.toml
+/test/Manifest.toml
+/test/Manifest-v*.toml
+/LocalPreferences.toml
+/test/LocalPreferences.toml
+
+# Local tools and diagnostics.
+/.codex-julia/
+/diagnostics/
+
+# Julia coverage and allocation reports.
+*.cov
+*.mem
+
+# Editor and operating-system files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -18,6 +18,29 @@ optimized for exact rational primal recovery. It is useful for small and
 medium-sized SDP/SOS certificate searches, including some quasiconvex
 one-parameter problems that are solved by fixed-parameter feasibility searches.
 
+## Installation
+
+Requires Julia 1.11 or later in the Julia 1.x series.
+
+Until the package is registered in General, install it from GitHub:
+
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/jeremypparker/RationalSDP.jl")
+Pkg.add("JuMP")  # for the modeling examples below
+```
+
+After registration, install it by name instead:
+
+```julia
+using Pkg
+Pkg.add("RationalSDP")
+```
+
+For the SumOfSquares examples, also install `DynamicPolynomials` and
+`SumOfSquares`. The regression test environment currently uses SumOfSquares
+from its `main` branch; it is resolved explicitly in CI.
+
 ## Supported Model Features
 
 RationalSDP currently supports:
@@ -587,3 +610,28 @@ The test suite includes affine SDP models, exact rational output checks,
 SumOfSquares integration, PSD face-pruning and facial-reduction cases,
 quasiconvex parameter models, and slow SOS regressions from larger log-domain
 examples.
+
+## Continuous integration and releases
+
+GitHub Actions runs the standard package tests on Linux and Windows with
+Julia 1.11 and the latest stable Julia. Each checkout resolves the package and
+test environments from their project files. The root and test manifests are
+kept locally and ignored by Git; `benchmark/Manifest.toml` remains tracked for
+reproducible benchmarks.
+
+The **Slow tests** workflow can be run manually from the repository's Actions
+tab. Enable its **extra_slow** input to include the extra-slow regressions.
+
+The current package version is `0.1.1`. To release it, commit and push the
+prepared repository, install the Julia Registrator GitHub app for this
+repository, then comment `@JuliaRegistrator register` on the release commit.
+For subsequent releases, update `version` in `Project.toml` first.
+
+The TagBot workflow creates the corresponding Git tag and GitHub release after
+General accepts the registration. It uses GitHub's automatically supplied
+`GITHUB_TOKEN` with write access to repository contents. See the
+[TagBot setup instructions](https://github.com/JuliaRegistries/TagBot#setup)
+if repository or organization policies restrict workflow permissions.
+If TagBot cannot tag a release commit that changes workflow files, follow
+[TagBot's workflow-file guidance](https://github.com/JuliaRegistries/TagBot#commits-that-modify-workflow-files)
+or create that first tag and release manually.

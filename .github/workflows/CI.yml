@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1.11', '1']
+        os: [ubuntu-latest, windows-latest]
+    env:
+      JULIA_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v3
+        with:
+          delete-old-caches: 'false'
+      # Resolve test sources explicitly, including the current SumOfSquares
+      # main dependency. No committed manifest is used on a fresh checkout.
+      - name: Instantiate the test environment
+        shell: julia --color=yes --startup-file=no --project=test {0}
+        run: |
+          using Pkg
+          Pkg.instantiate()
+      - name: Check package installation and loading
+        shell: julia --color=yes --startup-file=no --project=. {0}
+        run: |
+          using Pkg
+          Pkg.instantiate()
+          using RationalSDP
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: 'false'

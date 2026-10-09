@@ -1,7 +1,7 @@
 name = "RationalSDP"
 uuid = "6f8d3dbf-3ef5-4e1c-bc88-94a196f4b194"
 version = "0.1.1"
-authors = ["OpenAI Codex"]
+authors = ["Jeremy P. Parker"]
 
 [deps]
 Hypatia = "b99e6be6-89ff-11e8-14f8-45c827f4f8f2"
@@ -22,7 +22,7 @@ MathOptInterface = "1"
 MultiFloats = "3"
 Nemo = "0.45 - 0.56"
 Tullio = "0.3.9"
-julia = "1.10"
+julia = "1.11"
 
 [extras]
 DynamicPolynomials = "7c1d4256-1411-5781-91ec-d7bc3513ac07"

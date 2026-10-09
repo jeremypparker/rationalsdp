@@ -2,6 +2,7 @@ include("testutils.jl")
 include("slowtest_helpers.jl")
 include("affine_column_ordering_tests.jl")
 include("orthogonal_conditioning_tests.jl")
+include("solver_recovery_regressions.jl")
 
 @testset "RationalSDP JuMP integration" begin
     @testset "Optimizer metadata" begin

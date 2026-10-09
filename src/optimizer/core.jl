@@ -241,6 +241,7 @@ Base.@kwdef mutable struct Settings
     max_iterations::Int = 80
     phase1_outer_iterations::Int = 100
     phase2_outer_iterations::Int = 24
+    phase2_hypatia_fallback::Bool = true
     phase1_backend::Symbol = :hypatia
     phase1_hypatia_float_type::DataType = AbstractFloat
     phase1_hypatia_syssolver::Symbol = :auto
@@ -418,6 +419,14 @@ struct Phase1HypatiaAttempt{F<:AbstractFloat}
     elapsed_sec::Float64
     reason::Symbol
 end
+
+# Expected failure of numerical face recovery, not evidence of infeasibility.
+struct FacialReductionRecoveryError <: Exception
+    reason::Symbol
+    message::String
+end
+
+Base.showerror(io::IO, err::FacialReductionRecoveryError) = print(io, err.message)
 
 struct SPDSystemFactorizationError <: Exception
     dimension::Int

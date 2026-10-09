@@ -267,6 +267,7 @@ The full set of optimizer attributes is:
 - `max_iterations`
 - `phase1_outer_iterations`
 - `phase2_outer_iterations`
+- `phase2_hypatia_fallback` (default `true`)
 - `phase1_backend`
 - `phase1_hypatia_float_type`
 - `phase1_hypatia_syssolver`
@@ -492,10 +493,18 @@ exact recovery tightens rationalization tolerances between attempts.
 
 An optimal or near-optimal Hypatia Phase I margin at most
 `phase1_hypatia_boundary_margin_fraction` times the requested target margin is
-treated as a numerical boundary point. The default fraction is `0.01`. Set it
-to zero to disable this positive-margin test; nonpositive margins are always
-treated as boundary points. Exact recovery is skipped and, when enabled, facial
-reduction is attempted directly.
+treated as a boundary indication. The default fraction is `0.01`. Set it
+to zero to disable this positive-margin test. Nonpositive margins also indicate
+a boundary, but the reconstructed candidate is checked in the original cones
+before skipping recovery: a strictly interior candidate still undergoes exact
+rational recovery, even if Hypatia stopped with a small or negative margin.
+Facial reduction is attempted only if an exact interior was not recovered.
+
+An unrecoverable rational face or an inconsistent face restriction returns
+`MOI.NUMERICAL_ERROR` and `MOI.NO_SOLUTION`, with the recovery failure described
+in `MOI.RawStatusString()`. Failure on a tentative restriction does not establish
+infeasibility of the original SDP. Invalid inputs and unexpected programming
+errors still raise exceptions.
 
 ## Exactness Model
 
@@ -507,6 +516,19 @@ For ordinary optimization, `MOI.OPTIMAL` is returned only after Phase II meets
 both its numerical stationarity and gap criteria. Iteration or line-search
 limits can still return an exact feasible primal point with a non-optimal
 termination status.
+
+If native Phase II centering reaches a Newton or line-search limit, the default
+`phase2_hypatia_fallback=true` retries objective optimization with Hypatia's
+primal-dual method at the working precision. This helps when weakly penalized
+cone directions grow during primal centering. The fallback uses the same SDP
+and the original Phase I center. Its candidate still undergoes exact rational
+recovery and validation. A fallback is reported optimal only when numerical
+stationarity and the gap of the recovered exact point meet the configured
+criteria. Otherwise the original limit status is retained. Unconverged barrier
+subproblems display `--` for the gap, and exact recovery retains the best
+objective candidate rather than blindly using the last centering iterate. Phase II
+rounds affine coordinates on a shared binary grid to avoid denominator growth
+in exact matrix checks, and reuses each improved exact interior during recovery.
 
 This does not mean every returned certificate is automatically a complete proof.
 For proof use, you should still independently check the final rational matrices,

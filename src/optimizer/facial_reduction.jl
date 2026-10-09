@@ -2380,7 +2380,7 @@ function _candidate_kernel_directions(
             _log(opt, message)
             return Vector{ExactRational}[]
         end
-        throw(ErrorException(message))
+        throw(FacialReductionRecoveryError(:inexact_face, message))
     end
 
     return exact_directions
@@ -2776,6 +2776,9 @@ function _tentative_feasibility_search_problem(
 end
 
 function _is_inexact_facial_reduction_error(err)
+    if err isa FacialReductionRecoveryError
+        return err.reason == :inexact_face
+    end
     err isa ErrorException || return false
     return occursin(
         "could not be represented exactly over the rational coefficient field",
@@ -4861,7 +4864,7 @@ function _facial_reduction_block_directions(
             _log(opt, message)
             return Vector{ExactRational}[]
         end
-        throw(ErrorException(message))
+        throw(FacialReductionRecoveryError(:inexact_face, message))
     end
 
     return exact_directions
@@ -6041,13 +6044,13 @@ function _facially_reduce_problem(
     )
     if reduced_problem.affine === nothing
         message =
-            "Facial reduction found a PSD block on the cone boundary, " *
-            "but the exposed nullspace directions could not be represented exactly over the rational coefficient field."
+            "Facial reduction produced an inconsistent affine restriction; " *
+            "exact recovery failed. This does not establish infeasibility of the original SDP."
         if _facial_reduction_irrational_behavior(opt.settings) == :warn
             _log(opt, message)
             return problem
         end
-        throw(ErrorException(message))
+        throw(FacialReductionRecoveryError(:inconsistent_reduction, message))
     end
     _record_reduction_round!(
         _barrier_dimension(problem),
@@ -6113,8 +6116,8 @@ function _facially_reduce_search_problem(
         end
         if reduced_problem.affine === nothing
             message =
-                "Facial reduction found a PSD block on the cone boundary, " *
-                "but the exposed nullspace directions could not be represented exactly over the rational coefficient field."
+                "Facial reduction produced an inconsistent affine restriction; " *
+                "exact recovery failed. This does not establish infeasibility of the original SDP."
             if _facial_reduction_irrational_behavior(opt.settings) == :warn
                 _log(opt, message)
                 return (
@@ -6123,7 +6126,7 @@ function _facially_reduce_search_problem(
                     fallback_problem = nothing,
                 )
             end
-            throw(ErrorException(message))
+            throw(FacialReductionRecoveryError(:inconsistent_reduction, message))
         end
         _record_reduction_round!(
             _barrier_dimension(problem),

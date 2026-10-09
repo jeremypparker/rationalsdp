@@ -185,6 +185,17 @@ function _best_exact_interior_on_segment(
     return best
 end
 
+function _phase2_rational_coefficients(coefficients::Vector{F}, tolerance::F) where {F<:AbstractFloat}
+    # Independent continued-fraction approximations give large SDPs hundreds
+    # of coprime denominators. A shared dyadic grid keeps exact LDL arithmetic
+    # small while preserving the same absolute coefficient error tolerance.
+    return setprecision(BigFloat, max(precision(BigFloat), precision(F))) do
+        bits = max(0, ceil(Int, -log2(BigFloat(tolerance))))
+        denominator = BigInt(1) << bits
+        ExactRational[round(BigInt, BigFloat(value) * denominator) // denominator for value in coefficients]
+    end
+end
+
 function _phase2_exact_refinement(
     x_approx::Vector{F},
     anchor::Vector{ExactRational},
@@ -196,26 +207,43 @@ function _phase2_exact_refinement(
 ) where {F<:AbstractFloat}
     coefficients = _affine_coordinates(x_approx, numeric_affine)
     best = anchor
+    approximate_objective = dot(_to_working_array(F, problem.objective_vector_min), x_approx)
+    objective_tolerance = _numeric_settings(settings, F).optimality_gap_tolerance
+    try_direct_first = _strictly_interior_numeric(
+        x_approx, _numeric_blocks(problem.blocks), problem.positive_scalars,
+    )
+    last_candidate = nothing
 
     for tolerance in _recovery_tolerances(settings, F)
-        candidate = _project_exact_solution(
-            coefficients,
-            particular,
-            nullspace;
-            tolerance = tolerance,
-        )
+        rational_coefficients = _phase2_rational_coefficients(coefficients, tolerance)
+        candidate = particular + nullspace * rational_coefficients
+        last_candidate = candidate
+        # For a numerical interior, first tighten rounding until exact cone
+        # checks pass. Do not bisect repeatedly from coarse outside points.
+        # Reuse the improved exact interior; repeatedly bisecting from the
+        # original anchor loses accuracy and repeats expensive rational LDLs.
         refined = _best_exact_interior_on_segment(
-            anchor,
+            best,
             candidate,
             problem;
-            max_bisections = settings.exact_refinement_bisections,
+            max_bisections = try_direct_first ? 0 : settings.exact_refinement_bisections,
         )
         if _exact_phase2_objective_value(problem, refined) <
            _exact_phase2_objective_value(problem, best)
             best = refined
         end
+        recovered_objective = _to_working_float(F, _exact_phase2_objective_value(problem, best))
+        if abs(recovered_objective - approximate_objective) <= objective_tolerance
+            break
+        end
     end
 
+    if try_direct_first && best === anchor && last_candidate !== nothing
+        return _best_exact_interior_on_segment(
+            anchor, last_candidate, problem;
+            max_bisections = settings.exact_refinement_bisections,
+        )
+    end
     return best
 end
 
@@ -870,6 +898,17 @@ function _phase1_hypatia_margin_is_boundary(
     return margin <= margin_goal * boundary_fraction
 end
 
+# The artificial Phase I margin can be negative when Hypatia stops early even
+# though the reconstructed point is strictly inside the original cones. Only
+# skip exact recovery when the point itself also fails the interior test.
+function _phase1_hypatia_candidate_is_boundary(
+    problem::ProblemData, candidate::Vector{F}, margin::F, status,
+    margin_goal::F, boundary_fraction::F,
+) where {F<:AbstractFloat}
+    return _phase1_hypatia_margin_is_boundary(margin, status, margin_goal, boundary_fraction) &&
+           !_strictly_interior_numeric(candidate, _numeric_blocks(problem.blocks), problem.positive_scalars)
+end
+
 function _log_phase1_hypatia_attempt(
     opt::Optimizer,
     attempt::Phase1HypatiaAttempt,
@@ -1070,7 +1109,9 @@ function _phase1_hypatia_anchor_once(
             residual,
             HF,
         )
-        if _phase1_hypatia_margin_is_boundary(
+        if _phase1_hypatia_candidate_is_boundary(
+            problem,
+            candidate,
             margin,
             status,
             margin_goal,
@@ -1404,6 +1445,8 @@ function _newton_phase2!(
 ) where {F<:AbstractFloat}
     settings = numeric_settings
     Nt_big = transpose(N_big)
+    best_z = copy(z)
+    best_objective = dot(c_big, x0 + N_big * z)
     for iteration in 1:settings.max_iterations
         x = x0 + N_big * z
         barrier_value, barrier_grad_x, barrier_hess_x = _barrier_value_grad_hess(
@@ -1428,6 +1471,7 @@ function _newton_phase2!(
         if relative_grad_norm <= settings.phase2_gradient_tolerance
             return (
                 z = z,
+                best_z = best_z,
                 converged = true,
                 reason = :gradient_tolerance,
                 gradient_norm = relative_grad_norm,
@@ -1452,15 +1496,15 @@ function _newton_phase2!(
             trial_z = z + step * direction
             trial_x = x + step * direction_x
             if _strictly_interior_numeric(trial_x, numeric_blocks, positive_scalars)
-                trial_barrier, _, _ = _barrier_value_grad_hess(
-                    trial_x,
-                    numeric_blocks,
-                    positive_scalars,
-                    settings,
-                )
+                trial_barrier = _barrier_value_only(trial_x, numeric_blocks, positive_scalars)
                 trial_value = barrier_parameter * dot(c_big, trial_x) + trial_barrier
                 if trial_value <= value + settings.armijo_fraction * step * directional_derivative
                     z .= trial_z
+                    trial_objective = dot(c_big, trial_x)
+                    if trial_objective < best_objective
+                        best_objective = trial_objective
+                        best_z .= trial_z
+                    end
                     accepted = true
                     break
                 end
@@ -1470,6 +1514,7 @@ function _newton_phase2!(
         if !accepted
             return (
                 z = z,
+                best_z = best_z,
                 converged = false,
                 reason = :line_search_failed,
                 gradient_norm = relative_grad_norm,
@@ -1492,6 +1537,7 @@ function _newton_phase2!(
     )
     return (
         z = z,
+        best_z = best_z,
         converged = final_gradient_norm <= settings.phase2_gradient_tolerance,
         reason = :newton_iteration_limit,
         gradient_norm = final_gradient_norm,
@@ -1553,6 +1599,78 @@ function _objective_nullspace_direction(
         return zeros(ExactRational, 0)
     end
     return transpose(nullspace) * c
+end
+
+# Native primal centering can drive weakly penalized cone directions to very
+# large values before reaching its first center. Recover with a primal-dual
+# solve of the same affine SDP, starting from the original (well-scaled) center.
+function _phase2_hypatia_fallback(
+    opt::Optimizer, problem::ProblemData, x0::Vector{F}, N::Matrix{F}, c::Vector{F},
+) where {F<:AbstractFloat}
+    settings = _numeric_settings(opt.settings, F)
+    positions = copy(problem.positive_scalars)
+    scales = ones(F, length(positions))
+    cones = Hypatia.Cones.Cone{F}[]
+    if !isempty(positions)
+        push!(cones, Hypatia.Cones.Nonnegative{F}(length(positions)))
+    end
+    for block in problem.blocks
+        append!(positions, block.global_positions)
+        append!(scales, [i == j ? one(F) : sqrt(F(2)) for (i, j) in block.local_positions])
+        push!(cones, Hypatia.Cones.PosSemidefTri{F,F}(length(block.local_positions)))
+    end
+    d = size(N, 2)
+    offset = dot(c, x0)
+    model = Hypatia.Models.Model{F}(
+        transpose(N) * c, zeros(F, 0, d), F[],
+        -N[positions, :] .* scales, x0[positions] .* scales, cones;
+        obj_offset = offset,
+    )
+    _log(opt, "Phase II: retrying objective optimization with Hypatia primal-dual search")
+    solver = Hypatia.Solvers.Solver{F}(
+        ; verbose = !opt.silent && opt.settings.verbose,
+        iter_limit = opt.settings.max_iterations,
+        # Hypatia's relative test uses the objective without its affine offset.
+        tol_rel_opt = settings.optimality_gap_tolerance / max(one(F), abs(offset)),
+        tol_abs_opt = settings.optimality_gap_tolerance,
+        tol_feas = settings.phase2_gradient_tolerance,
+        preprocess = true, reduce = false, use_dense_model = true,
+        syssolver = Hypatia.Solvers.QRCholDenseSystemSolver{F}(),
+    )
+    _with_filtered_hypatia_logger() do
+        Hypatia.Solvers.load(solver, model)
+        Hypatia.Solvers.solve(solver)
+    end
+    status = Hypatia.Solvers.get_status(solver)
+    coordinates = copy(Hypatia.Solvers.get_x(solver))
+    _log(opt, "Phase II Hypatia fallback: status=$(status), iter=$(Hypatia.Solvers.get_num_iters(solver))")
+    _hypatia_solution_is_usable(coordinates, d) || return nothing
+    candidate = x0 + N * coordinates
+    all(isfinite, candidate) || return nothing
+    numeric_blocks = _numeric_blocks(problem.blocks)
+    if !_strictly_interior_numeric(candidate, numeric_blocks, problem.positive_scalars)
+        # A conic solver's affine point can lie just outside a cone within its
+        # feasibility tolerance. Move only as far toward the original strict
+        # interior as needed before rational projection; exact checks still
+        # decide whether any resulting point is returned.
+        direction = candidate - x0
+        step = _max_step_to_boundary(
+            x0, direction, numeric_blocks, problem.positive_scalars, one(F) - sqrt(eps(F)),
+        )
+        candidate = x0 + step * direction
+    end
+    dual = copy(Hypatia.Solvers.get_z(solver))
+    stationarity = if length(dual) == length(model.h) && all(isfinite, dual)
+        dual_gradient = transpose(model.G) * dual
+        _max_abs(model.c + dual_gradient) / max(one(F), _max_abs(model.c), _max_abs(dual_gradient))
+    else
+        F(Inf)
+    end
+    return (
+        candidate = candidate,
+        dual_objective = Hypatia.Solvers.get_dual_obj(solver),
+        converged = status == Hypatia.Solvers.Optimal && stationarity <= settings.phase2_gradient_tolerance,
+    )
 end
 
 function _phase2_exact_solution(
@@ -1685,6 +1803,7 @@ function _phase2_exact_solution(
     last_barrier_parameter = barrier_parameter
     last_gap_bound = _to_working_float(F, barrier_dim) / barrier_parameter
     termination_reason = :outer_iteration_limit
+    best_x_numeric = copy(phase2_start_point)
     for outer_iteration in 1:opt.settings.phase2_outer_iterations
         last_barrier_parameter = barrier_parameter
         newton_result = _newton_phase2!(
@@ -1700,14 +1819,18 @@ function _phase2_exact_solution(
         )
         z = newton_result.z
         x_trial = x0 + N_big * z
+        best_trial = x0 + N_big * newton_result.best_z
+        if dot(c_big, best_trial) < dot(c_big, best_x_numeric)
+            best_x_numeric = best_trial
+        end
         approximate_objective = dot(c_big, x_trial) + _to_working_float(F, problem.objective_constant_raw)
-        gap_bound = _to_working_float(F, barrier_dim) / barrier_parameter
+        gap_bound = newton_result.converged ? _to_working_float(F, barrier_dim) / barrier_parameter : F(Inf)
         last_gap_bound = gap_bound
         phase2_row = [
             string(outer_iteration),
             _format_metric(barrier_parameter),
             _format_metric(approximate_objective),
-            _format_metric(gap_bound),
+            isfinite(gap_bound) ? _format_metric(gap_bound) : "--",
             @sprintf("%.2f", (time_ns() - phase2_start_time) / 1.0e9),
         ]
         _log_table_row(opt, phase2_row, phase2_widths, phase2_alignments)
@@ -1726,20 +1849,55 @@ function _phase2_exact_solution(
         barrier_parameter *= numeric_settings.path_parameter_growth
     end
 
-    x_numeric = x0 + N_big * z
+    fallback = nothing
+    if termination_reason in (:newton_iteration_limit, :line_search_failed) && opt.settings.phase2_hypatia_fallback
+        fallback = try
+            _phase2_hypatia_fallback(opt, problem, x0, N_big, c_big)
+        catch err
+            err isa InterruptException && rethrow()
+            _log(opt, _solver_failure_message("Phase II Hypatia fallback", err))
+            nothing
+        end
+    end
+    x_numeric = best_x_numeric
+    other_candidate = nothing
+    if fallback !== nothing
+        if dot(c_big, fallback.candidate) < dot(c_big, x_numeric)
+            other_candidate = x_numeric
+            x_numeric = fallback.candidate
+        else
+            other_candidate = fallback.candidate
+        end
+    end
+    x_exact = _phase2_exact_refinement(
+        x_numeric, anchor, problem, opt.settings, anchor, phase2_nullspace, numeric_affine,
+    )
+    if other_candidate !== nothing &&
+       dot(c_big, other_candidate) < _to_working_float(F, _exact_phase2_objective_value(problem, x_exact))
+        other_exact = _phase2_exact_refinement(
+            other_candidate, anchor, problem, opt.settings, anchor, phase2_nullspace, numeric_affine,
+        )
+        if _exact_phase2_objective_value(problem, other_exact) < _exact_phase2_objective_value(problem, x_exact)
+            x_exact = other_exact
+            x_numeric = other_candidate
+        end
+    end
+    # Rational projection (or interpolation toward the anchor) can worsen a
+    # numerical optimum. Check the gap of the returned exact point as well.
+    if fallback !== nothing && fallback.converged
+        recovered_objective = _to_working_float(F, _exact_phase2_objective_value(problem, x_exact))
+        recovered_gap = abs(recovered_objective - fallback.dual_objective)
+        last_gap_bound = recovered_gap
+        if isfinite(recovered_gap) && recovered_gap <= numeric_settings.optimality_gap_tolerance
+            termination_reason = :optimal
+        end
+    end
     return (
-        x_exact = _phase2_exact_refinement(
-            x_numeric,
-            anchor,
-            problem,
-            opt.settings,
-            anchor,
-            phase2_nullspace,
-            numeric_affine,
-        ),
+        x_exact = x_exact,
         x_numeric = x_numeric,
         barrier_parameter = last_barrier_parameter,
         termination_reason = termination_reason,
         gap_bound = last_gap_bound,
+        hypatia_fallback_used = fallback !== nothing,
     )
 end

@@ -124,8 +124,28 @@ end
 function MOI.optimize!(opt::Optimizer{T}) where {T}
     stats = FacialReductionStatistics()
     opt.facial_reduction_statistics = stats
+    start_time = time_ns()
     return _with_facial_reduction_statistics(stats) do
-        _optimize_impl!(opt)
+        _with_solver_failure_status(opt, start_time) do
+            _optimize_impl!(opt)
+        end
+    end
+end
+
+function _with_solver_failure_status(f::Function, opt::Optimizer, start_time)
+    try
+        return f()
+    catch err
+        # Keep invalid models, invalid settings and programming errors visible.
+        # A failed face recovery is an expected solver outcome, not a certificate
+        # that the original model is infeasible (especially on a tentative face).
+        err isa FacialReductionRecoveryError || rethrow()
+        _reset_results!(opt)
+        opt.termination_status = MOI.NUMERICAL_ERROR
+        opt.raw_status = _solver_failure_message("Facial reduction", err)
+        opt.solve_time_sec = (time_ns() - start_time) / 1.0e9
+        _log(opt, opt.raw_status)
+        return
     end
 end
 
@@ -331,6 +351,7 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
 
         x_exact = anchor
         phase2_termination_reason = :optimal
+        phase2_fallback_used = false
         if size(nullspace, 2) > 0 && any(!iszero, problem.objective_vector_min)
             try
                 phase2_result = _phase2_exact_solution(
@@ -344,6 +365,8 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
                 )
                 x_exact = phase2_result.x_exact
                 phase2_termination_reason = phase2_result.termination_reason
+                phase2_fallback_used = hasproperty(phase2_result, :hypatia_fallback_used) &&
+                                       phase2_result.hypatia_fallback_used
             catch err
                 opt.termination_status = MOI.NUMERICAL_ERROR
                 opt.primal_status = MOI.NO_SOLUTION
@@ -394,6 +417,9 @@ function _optimize_impl!(opt::Optimizer{T}) where {T}
         else
             opt.termination_status = MOI.OTHER_ERROR
             opt.raw_status = "Phase II stopped for an unknown reason"
+        end
+        if phase2_fallback_used && phase2_termination_reason != :optimal
+            opt.raw_status *= "; Hypatia fallback completed; an exact feasible point was returned without meeting the requested optimality tolerance"
         end
         opt.result_count = 1
         opt.solve_time_sec = (time_ns() - start_time) / 1.0e9

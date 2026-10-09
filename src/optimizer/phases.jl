@@ -208,7 +208,8 @@ function _phase2_exact_refinement(
     coefficients = _affine_coordinates(x_approx, numeric_affine)
     best = anchor
     approximate_objective = dot(_to_working_array(F, problem.objective_vector_min), x_approx)
-    objective_tolerance = _numeric_settings(settings, F).optimality_gap_tolerance
+    # Reserve most of the final gap tolerance for numerical optimization.
+    objective_tolerance = _numeric_settings(settings, F).optimality_gap_tolerance / F(4)
     try_direct_first = _strictly_interior_numeric(
         x_approx, _numeric_blocks(problem.blocks), problem.positive_scalars,
     )
@@ -1619,6 +1620,10 @@ function _phase2_hypatia_fallback(
         append!(scales, [i == j ? one(F) : sqrt(F(2)) for (i, j) in block.local_positions])
         push!(cones, Hypatia.Cones.PosSemidefTri{F,F}(length(block.local_positions)))
     end
+    # Leave room for strict-interior correction and rational recovery. Hypatia's
+    # absolute gap is scaled by its homogeneous variable, so use its relative
+    # test with a tighter budget and retain the recovered-point gap check.
+    gap_tolerance = settings.optimality_gap_tolerance / F(100)
     d = size(N, 2)
     offset = dot(c, x0)
     model = Hypatia.Models.Model{F}(
@@ -1631,9 +1636,12 @@ function _phase2_hypatia_fallback(
         ; verbose = !opt.silent && opt.settings.verbose,
         iter_limit = opt.settings.max_iterations,
         # Hypatia's relative test uses the objective without its affine offset.
-        tol_rel_opt = settings.optimality_gap_tolerance / max(one(F), abs(offset)),
-        tol_abs_opt = settings.optimality_gap_tolerance,
-        tol_feas = settings.phase2_gradient_tolerance,
+        tol_rel_opt = gap_tolerance / max(one(F), abs(offset)),
+        tol_abs_opt = zero(F),
+        tol_feas = min(
+            settings.phase2_gradient_tolerance,
+            gap_tolerance / max(one(F), _max_abs(c), abs(offset)),
+        ),
         preprocess = true, reduce = false, use_dense_model = true,
         syssolver = Hypatia.Solvers.QRCholDenseSystemSolver{F}(),
     )
@@ -1654,8 +1662,13 @@ function _phase2_hypatia_fallback(
         # interior as needed before rational projection; exact checks still
         # decide whether any resulting point is returned.
         direction = candidate - x0
+        # A fixed sqrt(eps) retreat can spend the entire objective gap budget
+        # when the center is far from optimal. Bound its objective cost instead.
+        interior_margin = max(eps(F), min(
+            sqrt(eps(F)), gap_tolerance / max(one(F), abs(dot(c, direction))),
+        ))
         step = _max_step_to_boundary(
-            x0, direction, numeric_blocks, problem.positive_scalars, one(F) - sqrt(eps(F)),
+            x0, direction, numeric_blocks, problem.positive_scalars, one(F) - interior_margin,
         )
         candidate = x0 + step * direction
     end

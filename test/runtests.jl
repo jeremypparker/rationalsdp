@@ -3705,6 +3705,40 @@ include("solver_recovery_regressions.jl")
         @test UX[15] + UX[16] <= 3//2
         @test is_psd_exact(VX)
         @test is_psd_exact(VY)
+
+        # Exercise primal-dual recovery independently of whether native Newton
+        # happens to converge on this platform. Both Phase I centers must leave
+        # enough gap budget for strict-interior correction and exact recovery.
+        opt = unsafe_backend(model)
+        problem = RationalSDP._extract_problem(opt)
+        F = RationalSDP.Float64x2
+        tolerance = RationalSDP._numeric_settings(opt.settings, F).optimality_gap_tolerance
+        # 3sum(u) - 2u[1] - u[2] + 3(u[6]+u[7]) + 9(u[12]+u[13]+u[14])
+        # bounds the objective below by 114/5, attained on the cone boundary.
+        @test 0 <= objective_value(model) - 114//5 <= Rational{BigInt}(tolerance)
+        phase1 = RationalSDP._phase1_anchor_attempt(opt, problem, F)
+        @test phase1.anchor !== nothing
+        basis = RationalSDP._phase2_nullspace(problem, F)
+        affine = RationalSDP._numeric_affine_data(phase1.anchor, basis, F)
+        N = RationalSDP._numeric_nullspace!(affine)
+        c = RationalSDP._to_working_array(F, problem.objective_vector_min)
+        for center in (
+            RationalSDP._to_working_array(F, phase1.anchor),
+            phase1.phase2_initial_point,
+        )
+            fallback = RationalSDP._phase2_hypatia_fallback(opt, problem, center, N, c)
+            @test fallback !== nothing
+            @test fallback.converged
+            recovered = RationalSDP._phase2_exact_refinement(
+                fallback.candidate, phase1.anchor, problem, opt.settings,
+                phase1.anchor, basis, affine,
+            )
+            @test RationalSDP._exact_primal_feasibility(problem, recovered).ok
+            recovered_objective = RationalSDP._to_working_float(
+                F, RationalSDP._exact_phase2_objective_value(problem, recovered),
+            )
+            @test abs(recovered_objective - fallback.dual_objective) <= tolerance
+        end
     end
 
     @testset "SOS-style polynomial lower bound via DynamicPolynomials" begin

@@ -22,24 +22,9 @@ one-parameter problems that are solved by fixed-parameter feasibility searches.
 
 Requires Julia 1.11 or later in the Julia 1.x series.
 
-Until the package is registered in General, install it from GitHub:
-
-```julia
-using Pkg
-Pkg.add(url = "https://github.com/jeremypparker/RationalSDP.jl")
-Pkg.add("JuMP")  # for the modeling examples below
-```
-
-After registration, install it by name instead:
-
-```julia
-using Pkg
-Pkg.add("RationalSDP")
-```
 
 For the SumOfSquares examples, also install `DynamicPolynomials` and
-`SumOfSquares`. The regression test environment currently uses SumOfSquares
-from its `main` branch; it is resolved explicitly in CI.
+`SumOfSquares`.
 
 ## Supported Model Features
 
@@ -547,8 +532,8 @@ cone directions grow during primal centering. The fallback uses the same SDP
 and the original Phase I center. Its candidate still undergoes exact rational
 recovery and validation. A fallback is reported optimal only when numerical
 stationarity and the gap of the recovered exact point meet the configured
-criteria. Otherwise the original limit status is retained. Unconverged barrier
-subproblems display `--` for the gap, and exact recovery retains the best
+criteria. Otherwise the original limit status is retained.
+Unconverged barrier subproblems display `--` for the gap, and exact recovery retains the best
 objective candidate rather than blindly using the last centering iterate. Phase II
 rounds affine coordinates on a shared binary grid to avoid denominator growth
 in exact matrix checks, and reuses each improved exact interior during recovery.

@@ -1682,7 +1682,10 @@ function _phase2_hypatia_fallback(
     return (
         candidate = candidate,
         dual_objective = Hypatia.Solvers.get_dual_obj(solver),
-        converged = status == Hypatia.Solvers.Optimal && stationarity <= settings.phase2_gradient_tolerance,
+        # Hypatia solves to a tighter internal gap budget. NearOptimal can still
+        # meet our stationarity tolerance; the recovered-point gap is checked below.
+        converged = status in (Hypatia.Solvers.Optimal, Hypatia.Solvers.NearOptimal) &&
+                    stationarity <= settings.phase2_gradient_tolerance,
     )
 end
 
